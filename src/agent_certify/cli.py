@@ -14,14 +14,15 @@
     agent-certify mcp                     # MCP server on stdio
     (scan and watch take --otel / --otel-stdout to emit OpenTelemetry spans)
     agent-certify blast <path> --node bash
-    agent-certify keygen signing.key
+    agent-certify keygen [signing.key]   # default: agent-certify.key
     agent-certify certify <path> --key signing.key [--validity-days 90] -o system.cert.json
     agent-certify verify system.cert.json <path> --public-key signing.key.pub
                          [--ignore-expiry] [--expect-system-id ID] [--allow-unsigned]
 
 Exit codes: ``scan`` returns 2 when a finding reaches ``--fail-on`` (default:
 any critical anomaly or critical policy violation); ``verify`` returns 1 on
-drift or an untrusted certificate, 2 on usage errors.
+drift or an untrusted certificate, 2 on usage errors. Every command exits 1
+when its input holds no readable records.
 
 A directory is scanned session by session and as one merged graph (every
 session's agents and tools combined); ``html``, ``blast``, ``certify`` and
@@ -57,7 +58,6 @@ from agent_certify.watcher import SessionWatcher, latest_session
 
 DEFAULT_PATH = "~/.claude/projects"
 FAIL_EXIT = 2
-SKIPPED_WARN_RATIO = 0.05
 
 
 def _path(p: str) -> Path:
@@ -89,6 +89,7 @@ def load(path: str, include_mcp: bool = False) -> tuple[list[AgentGraph], AgentG
             raise SystemExit(f"agent-certify: {p} does not exist")
     except ValueError as exc:
         raise SystemExit(f"agent-certify: {exc}") from exc
+    graphs = _usable(graphs, p)
     if include_mcp:
         mcp = MCPLogsParser()
         enriched, added = [], 0
@@ -101,6 +102,26 @@ def load(path: str, include_mcp: bool = False) -> tuple[list[AgentGraph], AgentG
     if len(graphs) == 1:
         return graphs, graphs[0]
     return graphs, AgentGraph.merge(graphs, session_id=f"{p.name} ({len(graphs)} sessions)")
+
+
+def _name(g: AgentGraph) -> str:
+    return Path(g.source).name if g.source else (g.session_id or "session")
+
+
+def _usable(graphs: list[AgentGraph], p: Path) -> list[AgentGraph]:
+    """Warn once per file with unreadable records; drop (or refuse) files with nothing usable."""
+    usable = [g for g in graphs if g.has_data]
+    if not usable:
+        target = _name(graphs[0]) if len(graphs) == 1 else p.name or str(p)
+        raise SystemExit(f"No readable records in {target}")
+    for g in usable:
+        if g.skipped_records:
+            print(f"WARNING: {_name(g)}: {g.skipped_records} of {g.total_records} records unreadable, skipped",
+                  file=sys.stderr)
+    if len(usable) < len(graphs):
+        left_out = len(graphs) - len(usable)
+        print(f"agent-certify: {left_out} file(s) with no readable records left out", file=sys.stderr)
+    return usable
 
 
 # ---------------------------------------------------------------- formatting
@@ -117,10 +138,9 @@ def _skipped_note(g: AgentGraph) -> str | None:
     """A line about unreadable records, or None when every record was read."""
     if not g.skipped_records:
         return None
-    total = g.total_messages + g.skipped_records
-    share = g.skipped_records / total if total else 1.0
-    return (f"Skipped records  {g.skipped_records} ({share:.1%} of {total}) — malformed or oversized lines; "
-            "the graph may be incomplete")
+    total = max(g.total_records, g.skipped_records)
+    return (f"Skipped records  {g.skipped_records} ({g.skipped_records / total:.1%} of {total}) — malformed or "
+            "oversized lines; the graph may be incomplete")
 
 
 def _text_report(g: AgentGraph, r: ScanResult, anomalies: AnomalyReport | None = None,
@@ -326,11 +346,6 @@ def cmd_scan(args) -> int:
             written = exporter.write(span, args.otel_file, stdout=args.otel_stdout)
         if written:
             print(f"OTel: {len(sessions)} span(s) appended to {written.as_posix()}", file=sys.stderr)
-    for s in sessions:
-        g = s["graph"]
-        total = g.total_messages + g.skipped_records
-        if total and g.skipped_records / total > SKIPPED_WARN_RATIO:
-            _warn(f"{g.session_id}: {g.skipped_records} of {total} records could not be read")
     if _fails(sessions, args.fail_on):
         print(f"agent-certify: findings at or above '{args.fail_on}' (exit {FAIL_EXIT})", file=sys.stderr)
         return FAIL_EXIT
@@ -561,7 +576,26 @@ def cmd_certify(args) -> int:
     return 0
 
 
+def _looks_like_session(arg: str) -> bool:
+    return arg.lower().endswith((".jsonl", ".agent-trace")) or _path(arg).is_dir()
+
+
+def _looks_like_certificate(arg: str) -> bool:
+    return arg.lower().endswith(".json")
+
+
+VERIFY_HINT = "Hint: usage is 'verify CERTIFICATE SESSION --public-key KEY'"
+
+
 def cmd_verify(args) -> int:
+    cert_arg, session_arg = args.certificate, args.path
+    reversed_args = bool(cert_arg) and _looks_like_session(cert_arg) and (
+        session_arg is None or _looks_like_certificate(session_arg))
+    if not cert_arg or not session_arg or reversed_args:
+        problem = ("the arguments look reversed" if reversed_args and session_arg
+                   else "the certificate comes first" if reversed_args else "two arguments are needed")
+        print(f"agent-certify: verify: {problem}.\n{VERIFY_HINT}", file=sys.stderr)
+        return 2
     if not args.public_key and not args.allow_unsigned:
         print("agent-certify: verify needs --public-key ISSUER.pub (the issuer's public key, obtained out of "
               "band); --allow-unsigned skips the signature check", file=sys.stderr)
@@ -669,7 +703,8 @@ def build_parser() -> argparse.ArgumentParser:
     b.set_defaults(func=cmd_blast)
 
     k = sub.add_parser("keygen", help="create an Ed25519 signing key (writes KEY with mode 600, and KEY.pub)")
-    k.add_argument("output", help="private key file; keep it outside the repository")
+    k.add_argument("output", nargs="?", default="agent-certify.key",
+                   help="private key file (default: agent-certify.key); keep it outside the repository")
     k.add_argument("--force", action="store_true", help="replace existing key files")
     k.set_defaults(func=cmd_keygen)
 
@@ -683,8 +718,8 @@ def build_parser() -> argparse.ArgumentParser:
     c.set_defaults(func=cmd_certify)
 
     v = sub.add_parser("verify", help="check a graph against a certificate (exit 1 on drift)")
-    v.add_argument("certificate")
-    v.add_argument("path")
+    v.add_argument("certificate", nargs="?", help="certificate file from `agent-certify certify` (.cert.json)")
+    v.add_argument("path", nargs="?", help="session (.jsonl, .agent-trace) or project folder to check")
     v.add_argument("--public-key", help="REQUIRED: the issuer's public key file (KEY.pub), obtained out of band")
     v.add_argument("--allow-unsigned", action="store_true",
                    help="skip the signature check (unsafe: anyone can write an unsigned certificate)")

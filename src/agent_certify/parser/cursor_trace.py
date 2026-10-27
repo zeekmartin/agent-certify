@@ -69,6 +69,8 @@ class CursorTraceParser(BaseParser):
 
     def __init__(self):
         self.skipped = 0
+        self.skipped_records = 0
+        self.records_seen = 0
 
     def parse(self, path: str) -> AgentGraph:
         p = self._expand(path)
@@ -76,6 +78,8 @@ class CursorTraceParser(BaseParser):
         if not files:
             raise FileNotFoundError(p)
         self.skipped = 0
+        self.skipped_records = 0
+        self.records_seen = 0
         g = AgentGraph(session_id=None, project=self._project_name(p))
         ids, stamps, editor = [], [], None
         for f in files:
@@ -92,9 +96,11 @@ class CursorTraceParser(BaseParser):
         if stamps:
             g.started_at, g.ended_at = min(stamps), max(stamps)
         g.total_messages = len(ids)
-        g.skipped_records = self.skipped
-        if self.skipped:
-            logger.warning("%s: skipped %d malformed trace record(s) or field(s)", p, self.skipped)
+        g.skipped_records = self.skipped_records
+        g.total_records = self.records_seen
+        g.source = str(p)
+        if self.skipped:                           # reported once per file by the caller (CLI, MCP)
+            logger.debug("%s: skipped %d record(s), %d field(s) in total", p, self.skipped_records, self.skipped)
         return g
 
     def parse_directory(self, directory: str) -> list[AgentGraph]:
@@ -157,15 +163,19 @@ class CursorTraceParser(BaseParser):
             return
         for _, line in iter_lines(path):
             if line is None:
+                self.records_seen += 1
                 self.skipped += 1
+                self.skipped_records += 1
             elif line.strip():
                 yield from self._accept(decode_json(line))
 
     def _accept(self, rec) -> Iterator[dict]:
+        self.records_seen += 1
         if looks_like_trace_record(rec) and isinstance(rec["files"], list):
             yield rec
         else:
             self.skipped += 1
+            self.skipped_records += 1
 
     @staticmethod
     def _add_editor(g: AgentGraph, tool: dict) -> str:

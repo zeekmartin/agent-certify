@@ -71,6 +71,7 @@ class ClaudeCodeParser(BaseParser):
         self.include_subagents = include_subagents
         self.include_human = include_human
         self.skipped_lines = 0
+        self.records_seen = 0
 
     # ------------------------------------------------------------------ api
     def parse(self, path: str) -> AgentGraph:
@@ -79,6 +80,7 @@ class ClaudeCodeParser(BaseParser):
         if not p.is_file():
             raise FileNotFoundError(p)
         self.skipped_lines = 0
+        self.records_seen = 0
         g = AgentGraph(session_id=p.stem, project=p.parent.name)
         g.add_node(ORCHESTRATOR, "orchestrator", "claude")
         state = _State()
@@ -111,8 +113,10 @@ class ClaudeCodeParser(BaseParser):
             g.started_at = _iso(state.first)
             g.ended_at = _iso(state.last)
         g.skipped_records = self.skipped_lines
-        if self.skipped_lines:
-            logger.warning("%s: skipped %d unreadable line(s)", p, self.skipped_lines)
+        g.total_records = self.records_seen
+        g.source = str(p)
+        if self.skipped_lines:                     # reported once per file by the caller (CLI, MCP)
+            logger.debug("%s: skipped %d of %d record(s)", p, self.skipped_lines, self.records_seen)
         return g
 
     def parse_directory(self, directory: str) -> list[AgentGraph]:
@@ -204,6 +208,8 @@ class ClaudeCodeParser(BaseParser):
     def _records(self, path: Path) -> Iterator[dict]:
         """Stream records, skipping lines that are malformed, too deeply nested or too long."""
         for lineno, line in iter_lines(path):
+            if line is None or line.strip():
+                self.records_seen += 1
             if line is None:
                 self.skipped_lines += 1
                 logger.debug("%s:%d: line over the size limit, skipped", path, lineno)

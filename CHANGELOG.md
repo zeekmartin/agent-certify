@@ -6,6 +6,21 @@ project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-27
+
+### Fixed
+- A file with no readable records (empty, or nothing but malformed lines) now prints
+  `No readable records in <file>` and exits 1, instead of an empty report with FI 0.0000. A directory
+  scan leaves such files out and says how many; the MCP server reports it as a tool error
+- Unreadable records produce a single warning per file,
+  `WARNING: <file>: N of M records unreadable, skipped` (the parser and the CLI each printed one);
+  M now counts every record read, sub-agent transcripts included
+
+### Changed
+- `keygen` without an argument writes `agent-certify.key` (and `agent-certify.key.pub`)
+- `verify` with its arguments reversed or missing prints
+  `Hint: usage is 'verify CERTIFICATE SESSION --public-key KEY'` and exits 2
+
 ## [0.5.0] - 2026-10-27
 
 Fixes for the security audit of 2026-10-27 (45 findings). Items marked
@@ -109,7 +124,8 @@ Fixes for the security audit of 2026-10-27 (45 findings). Items marked
 - HTML visualization with interactive graph
 - CLI: scan, blast, keygen, certify, verify
 
-[Unreleased]: https://github.com/zeekmartin/agent-certify/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/zeekmartin/agent-certify/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/zeekmartin/agent-certify/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/zeekmartin/agent-certify/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/zeekmartin/agent-certify/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/zeekmartin/agent-certify/compare/v0.2.0...v0.3.0

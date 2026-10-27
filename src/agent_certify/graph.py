@@ -62,6 +62,8 @@ class AgentGraph:
     started_at: str | None = None        # ISO 8601, UTC
     ended_at: str | None = None
     skipped_records: int = 0             # malformed / oversized records the parser could not read
+    total_records: int = 0               # records the parser attempted (read or skipped)
+    source: str | None = field(default=None, compare=False, repr=False)   # file it came from; not serialised
 
     _edge_index: dict = field(default=None, init=False, repr=False, compare=False)
     _adjacency: dict = field(default=None, init=False, repr=False, compare=False)
@@ -88,6 +90,11 @@ class AgentGraph:
         self._adjacency.setdefault(e.target, set()).add(e.source)
         self._successors.setdefault(e.source, set()).add(e.target)
         self._index_key = (id(self.edges), len(self.edges))
+
+    @property
+    def has_data(self) -> bool:
+        """False when the parser found nothing usable: no messages, no calls, no links."""
+        return bool(self.total_messages or self.total_tool_calls or self.edges)
 
     # ------------------------------------------------------------- building
     def add_node(self, node_id: str, kind: str, name: str | None = None, **metadata) -> AgentNode:
@@ -239,6 +246,7 @@ class AgentGraph:
             "started_at": self.started_at,
             "ended_at": self.ended_at,
             "skipped_records": self.skipped_records,
+            "total_records": self.total_records,
             "nodes": [asdict(n) for n in self.nodes.values()],
             "edges": [asdict(e) for e in self.edges],
         }
@@ -250,7 +258,8 @@ class AgentGraph:
             _check(isinstance(data, dict))
             _check(all(data.get(k) is None or isinstance(data[k], str)
                        for k in ("session_id", "project", "started_at", "ended_at")))
-            _check(all(_is_count(data.get(k, 0)) for k in ("total_messages", "total_tool_calls", "skipped_records")))
+            _check(all(_is_count(data.get(k, 0))
+                       for k in ("total_messages", "total_tool_calls", "skipped_records", "total_records")))
             duration = data.get("duration_seconds")
             _check(duration is None or (_is_number(duration) and duration >= 0))
             nodes, edges = data.get("nodes", []), data.get("edges", [])
@@ -258,7 +267,7 @@ class AgentGraph:
             g = cls(session_id=data.get("session_id"), project=data.get("project"),
                     total_messages=data.get("total_messages", 0), total_tool_calls=data.get("total_tool_calls", 0),
                     duration_seconds=duration, started_at=data.get("started_at"), ended_at=data.get("ended_at"),
-                    skipped_records=data.get("skipped_records", 0))
+                    skipped_records=data.get("skipped_records", 0), total_records=data.get("total_records", 0))
             for n in nodes:
                 _check(isinstance(n, dict) and set(n) <= set(AgentNode.__dataclass_fields__))
                 _check(isinstance(n.get("id"), str) and n.get("kind") in NODE_KINDS and isinstance(n.get("name"), str))
@@ -299,6 +308,7 @@ class AgentGraph:
             out.total_messages += g.total_messages
             out.total_tool_calls += g.total_tool_calls
             out.skipped_records += g.skipped_records
+            out.total_records += g.total_records
             if g.duration_seconds is not None:
                 durations.append(g.duration_seconds)
             if g.project:

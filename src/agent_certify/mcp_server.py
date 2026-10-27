@@ -480,6 +480,8 @@ class AgentCertifyMCPServer:
             graph = AutoParser().parse(str(p))
         except (ValueError, OSError, RecursionError, MemoryError):
             raise ToolError("Session could not be read (unsupported or malformed file)") from None
+        if not graph.has_data:
+            raise ToolError("No readable records in the session")
         return graph, label, how
 
     def _artifact(self, raw: str | None, default: Path, loader, what: str, hint: str, absent_note: str,

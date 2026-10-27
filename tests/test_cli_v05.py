@@ -197,6 +197,7 @@ def test_skipped_records_reported(session_dir, capsys):
     assert main(["scan", str(session), "--no-baseline", "--no-policy"]) == 0
     captured = capsys.readouterr()
     assert "Skipped records  11" in captured.out
-    assert "11 of" in captured.err and "could not be read" in captured.err
+    assert captured.err.count("WARNING") == 1                           # one message per file
+    assert "WARNING: sess-1.jsonl: 11 of 23 records unreadable, skipped" in captured.err   # 20 + 3 sub-agent
     main(["scan", str(session), "--no-baseline", "--no-policy", "--format", "json"])
     assert json.loads(capsys.readouterr().out)["scan"]["skipped_records"] == 11

@@ -89,6 +89,7 @@ class MCPLogsParser(BaseParser):
     def __init__(self, roots: list[str | os.PathLike] | None = None):
         self.roots = [Path(r) for r in roots] if roots is not None else default_roots()
         self.skipped_lines = 0
+        self.records_seen = 0
         self.added_calls = 0
 
     # ---------------------------------------------------------------- find
@@ -116,6 +117,7 @@ class MCPLogsParser(BaseParser):
         if not p.is_file():
             raise FileNotFoundError(p)
         self.skipped_lines = 0
+        self.records_seen = 0
         server = self._server(p)
         g = AgentGraph(session_id=None, project=p.parent.parent.name)
         g.add_node(ORCHESTRATOR, "orchestrator", "claude")
@@ -133,6 +135,8 @@ class MCPLogsParser(BaseParser):
                 g.record_error(ORCHESTRATOR, nid)
         sessions.discard(None)
         g.skipped_records = self.skipped_lines
+        g.total_records = self.records_seen
+        g.source = str(p)
         g.session_id = sessions.pop() if len(sessions) == 1 else p.stem
         if stamps:
             g.started_at, g.ended_at = min(stamps), max(stamps)
@@ -219,11 +223,13 @@ class MCPLogsParser(BaseParser):
         """Tool-call and tool-failure events, skipping unreadable or oversized lines."""
         for _, line in iter_lines(path):
             if line is None:
+                self.records_seen += 1
                 self.skipped_lines += 1
                 continue
             line = line.strip()
             if not line:
                 continue
+            self.records_seen += 1
             rec = decode_json(line)
             if not isinstance(rec, dict):
                 self.skipped_lines += 1

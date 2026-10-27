@@ -6,7 +6,7 @@
 [![Downloads](https://img.shields.io/pypi/dm/agent-certify)](https://pypi.org/project/agent-certify/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![Coverage](https://img.shields.io/badge/coverage-95%25-brightgreen)]()
-[![Tests](https://img.shields.io/badge/tests-279%20passed-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-306%20passed-brightgreen)]()
 
 Structural verification of multiagent systems.
 
