@@ -50,17 +50,28 @@ def test_env_vars_in_artifact_paths(server, monkeypatch, field, tool):
 
 
 # ------------------------------------------------------------------ confinement
-@pytest.mark.parametrize("arg", ["/etc/passwd", "../../etc/passwd", "../../../../../../etc/passwd",
-                                 "C:\\Windows\\System32\\config\\SAM", "/", "C:\\", "\\\\server\\share\\x.jsonl"])
+WINDOWS_PATHS = ["C:\\Windows\\System32\\config\\SAM", "C:\\", "\\\\server\\share\\x.jsonl"]
+
+
+@pytest.mark.parametrize("arg", ["/etc/passwd", "../../etc/passwd", "../../../../../../etc/passwd", "/"])
 def test_paths_outside_the_roots_are_refused(server, arg):
     reply, _raw = call(server, "scan_topology", session_path=arg)
     assert error_text(reply) == "Path not allowed"
 
 
+@pytest.mark.parametrize("arg", WINDOWS_PATHS)
+def test_windows_style_paths(server, arg):
+    # On Windows these are absolute paths outside the roots. On POSIX a backslash is an ordinary
+    # character, so each is one oddly named file inside the working directory: nothing escapes.
+    text = error_text(call(server, "scan_topology", session_path=arg)[0])
+    assert text == "Path not allowed" if os.name == "nt" else text == "Session not found"
+
+
 def test_artifact_paths_outside_the_roots_are_refused(server):
     reply, _ = call(server, "check_anomalies", baseline_path="/etc/shadow")
     assert error_text(reply) == "Path not allowed"
-    reply, _ = call(server, "check_policy", policy_path="C:\\Windows\\System32\\config\\SAM")
+    outside = "C:\\Windows\\System32\\config\\SAM" if os.name == "nt" else "/etc/passwd"
+    reply, _ = call(server, "check_policy", policy_path=outside)
     assert error_text(reply) == "Path not allowed"
 
 
