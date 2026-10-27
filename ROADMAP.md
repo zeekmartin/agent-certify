@@ -51,29 +51,35 @@ Structural verification of multiagent systems.
   - Pre-v0.3 certificates keep id comparison and their signatures stay valid
 - 114 tests, 94% coverage
 
+### v0.4.0 — MCP server & self-scan (Oct 2026)
+
+- agent-certify as an MCP server: any MCP-compatible agent can scan its own topology
+  - `agent-certify mcp`; `claude mcp add agent-certify -- agent-certify mcp`
+  - Bare stdio JSON-RPC 2.0 (protocol 2024-11-05 to 2025-06-18), no `mcp` package
+  - Tools: `topology_summary` (plain language, written for the agent), `scan_topology`,
+    `blast_radius`, `check_anomalies`, `check_policy`
+  - Finds the current session itself (`CLAUDE_CODE_SESSION_ID`, then the cwd's project)
+  - Tool failures come back as readable `isError` results; the server never crashes
+- OTel export: one `agent_certify.scan` span per scan, anomalies and violations as events
+  - OTLP/JSON lines (Collector `otlpjsonfile`-compatible), no OpenTelemetry SDK
+  - `scan --otel`, `watch --otel` (span per cycle), `--otel-stdout` for piping
+- Cursor Agent Trace parser (code provenance: models → files written)
+- Format auto-detection from content (Claude Code transcript, Agent Trace, MCP log)
+- License headers (SPDX) on every source file
+- 154 tests, 94% coverage
+
 ## Planned
-
-### v0.4.0 — MCP server & self-scan
-
-- Carried over from v0.3.0:
-  - OTel trace parser: import OpenInference/Arize format spans
-  - Alert output beyond stdout: JSON webhook, file
-
-- agent-certify as an MCP server
-  - Any MCP-compatible agent can scan its OWN topology
-  - `claude mcp add agent-certify agent-certify mcp`
-  - Tool: `scan_my_topology` → returns FI, anomalies, blast radius
-  - Tool: `check_policy` → returns violations
-- Kill switch recommendation: "isolate node X, keep the rest running"
-- OTel export: emit spans for each scan/anomaly/violation
-- Cursor agent-trace parser
 
 ### v0.5.0 — Multi-framework parsers
 
+- Carried over from v0.3.0 / v0.4.0:
+  - OTel trace parser: import OpenInference/Arize format spans
+  - Alert output: JSON webhook
+  - Kill switch recommendation: "isolate node X, keep the rest running"
 - CrewAI parser: task execution logs → AgentGraph
 - LangGraph parser: graph state transitions → AgentGraph
 - AutoGen parser: message history → AgentGraph
-- Unified parser auto-detection: detect format, pick the right parser
+- Extend auto-detection to the new parsers
 - Cross-session trending: FI over time, tool usage patterns
 
 ### v0.6.0 — Fleet & dashboard
