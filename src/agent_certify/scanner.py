@@ -1,3 +1,6 @@
+# agent-certify — Structural verification of multiagent systems
+# Copyright 2026 Cognitive Engineering (Switzerland)
+# SPDX-License-Identifier: BSL-1.1
 """Fragility Index (FI) of an agent graph.
 
 FI is the fraction of communication links with **zero triangle support**: links

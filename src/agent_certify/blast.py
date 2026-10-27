@@ -1,3 +1,6 @@
+# agent-certify — Structural verification of multiagent systems
+# Copyright 2026 Cognitive Engineering (Switzerland)
+# SPDX-License-Identifier: BSL-1.1
 """Blast radius: what a compromised agent or tool can touch.
 
 A compromised node can act on everything it invokes, and can influence

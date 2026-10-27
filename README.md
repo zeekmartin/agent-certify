@@ -11,6 +11,59 @@ Find structural single points of failure before they're exploited.
 pip install agent-certify
 ```
 
+The only dependencies are `numpy` and `cryptography`. The MCP server, the
+OpenTelemetry export and the Cursor parser need nothing else (the `[mcp]`,
+`[otel]`, `[cursor]` and `[all]` extras exist but are empty).
+
+## Let your agent scan itself (MCP server)
+
+agent-certify runs as an MCP server, so an agent can check its own structure
+while it works:
+
+```bash
+claude mcp add agent-certify -- agent-certify mcp
+```
+
+or in an MCP client's settings:
+
+```json
+{
+  "mcpServers": {
+    "agent-certify": {"command": "agent-certify", "args": ["mcp"]}
+  }
+}
+```
+
+| Tool | What it returns |
+|---|---|
+| `topology_summary` | a plain-language health check, written for the agent to read about itself |
+| `scan_topology` | FI, nodes, links, bridges, articulation points, every node's role (`perspective` picks the vocabulary) |
+| `blast_radius` | what a compromised or failed `node` reaches, and whether the system fragments |
+| `check_anomalies` | anomalies against `.agent-certify/baseline.json` (or `baseline_path`) |
+| `check_policy` | violations of `.agent-certify/policy.json` (or `policy_path`) |
+
+Every tool takes an optional `session_path`. Without it the server finds the
+**current** session: `CLAUDE_CODE_SESSION_ID` (Claude Code sets it for the
+processes it starts), then the newest session of the working directory's
+project, then the newest session on the machine. A real `topology_summary`
+from this repository's own development session:
+
+> Your current session has 12 nodes (1 orchestrator, 10 tools, the human) and
+> 11 links. Fragility Index is 1.0 — every connection is a single point of
+> failure with no backup path. The orchestrator (claude) is the sole keystone:
+> if it fails, the system fragments into 11 isolated pieces. Most-used tool:
+> Bash (97 calls, 8 failed). Overall 2.9% of 278 tool calls failed. No
+> anomalies detected against the baseline of 25 sessions. No policy
+> violations. This is the usual shape of a single-agent session — one
+> orchestrator calling each tool directly; redundancy only appears when
+> sub-agents share tools.
+
+The server speaks MCP over stdio (newline-delimited JSON-RPC 2.0, protocol
+versions 2024-11-05 to 2025-06-18) without the `mcp` package. A tool that
+cannot run (no baseline yet, unknown node, missing session) returns a normal
+result with `isError: true` and a message saying what to do; protocol errors
+are JSON-RPC errors; nothing a request does stops the server.
+
 ## Quick start
 
 ```python
@@ -61,6 +114,14 @@ agent-certify watch path/to/session.jsonl --interval 10 --perspective risk
 
 # MCP server logs as a second data source
 agent-certify scan session.jsonl --include-mcp
+
+# OpenTelemetry spans (OTLP/JSON)
+agent-certify scan session.jsonl --otel                      # appends to .agent-certify/traces.jsonl
+agent-certify scan session.jsonl --otel-stdout | <collector> # spans on stdout, report on stderr
+agent-certify watch ... --otel                               # one span per scan cycle
+
+# Other formats are detected from the content
+agent-certify scan path/to/repo/.agent-trace/                # Cursor Agent Trace
 
 # Structural baseline and drift detection
 agent-certify keygen signing.key                             # writes signing.key and signing.key.pub
@@ -323,6 +384,45 @@ there are not counted twice. The logs do not say which agent made a call, so
 all of them are attributed to the orchestrator. No logs (no MCP servers, or a
 platform without the cache) is not an error: the graph is returned unchanged.
 
+## OpenTelemetry
+
+`--otel` turns every scan into one span, `agent_certify.scan`, with the
+structural metrics as attributes (`agent_certify.fi`, `.node_count`,
+`.edge_count`, `.bridge_count`, `.sub_agent_count`, `.anomaly_count`, ...).
+Anomalies and policy violations become span events (`anomaly.new_tool`,
+`policy_violation.forbidden_tool`, ...). A critical anomaly or any policy
+violation sets the span status to ERROR.
+
+Spans are OTLP/JSON, one `{"resourceSpans": [...]}` object per line: the
+layout the OpenTelemetry Collector's `file` exporter writes and its
+`otlpjsonfile` receiver reads, so a collector can forward them to Jaeger,
+Grafana Tempo, Datadog and so on. All scans of one session share a trace id,
+so a `watch` run appears as one trace with a span per cycle. No OpenTelemetry
+SDK is needed.
+
+## Cursor Agent Trace
+
+[Agent Trace](https://agent-trace.dev) (github.com/cursor/agent-trace) records
+**which code was written by AI and which by humans**: files, line ranges and
+contributors (`human`, `ai` with a `model_id`, `mixed`, `unknown`), usually in
+`.agent-trace/traces.jsonl`. It does not record tool calls, MCP servers or
+sub-agents, so the graph is a provenance graph:
+
+- the producing tool (`cursor`) is the orchestrator, linked to each model (`agent:<model_id>`)
+- each contributor links to the files it wrote (`file:<path>`), weighted by lines
+
+That graph is bipartite (contributors on one side, editor and files on the
+other) and has no triangles, so **FI is always 1.0** for it. The useful views
+are blast radius (which files a model touched), policy rules such as
+`{"kind": "forbidden_link", "target": "agent:* → file:infra/*"}` and anomaly
+detection (a new model, new files touched).
+
+Formats are detected from the content, not only the extension:
+`.agent-trace/traces.jsonl` is routed to the Cursor parser although it ends in
+`.jsonl`. A directory is scanned for every supported format: Claude Code
+sessions, `.agent-trace/` folders and `*.agent-trace` files (MCP server logs are
+left out; they enrich sessions via `--include-mcp`).
+
 ## How Claude Code sessions map to graphs
 
 | Log content | Graph |
@@ -345,6 +445,7 @@ tools: each shared tool closes a triangle with the orchestrator.
 
 - [x] Claude Code (JSONL logs from ~/.claude/)
 - [x] Claude Code MCP server logs (`--include-mcp`)
+- [x] Cursor Agent Trace (code provenance; `.agent-trace/`)
 - [ ] CrewAI (planned)
 - [ ] LangGraph (planned)
 - [ ] AutoGen (planned)

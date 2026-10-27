@@ -1,3 +1,6 @@
+# agent-certify — Structural verification of multiagent systems
+# Copyright 2026 Cognitive Engineering (Switzerland)
+# SPDX-License-Identifier: BSL-1.1
 """Command-line interface.
 
     agent-certify scan <session.jsonl | project-dir> [--format text|json|markdown|html] [-o FILE]
@@ -7,6 +10,8 @@
                         [--baseline FILE | --no-baseline] [--policy FILE | --no-policy] [--perspective P]
     agent-certify learn <session.jsonl | dir>... [-o FILE]
     agent-certify suggest-policy [--baseline FILE] [-o FILE] [--force]
+    agent-certify mcp                     # MCP server on stdio
+    (scan and watch take --otel / --otel-stdout to emit OpenTelemetry spans)
     agent-certify blast <path> --node bash
     agent-certify keygen signing.key
     agent-certify certify <path> --key signing.key -o system.cert.json
@@ -19,12 +24,13 @@ session's agents and tools combined); ``html``, ``blast``, ``certify`` and
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import os
 import sys
 import textwrap
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from agent_certify import __version__
@@ -33,7 +39,10 @@ from agent_certify.baseline import DEFAULT_BASELINE_PATH, Baseline, BaselineLear
 from agent_certify.blast import BlastRadiusAnalyzer
 from agent_certify.certificate import AgentCertificate, generate_keypair
 from agent_certify.graph import AgentGraph
-from agent_certify.parser import ClaudeCodeParser, MCPLogsParser
+from agent_certify.mcp_server import AgentCertifyMCPServer
+from agent_certify.otel import DEFAULT_TRACES_PATH, OTelExporter
+from agent_certify.parser import AutoParser, MCPLogsParser
+from agent_certify.parser.auto import is_trace_dir
 from agent_certify.policy import DEFAULT_POLICY_PATH, Policy, PolicyGenerator, PolicyViolation
 from agent_certify.scanner import AgentFIScanner, Perspective, ScanResult
 from agent_certify.watcher import SessionWatcher, latest_session
@@ -48,18 +57,23 @@ def _path(p: str) -> Path:
 def load(path: str, include_mcp: bool = False) -> tuple[list[AgentGraph], AgentGraph]:
     """(per-session graphs, merged graph) for a session file or a directory.
 
-    ``include_mcp`` adds each session's calls from the MCP server logs.
+    The format is detected from the content (Claude Code transcript, Cursor
+    Agent Trace, MCP server log). ``include_mcp`` adds each session's calls from
+    the MCP server logs.
     """
     p = _path(path)
-    parser = ClaudeCodeParser()
-    if p.is_file():
-        graphs = [parser.parse(str(p))]
-    elif p.is_dir():
-        graphs = parser.parse_directory(str(p))
-        if not graphs:
-            raise SystemExit(f"agent-certify: no .jsonl sessions found under {p}")
-    else:
-        raise SystemExit(f"agent-certify: {p} does not exist")
+    parser = AutoParser()
+    try:
+        if p.is_file() or is_trace_dir(p):
+            graphs = [parser.parse(str(p))]
+        elif p.is_dir():
+            graphs = parser.parse_directory(str(p))
+            if not graphs:
+                raise SystemExit(f"agent-certify: no sessions (.jsonl, .agent-trace) found under {p}")
+        else:
+            raise SystemExit(f"agent-certify: {p} does not exist")
+    except ValueError as exc:
+        raise SystemExit(f"agent-certify: {exc}") from exc
     if include_mcp:
         mcp = MCPLogsParser()
         enriched, added = [], 0
@@ -244,6 +258,26 @@ def _violations_text(violations: list[PolicyViolation]) -> str:
 
 
 def cmd_scan(args) -> int:
+    started = datetime.now(timezone.utc)
+    otel = args.otel or args.otel_stdout
+    # --otel-stdout keeps stdout for OTLP lines (to pipe into a collector); the report goes to stderr.
+    with contextlib.redirect_stdout(sys.stderr) if args.otel_stdout else contextlib.nullcontext():
+        graphs, baseline, policy = _scan_report(args)
+    if otel:
+        exporter = OTelExporter()
+        detector = AnomalyDetector(baseline) if baseline else None
+        written = None
+        for g in graphs:                                    # one span per session
+            r = AgentFIScanner(g, perspective=args.perspective).scan()
+            span = exporter.export_scan(g, r, detector.detect(g, r) if detector else None,
+                                        policy.check(g) if policy else None, start_time=started)
+            written = exporter.write(span, args.otel_file, stdout=args.otel_stdout)
+        if written:
+            print(f"OTel: {len(graphs)} span(s) appended to {written.as_posix()}", file=sys.stderr)
+    return 0
+
+
+def _scan_report(args):
     graphs, merged = load(args.path, include_mcp=args.include_mcp)
     result = AgentFIScanner(merged, perspective=args.perspective).scan()
     baseline, source = _find_baseline(args)
@@ -293,7 +327,7 @@ def cmd_scan(args) -> int:
         if policy_source:
             text += f"\nPolicy:   {policy_source} ({len(policy.rules)} rules)"
         _emit(text, args.output)
-    return 0
+    return graphs, baseline, policy
 
 
 def cmd_watch(args) -> int:
@@ -306,8 +340,25 @@ def cmd_watch(args) -> int:
         session = p                     # may not exist yet: the watcher waits for it
     baseline, _ = _find_baseline(args)
     policy, _ = _find_policy(args)
+    on_scan, out = None, print
+    if args.otel or args.otel_stdout:
+        exporter = OTelExporter()
+
+        def on_scan(graph, result, report, violations, started):
+            exporter.write(exporter.export_scan(graph, result, report, violations, start_time=started),
+                           args.otel_file, stdout=args.otel_stdout)
+
+        if args.otel_stdout:
+            def out(line):
+                print(line, file=sys.stderr)
     SessionWatcher(str(session), baseline=baseline, policy=policy, interval=args.interval,
-                   perspective=args.perspective, max_scans=args.scans, max_seconds=args.duration).watch()
+                   perspective=args.perspective, max_scans=args.scans, max_seconds=args.duration,
+                   out=out, on_scan=on_scan).watch()
+    return 0
+
+
+def cmd_mcp(args) -> int:
+    AgentCertifyMCPServer().run()
     return 0
 
 
@@ -412,6 +463,14 @@ def _baseline_args(p: argparse.ArgumentParser) -> None:
     g.add_argument("--no-baseline", action="store_true", help="skip anomaly detection")
 
 
+def _otel_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--otel", action="store_true",
+                   help=f"append an OpenTelemetry span per scan (OTLP/JSON) to {DEFAULT_TRACES_PATH.as_posix()}")
+    p.add_argument("--otel-stdout", action="store_true",
+                   help="write the OTLP/JSON spans to stdout instead (the report moves to stderr)")
+    p.add_argument("--otel-file", help=f"span file (default: {DEFAULT_TRACES_PATH.as_posix()})")
+
+
 def _policy_args(p: argparse.ArgumentParser) -> None:
     g = p.add_mutually_exclusive_group()
     g.add_argument("--policy", help=f"policy to enforce (default: {DEFAULT_POLICY_PATH} if present)")
@@ -434,6 +493,7 @@ def build_parser() -> argparse.ArgumentParser:
     _policy_args(s)
     s.add_argument("--include-mcp", action="store_true",
                    help="add the session's calls from MCP server logs (claude-cli-nodejs cache)")
+    _otel_args(s)
     s.set_defaults(func=cmd_scan)
 
     w = sub.add_parser("watch", help="watch an active session live")
@@ -444,6 +504,7 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--duration", type=float, help="stop after this many seconds (default: until Ctrl+C)")
     _baseline_args(w)
     _policy_args(w)
+    _otel_args(w)
     w.set_defaults(func=cmd_watch)
 
     sp = sub.add_parser("suggest-policy", help="draft a policy from a learned baseline")
@@ -451,6 +512,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("-o", "--output", help=f"where to write the draft (default: {DEFAULT_POLICY_PATH})")
     sp.add_argument("--force", action="store_true", help="overwrite an existing policy file")
     sp.set_defaults(func=cmd_suggest_policy)
+
+    m = sub.add_parser("mcp", help="run as an MCP server on stdio (claude mcp add agent-certify -- agent-certify mcp)")
+    m.set_defaults(func=cmd_mcp)
 
     learn = sub.add_parser("learn", help="learn a statistical baseline from past sessions")
     learn.add_argument("paths", nargs="+", help="session .jsonl files and/or directories of sessions")

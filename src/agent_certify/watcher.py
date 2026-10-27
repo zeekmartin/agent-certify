@@ -1,3 +1,6 @@
+# agent-certify — Structural verification of multiagent systems
+# Copyright 2026 Cognitive Engineering (Switzerland)
+# SPDX-License-Identifier: BSL-1.1
 """Live monitoring of an active Claude Code session.
 
 The transcript is append-only. The watcher polls its size (plus the sizes of
@@ -20,6 +23,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 
 from agent_certify.anomaly import AnomalyDetector
@@ -46,7 +50,10 @@ class SessionWatcher:
     In a thread, call :meth:`stop` to end it; ``max_scans`` ends it after that
     many scans, ``max_seconds`` after that much time (scans only happen when the
     session grows, so a quiet session needs the latter). ``history`` keeps one
-    summary dict per scan.
+    summary dict per scan. ``on_scan(graph, result, report, violations, started_at)`` is
+    called after every scan with all of that scan's anomalies (an
+    :class:`AnomalyReport`, or None without a baseline) and policy violations
+    (a list, or None without a policy), not only the newly reported ones.
     """
 
     def __init__(
@@ -61,6 +68,7 @@ class SessionWatcher:
         max_scans: int | None = None,
         max_seconds: float | None = None,
         out: Callable[[str], None] = print,
+        on_scan: Callable | None = None,
     ):
         if interval <= 0:
             raise ValueError("interval must be positive")
@@ -75,6 +83,7 @@ class SessionWatcher:
         self.max_scans = max_scans
         self.max_seconds = max_seconds
         self.out = out
+        self.on_scan = on_scan
         self.history: list[dict] = []
         self._stop = threading.Event()
         self._last_size: int | None = None
@@ -150,6 +159,7 @@ class SessionWatcher:
         parser_log = logging.getLogger("agent_certify.parser.claude_code")
         level = parser_log.level
         parser_log.setLevel(logging.ERROR)     # a half-written last line is normal here
+        started = datetime.now(timezone.utc)
         try:
             parser = ClaudeCodeParser()
             graph = parser.parse(str(self.session_path))
@@ -169,7 +179,7 @@ class SessionWatcher:
             role = graph.role(nid)
             self.out(f"  ⚡ New node appeared: {nid}" + (f" ({role})" if role != nid else ""))
 
-        anomalies = []
+        anomalies, report, all_violations = [], None, None
         if self.baseline:
             report = AnomalyDetector(self.baseline).detect(graph, result)
             for a in report.anomalies:
@@ -179,7 +189,8 @@ class SessionWatcher:
                     self.on_anomaly(a)
         violations = []
         if self.policy:
-            for v in self.policy.check(graph):
+            all_violations = self.policy.check(graph)
+            for v in all_violations:
                 if self._is_new(("policy", v.rule.kind, v.rule.target, v.message), v.severity):
                     violations.append(v)
                     self.on_policy_violation(v)
@@ -188,6 +199,8 @@ class SessionWatcher:
                              "fi": result.fi, "calls": graph.total_tool_calls, "new_nodes": new_nodes,
                              "anomalies": anomalies, "violations": violations})
         self._last_graph, self._last_fi, self._last_result = graph, result.fi, result
+        if self.on_scan:
+            self.on_scan(graph, result, report, all_violations, started)
 
     @staticmethod
     def _ident(a) -> str:

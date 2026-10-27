@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-certify"
-version = "0.3.0"
+version = "0.4.0"
 description = "Structural verification of multiagent systems"
 readme = "README.md"
 license = {text = "BSL-1.1"}
@@ -28,6 +28,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# The MCP server, OTel exporter and Cursor parser need nothing beyond the core
+# dependencies; these extras exist so `pip install agent-certify[mcp]` etc. work.
+mcp = []           # stdio MCP server, no `mcp` package
+otel = []          # OTLP/JSON spans, no OpenTelemetry SDK
+cursor = []        # Cursor Agent Trace parser
+all = []
 dev = ["pytest>=7.0", "pytest-cov", "ruff"]
 
 [project.scripts]

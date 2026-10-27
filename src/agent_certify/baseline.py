@@ -1,3 +1,6 @@
+# agent-certify — Structural verification of multiagent systems
+# Copyright 2026 Cognitive Engineering (Switzerland)
+# SPDX-License-Identifier: BSL-1.1
 """Statistical baseline learned from past sessions.
 
 A :class:`Baseline` summarises what "normal" looks like for a system: the
@@ -124,10 +127,10 @@ class BaselineLearner:
     """
 
     def __init__(self, parser=None):
-        """If parser is None, use ClaudeCodeParser."""
+        """If parser is None, auto-detect each input's format (Claude Code, Cursor Agent Trace)."""
         if parser is None:
-            from agent_certify.parser import ClaudeCodeParser
-            parser = ClaudeCodeParser()
+            from agent_certify.parser import AutoParser
+            parser = AutoParser()
         self.parser = parser
 
     def learn(self, paths: list[str]) -> Baseline:

@@ -1,3 +1,6 @@
+# agent-certify — Structural verification of multiagent systems
+# Copyright 2026 Cognitive Engineering (Switzerland)
+# SPDX-License-Identifier: BSL-1.1
 """Parser interface: turn a framework's logs into an :class:`AgentGraph`."""
 from __future__ import annotations
 

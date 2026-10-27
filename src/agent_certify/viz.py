@@ -1,3 +1,6 @@
+# agent-certify — Structural verification of multiagent systems
+# Copyright 2026 Cognitive Engineering (Switzerland)
+# SPDX-License-Identifier: BSL-1.1
 """Self-contained HTML view of an agent graph.
 
 One file, inline SVG, a few lines of inline script, no external requests.
@@ -21,7 +24,7 @@ from agent_certify.graph import AgentGraph
 from agent_certify.scanner import HIGH, LEVELS, LOW, AgentFIScanner, Perspective, ScanResult
 
 W, H = 960, 680
-_RING = {"orchestrator": 0.0, "human": 0.55, "agent": 0.45, "tool": 0.9}
+_RING = {"orchestrator": 0.0, "human": 0.55, "agent": 0.45, "tool": 0.9, "file": 0.9}
 
 
 def layout(graph: AgentGraph, iterations: int = 400, seed: int = 7) -> dict[str, tuple[float, float]]:
@@ -111,7 +114,7 @@ def render_html(graph: AgentGraph, result: ScanResult | None = None, title: str 
     for nid, n in sorted(graph.nodes.items()):
         x, y = pos[nid]
         role = f"lvl-{result.node_levels.get(nid, LOW)}"
-        r = 9 + 13 * math.sqrt(n.call_count / max_calls) if n.kind == "tool" else 20
+        r = 9 + 13 * math.sqrt(n.call_count / max_calls) if n.kind == "tool" else (8 if n.kind == "file" else 20)
         if n.kind == "orchestrator":
             r = 26
         if n.kind in ("orchestrator", "agent"):
@@ -121,6 +124,8 @@ def render_html(graph: AgentGraph, result: ScanResult | None = None, title: str 
             shape = f'<polygon points="{x:.1f},{y - r:.1f} {x + r:.1f},{y:.1f} {x:.1f},{y + r:.1f} {x - r:.1f},{y:.1f}"/>'
         else:
             shape = f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{r:.1f}"/>'
+        if n.kind == "file":                       # code written (Cursor Agent Trace): small square
+            shape = f'<rect x="{x - r:.1f}" y="{y - r:.1f}" width="{2 * r:.1f}" height="{2 * r:.1f}" rx="2"/>'
         label = _short(n.name if n.kind != "agent" else n.name.split(":", 1)[-1].strip() or n.name)
         node_svg.append(
             f'<g class="node {role} {n.kind}" data-id="{html.escape(nid)}" tabindex="0">{shape}'
@@ -229,7 +234,7 @@ aside dl {{ margin:0; }} aside dt {{ color:var(--muted); font-size:12px; margin-
 </main>
 <div class="legend">
 {legend}
-<span>▭ agent · ● tool (size = calls) · ◆ human</span>
+<span>▭ agent · ● tool (size = calls) · ◆ human · ■ file</span>
 <span style="color:var(--bridge)">- - - bridge (no backup path)</span>
 </div>
 <script>

@@ -1,3 +1,6 @@
+# agent-certify — Structural verification of multiagent systems
+# Copyright 2026 Cognitive Engineering (Switzerland)
+# SPDX-License-Identifier: BSL-1.1
 """Signed structural baseline of a multiagent system.
 
 An :class:`AgentCertificate` records a system's topology (which agents exist,

@@ -1,3 +1,6 @@
+# agent-certify — Structural verification of multiagent systems
+# Copyright 2026 Cognitive Engineering (Switzerland)
+# SPDX-License-Identifier: BSL-1.1
 """Agent graph data model.
 
 An :class:`AgentGraph` is the communication topology of a multiagent session:
@@ -11,14 +14,14 @@ import copy
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 
-NODE_KINDS = ("human", "orchestrator", "agent", "tool")
+NODE_KINDS = ("human", "orchestrator", "agent", "tool", "file")   # file: code written (Cursor agent-trace)
 
 
 @dataclass
 class AgentNode:
     """A node in the agent graph — an agent or a tool."""
     id: str                          # unique identifier
-    kind: str                        # "agent", "tool", "human", "orchestrator"
+    kind: str                        # "agent", "tool", "human", "orchestrator", "file"
     name: str                        # display name (e.g., "Bash", "Edit", "sub-agent-1")
     call_count: int = 0              # how many times this node was invoked
     error_count: int = 0             # how many times it returned an error

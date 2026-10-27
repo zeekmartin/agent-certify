@@ -1,3 +1,6 @@
+# agent-certify — Structural verification of multiagent systems
+# Copyright 2026 Cognitive Engineering (Switzerland)
+# SPDX-License-Identifier: BSL-1.1
 """MCP server logs parser.
 
 Claude Code writes one JSONL log per MCP server and process start:
@@ -188,7 +191,7 @@ class MCPLogsParser(BaseParser):
     @staticmethod
     def _server(path: Path) -> str:
         name = path.parent.name
-        return name.removeprefix(_LOG_DIR_PREFIX)
+        return name.removeprefix(_LOG_DIR_PREFIX) if name.startswith(_LOG_DIR_PREFIX) else "unknown"
 
     @staticmethod
     def _existing_node(g: AgentGraph, server: str, tool: str) -> str | None:

@@ -1,3 +1,6 @@
+# agent-certify — Structural verification of multiagent systems
+# Copyright 2026 Cognitive Engineering (Switzerland)
+# SPDX-License-Identifier: BSL-1.1
 """Quick demo on this machine's Claude Code sessions.
 
 Picks the session with the most sub-agents (ties broken by tool calls) under
