@@ -13,15 +13,71 @@ other. Call counts do not enter FI; it is a property of the topology alone.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from typing import ClassVar
 
 import numpy as np
 
 from agent_certify.graph import AgentEdge, AgentGraph
 
 CRITICAL, BUFFER, IMMUNE = "CRITICAL", "BUFFER", "IMMUNE"
+HIGH, MEDIUM, LOW = "high", "medium", "low"
+LEVELS = (HIGH, MEDIUM, LOW)
 DEFAULT_CRITICAL_THR = 0.10
 DEFAULT_IMMUNE_THR = 0.02
+
+
+class Perspective:
+    """Maps structural roles to domain-appropriate labels.
+
+    The scanner measures one structural level per node; a perspective only
+    names it. The levels:
+
+      * high:   an articulation point (removing the node disconnects the
+                system), or removing it raises FI by >= 10% (relative)
+      * medium: removing it raises FI by 2-10%
+      * low:    removing it raises FI by < 2%, or lowers it
+
+    ``classic`` is the v0.1 vocabulary and the Python API default; the CLI
+    defaults to ``engineering``.
+    """
+
+    CLASSIC: ClassVar[dict[str, str]] = {HIGH: CRITICAL, MEDIUM: BUFFER, LOW: IMMUNE}
+
+    ENGINEERING: ClassVar[dict[str, str]] = {
+        HIGH: "KEYSTONE",          # the structure stands or falls with it
+        MEDIUM: "LOAD-BEARING",    # carries redundancy others rely on
+        LOW: "PERIPHERAL",         # minimal structural impact
+    }
+
+    RISK: ClassVar[dict[str, str]] = {
+        HIGH: "HIGH RISK",
+        MEDIUM: "MODERATE RISK",
+        LOW: "LOW RISK",
+    }
+
+    COMPLIANCE: ClassVar[dict[str, str]] = {
+        HIGH: "UNRESTRICTED",      # failure or compromise propagates widely
+        MEDIUM: "BOUNDED",         # contained impact
+        LOW: "LOGGED",             # minimal impact, tracked
+    }
+
+    MONITORING: ClassVar[dict[str, str]] = {
+        HIGH: "WATCH",             # monitor closely
+        MEDIUM: "TRACK",           # routine monitoring
+        LOW: "IGNORE",             # no action needed
+    }
+
+    DEFAULT = "classic"
+    NAMES = ("engineering", "risk", "compliance", "monitoring", "classic")
+
+    @classmethod
+    def labels(cls, name: str | None = None) -> dict[str, str]:
+        """The level -> label mapping for ``name`` (case-insensitive)."""
+        key = (name or cls.DEFAULT).lower()
+        if key not in cls.NAMES:
+            raise ValueError(f"unknown perspective {name!r}; choose from {', '.join(cls.NAMES)}")
+        return dict(getattr(cls, key.upper()))
 
 
 def compute_fi(adjacency) -> float:
@@ -121,23 +177,40 @@ class ScanResult:
     articulation_points: list[str] = field(default_factory=list)
     fi_deltas: dict[str, float] = field(default_factory=dict)           # FI change on removing each node
     components: int = 1
+    node_levels: dict[str, str] = field(default_factory=dict)           # high / medium / low
+    perspective: str = Perspective.DEFAULT
+
+    def __post_init__(self):
+        if not self.node_levels and self.node_classifications:
+            inverse = {v: k for k, v in Perspective.labels(self.perspective).items()}
+            self.node_levels = {n: inverse[c] for n, c in self.node_classifications.items()}
+
+    def labels(self, perspective: str | None = None) -> dict[str, str]:
+        """Node labels under ``perspective`` (default: this result's own)."""
+        names = Perspective.labels(perspective or self.perspective)
+        return {n: names[lvl] for n, lvl in self.node_levels.items()}
+
+    def with_perspective(self, perspective: str) -> ScanResult:
+        """The same result, labelled under another perspective."""
+        return replace(self, node_classifications=self.labels(perspective), perspective=perspective.lower())
 
     @property
     def critical_nodes(self) -> list[str]:
-        return sorted(n for n, c in self.node_classifications.items() if c == CRITICAL)
+        return sorted(n for n, lvl in self.node_levels.items() if lvl == HIGH)
 
     @property
     def buffer_nodes(self) -> list[str]:
-        return sorted(n for n, c in self.node_classifications.items() if c == BUFFER)
+        return sorted(n for n, lvl in self.node_levels.items() if lvl == MEDIUM)
 
     @property
     def immune_nodes(self) -> list[str]:
-        return sorted(n for n, c in self.node_classifications.items() if c == IMMUNE)
+        return sorted(n for n, lvl in self.node_levels.items() if lvl == LOW)
 
     def summary(self) -> str:
+        names = Perspective.labels(self.perspective)
         return (f"FI={self.fi:.4f} | {self.node_count} nodes, {self.edge_count} links, "
-                f"{len(self.bridges)} bridges | {len(self.critical_nodes)} critical, "
-                f"{len(self.buffer_nodes)} buffer, {len(self.immune_nodes)} immune")
+                f"{len(self.bridges)} bridges | {len(self.critical_nodes)} {names[HIGH].lower()}, "
+                f"{len(self.buffer_nodes)} {names[MEDIUM].lower()}, {len(self.immune_nodes)} {names[LOW].lower()}")
 
     def to_dict(self) -> dict:
         return {
@@ -148,7 +221,9 @@ class ScanResult:
             "bridges": [[e.source, e.target] for e in self.bridges],
             "fragile_edges": [list(e) for e in self.fragile_edges],
             "articulation_points": self.articulation_points,
+            "perspective": self.perspective,
             "node_classifications": self.node_classifications,
+            "node_levels": self.node_levels,
             "fi_deltas": self.fi_deltas,
         }
 
@@ -162,19 +237,26 @@ class AgentFIScanner:
         result.fi                     # 0.0 .. 1.0
         result.bridges                # AgentEdge list
         result.node_classifications   # {"tool:Bash": "IMMUNE", "claude": "CRITICAL", ...}
+        result.labels("engineering")  # {"tool:Bash": "PERIPHERAL", "claude": "KEYSTONE", ...}
 
     A node is CRITICAL when removing it raises FI by at least ``critical_thr``
     (relative), BUFFER between ``immune_thr`` and ``critical_thr``, IMMUNE
-    below (including nodes whose removal lowers FI). A node whose removal disconnects the graph (an articulation point)
-    is CRITICAL regardless of FI: it is a single point of failure even when the
-    fraction of fragile links happens not to move. ``scan()`` also stores each
-    edge's triangle count in ``edge.tri_count``.
+    below (including nodes whose removal lowers FI). A node whose removal
+    disconnects the graph (an articulation point) is CRITICAL regardless of FI:
+    it is a single point of failure even when the fraction of fragile links
+    happens not to move. ``scan()`` also stores each edge's triangle count in
+    ``edge.tri_count``.
+
+    These are the ``classic`` labels of the high / medium / low levels;
+    ``perspective=`` picks another vocabulary (see :class:`Perspective`).
     """
 
     def __init__(self, graph: AgentGraph, critical_thr: float = DEFAULT_CRITICAL_THR,
-                 immune_thr: float = DEFAULT_IMMUNE_THR):
+                 immune_thr: float = DEFAULT_IMMUNE_THR, perspective: str = Perspective.DEFAULT):
         if not 0 <= immune_thr <= critical_thr:
             raise ValueError("need 0 <= immune_thr <= critical_thr")
+        Perspective.labels(perspective)          # validate early
+        self.perspective = perspective.lower()
         self.graph = graph
         self.critical_thr = critical_thr
         self.immune_thr = immune_thr
@@ -186,11 +268,14 @@ class AgentFIScanner:
             e.tri_count = tri.get(e.key, 0)
         fi = self._compute_fi()
         bridges = self._find_bridges()
-        node_classes, deltas, cut_nodes = self._classify_nodes(fi)
+        levels, deltas, cut_nodes = self._classify_nodes(fi)
+        names = Perspective.labels(self.perspective)
         return ScanResult(
             fi=fi,
             bridges=bridges,
-            node_classifications=node_classes,
+            node_classifications={n: names[lvl] for n, lvl in levels.items()},
+            node_levels=levels,
+            perspective=self.perspective,
             node_count=len(self.graph.nodes),
             edge_count=len(tri),
             fragile_edges=sorted(tuple(sorted(k)) for k, v in tri.items() if v == 0),
@@ -210,7 +295,7 @@ class AgentFIScanner:
         return [e for e in self.graph.edges if e.key in keys]
 
     def _classify_nodes(self, base_fi: float) -> tuple[dict[str, str], dict[str, float], set[str]]:
-        """Classify each node as CRITICAL, BUFFER, or IMMUNE.
+        """Assign each node a structural level: high, medium or low.
 
         Only an *increase* counts: a node whose removal lowers FI was holding up
         fragile links, not redundancy. (sal-torch's layer classifier uses the
@@ -225,9 +310,9 @@ class AgentFIScanner:
             delta = (new_fi - base_fi) / base_fi if base_fi > 1e-12 else new_fi - base_fi
             deltas[nid] = round(new_fi - base_fi, 6)
             if nid in cut_nodes or delta >= self.critical_thr:
-                classes[nid] = CRITICAL
+                classes[nid] = HIGH
             elif delta >= self.immune_thr:
-                classes[nid] = BUFFER
+                classes[nid] = MEDIUM
             else:
-                classes[nid] = IMMUNE
+                classes[nid] = LOW
         return classes, deltas, cut_nodes

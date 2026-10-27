@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-certify"
-version = "0.1.0"
+version = "0.2.0"
 description = "Structural verification of multiagent systems"
 readme = "README.md"
 license = {text = "BSL-1.1"}

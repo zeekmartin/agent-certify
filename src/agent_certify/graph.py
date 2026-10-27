@@ -50,6 +50,8 @@ class AgentGraph:
     total_messages: int = 0
     total_tool_calls: int = 0
     duration_seconds: float | None = None
+    started_at: str | None = None        # ISO 8601, UTC
+    ended_at: str | None = None
 
     # ------------------------------------------------------------- building
     def add_node(self, node_id: str, kind: str, name: str | None = None, **metadata) -> AgentNode:
@@ -185,6 +187,8 @@ class AgentGraph:
             "total_messages": self.total_messages,
             "total_tool_calls": self.total_tool_calls,
             "duration_seconds": self.duration_seconds,
+            "started_at": self.started_at,
+            "ended_at": self.ended_at,
             "nodes": [asdict(n) for n in self.nodes.values()],
             "edges": [asdict(e) for e in self.edges],
         }
@@ -194,7 +198,8 @@ class AgentGraph:
         g = cls(session_id=data.get("session_id"), project=data.get("project"),
                 total_messages=data.get("total_messages", 0),
                 total_tool_calls=data.get("total_tool_calls", 0),
-                duration_seconds=data.get("duration_seconds"))
+                duration_seconds=data.get("duration_seconds"),
+                started_at=data.get("started_at"), ended_at=data.get("ended_at"))
         for n in data.get("nodes", []):
             g.nodes[n["id"]] = AgentNode(**n)
         g.edges = [AgentEdge(**e) for e in data.get("edges", [])]
@@ -226,6 +231,10 @@ class AgentGraph:
                 durations.append(g.duration_seconds)
             if g.project:
                 projects.add(g.project)
+            if g.started_at and (out.started_at is None or g.started_at < out.started_at):
+                out.started_at = g.started_at
+            if g.ended_at and (out.ended_at is None or g.ended_at > out.ended_at):
+                out.ended_at = g.ended_at
         out.duration_seconds = sum(durations) if durations else None
         out.project = projects.pop() if len(projects) == 1 else None
         return out

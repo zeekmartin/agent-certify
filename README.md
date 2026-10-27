@@ -40,7 +40,15 @@ print(f"System fragmented: {report.system_fragmented}")
 agent-certify scan ~/.claude/projects/                       # every session, plus a merged graph
 agent-certify scan ~/.claude/projects/<project>/<session>.jsonl
 agent-certify scan <path> --format json|markdown|html [-o FILE]
+agent-certify scan <path> --perspective engineering|risk|compliance|monitoring
 agent-certify blast ~/.claude/projects/ --node bash
+
+# Baseline and anomaly detection
+agent-certify learn ~/.claude/projects/C--dev-myproject/     # writes .agent-certify/baseline.json
+agent-certify learn s1.jsonl s2.jsonl s3.jsonl --output ./my-baseline.json
+agent-certify scan session.jsonl                             # compares against ./.agent-certify/baseline.json if present
+agent-certify scan session.jsonl --baseline path/to/baseline.json
+agent-certify scan session.jsonl --no-baseline
 
 # Structural baseline and drift detection
 agent-certify keygen signing.key                             # writes signing.key and signing.key.pub
@@ -68,14 +76,117 @@ with no edges has FI 0.
 Every bridge has `tri(e) = 0`, but not every fragile link is a bridge: a
 4-cycle has FI 1 and no bridges.
 
-## Node classification
+## Node classification and perspectives
 
-Each node is removed in turn and FI recomputed.
+Each node is removed in turn and FI recomputed. That gives every node one
+structural **level**:
 
-- **CRITICAL**: removing this agent/tool raises system FI by ≥ 10% (relative), or
+- **high**: removing this agent/tool raises system FI by ≥ 10% (relative), or
   the node is an articulation point (removing it disconnects the system)
-- **BUFFER**: raises FI by 2–10%
-- **IMMUNE**: raises FI by less than 2%, or lowers it
+- **medium**: raises FI by 2–10%
+- **low**: raises FI by less than 2%, or lowers it
+
+A **perspective** names the levels for the people reading the report. The
+measurement is the same under every perspective; only the words (and the
+colours in the HTML view) change.
+
+| Perspective | high | medium | low | Use it when |
+|---|---|---|---|---|
+| `engineering` (CLI default) | KEYSTONE | LOAD-BEARING | PERIPHERAL | designing or refactoring the agent architecture |
+| `risk` | HIGH RISK | MODERATE RISK | LOW RISK | threat modelling, security review |
+| `compliance` | UNRESTRICTED | BOUNDED | LOGGED | audits, access reviews, regulatory reports |
+| `monitoring` | WATCH | TRACK | IGNORE | deciding where to point runtime alerts |
+| `classic` | CRITICAL | BUFFER | IMMUNE | v0.1 labels; the Python API default |
+
+```python
+result = AgentFIScanner(graph, perspective="risk").scan()
+result.node_classifications        # {"claude": "HIGH RISK", ...}
+result.node_levels                 # {"claude": "high", ...}
+result.labels("compliance")        # same result, other vocabulary
+```
+
+## Baselines
+
+`agent-certify learn` reads N past sessions and records what normal looks like:
+
+- mean ± std of FI, node count, link count, bridge count, sub-agent count and
+  error rate (errors / tool calls), plus FI's range and the most sub-agents seen
+- every tool seen, and the fraction of sessions it appears in
+- every invocation link seen (`source -> target`)
+
+Sub-agent ids are unique per spawn, so links are recorded by role: a sub-agent
+counts as `agent:<type>` (`agent:Explore`, `agent:general-purpose`). Standard
+deviations are population deviations, so a baseline learned from one session
+has std 0.
+
+The baseline is saved to `.agent-certify/baseline.json` in the current
+directory (`--output` to change). `scan` picks it up from there automatically.
+The baseline is optional: without one, `scan` behaves exactly as without
+anomaly detection.
+
+```python
+from agent_certify import AgentFIScanner, AnomalyDetector, BaselineLearner
+
+learner = BaselineLearner()
+baseline = learner.learn(["~/.claude/projects/C--dev-myproject/"])
+learner.save(baseline)
+
+report = AnomalyDetector(baseline).detect(graph, AgentFIScanner(graph).scan())
+report.has_critical
+print(report)
+```
+
+## Anomaly detection
+
+| Check | Flags | Severity |
+|---|---|---|
+| `new_tool` | a tool never seen in the baseline | critical |
+| `new_link` | an invocation path never seen (links to a new tool are not repeated) | warning |
+| `fi_deviation` | FI more than 2σ from the mean | warning; critical past 3σ when FI *rose* |
+| `error_rate` | error rate more than 2σ *above* the mean | warning; critical past 3σ |
+| `sub_agents` | more sub-agents than ever seen, or 2σ above the mean | warning; critical when above the max *and* past 3σ |
+| `node_count` | node count more than 2σ from the mean | info; warning past 3σ |
+
+- **critical**: something structurally new or a large move toward fragility. Look now.
+- **warning**: a structural change worth a look; often explained by the task.
+- **info**: unusual but benign on its own.
+
+A falling FI means added redundancy (usually sub-agents sharing tools). That is
+a structural change, not a risk in itself, so it never goes past warning. When
+the baseline never varied on a metric (std 0), z is undefined: any difference
+is reported with no z-score at the lower severity.
+
+For a directory, `scan` lists the anomaly count of each session in the
+session table.
+
+## Example workflow
+
+```bash
+# 1. Learn what normal looks like from the last few weeks of sessions
+agent-certify learn ~/.claude/projects/C--dev-myproject/
+
+# 2. Scan a new session; anomalies print above the node table
+agent-certify scan ~/.claude/projects/C--dev-myproject/<new-session>.jsonl
+
+# 3. Triage with the vocabulary your team uses
+agent-certify scan <new-session>.jsonl --perspective monitoring --format html -o review.html
+```
+
+```
+Fragility Index  0.3103   (9/29 links with tri(e)=0; baseline: 0.98 ± 0.09)
+
+⚠  ANOMALIES DETECTED (8):
+
+[CRITICAL] Sub-agents: 3 (baseline: 0.04 ± 0.20, max seen 1)
+           Types: agent:Explore, agent:general-purpose
+
+[WARNING]  New communication path: claude -> agent:Explore
+           Baseline: not among 35 known links
+
+[WARNING]  FI deviation: 0.31 (baseline: 0.98 ± 0.09, z = -7.8)
+           Sub-agents detected — shared tools add triangles; structural change expected
+...
+```
 
 ## Blast radius
 

@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Iterator
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from agent_certify.graph import AgentGraph
@@ -102,6 +102,8 @@ class ClaudeCodeParser(BaseParser):
         g.total_tool_calls = len(state.calls)
         if state.first and state.last:
             g.duration_seconds = (state.last - state.first).total_seconds()
+            g.started_at = _iso(state.first)
+            g.ended_at = _iso(state.last)
         if self.skipped_lines:
             logger.warning("%s: skipped %d malformed line(s)", p, self.skipped_lines)
         return g
@@ -167,7 +169,8 @@ class ClaudeCodeParser(BaseParser):
             linked = state.spawn_links.get(call_id)
             target = agent_id(linked or call_id or f"anon{len(state.calls)}")
             g.add_node(target, "agent", _agent_label(inp.get("subagent_type"), inp.get("description"), linked),
-                       spawned_via=name, spawn_call_id=call_id)
+                       spawned_via=name, spawn_call_id=call_id,
+                       **({"agentType": inp["subagent_type"]} if inp.get("subagent_type") else {}))
         else:
             target = tool_id(name)
             g.add_node(target, "tool", name)
@@ -239,6 +242,12 @@ def _agent_label(agent_type: str | None, description: str | None, aid: str | Non
     if parts:
         return ": ".join(parts)
     return f"agent-{aid}" if aid else "sub-agent"
+
+
+def _iso(ts: datetime) -> str:
+    if ts.tzinfo is not None:
+        ts = ts.astimezone(timezone.utc).replace(tzinfo=None)
+    return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _timestamp(value) -> datetime | None:

@@ -15,6 +15,40 @@ def star(n_tools: int = 4) -> AgentGraph:
     return g
 
 
+@pytest.fixture(autouse=True)
+def _isolated_cwd(tmp_path, monkeypatch):
+    """Run each test in an empty directory, so a real ./.agent-certify/baseline.json is never picked up."""
+    work = tmp_path / "cwd"
+    work.mkdir()
+    monkeypatch.chdir(work)
+
+
+def session_graph(session_id: str, tools: dict[str, int], errors: int = 0, agents: int = 0,
+                  cross_links: int = 0, start: str = "2026-10-01T10:00:00Z") -> AgentGraph:
+    """Synthetic session: claude calls ``tools`` (name -> calls), ``errors`` of them fail.
+
+    ``agents`` sub-agents of type ``Explore`` each call the first tool.
+    ``cross_links`` links tool i -> tool i+1, closing triangles with claude.
+    """
+    g = AgentGraph(session_id=session_id, project="synthetic", started_at=start, ended_at=start)
+    g.add_node("claude", "orchestrator")
+    names = list(tools)
+    for name, calls in tools.items():
+        g.add_node(f"tool:{name}", "tool", name)
+        g.add_call("claude", f"tool:{name}", count=calls)
+    for _ in range(errors):
+        g.record_error("claude", f"tool:{names[0]}")
+    for i in range(agents):
+        aid = f"agent:{session_id}-{i}"
+        g.add_node(aid, "agent", f"Explore: task {i}", agentType="Explore")
+        g.add_call("claude", aid)
+        g.add_call(aid, f"tool:{names[0]}")
+    for i in range(cross_links):
+        g.add_call(f"tool:{names[i]}", f"tool:{names[i + 1]}")
+    g.total_tool_calls = sum(tools.values()) + agents * 2
+    return g
+
+
 @pytest.fixture
 def star_graph():
     return star()

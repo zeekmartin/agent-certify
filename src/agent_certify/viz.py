@@ -1,9 +1,10 @@
 """Self-contained HTML view of an agent graph.
 
 One file, inline SVG, a few lines of inline script, no external requests.
-Nodes are coloured by role (IMMUNE green, BUFFER amber, CRITICAL red), edge
-width follows call count, bridges are dashed red. Hovering a node shows its
-blast radius and dims everything it cannot reach.
+Nodes are coloured by structural level (high red, medium amber, low green;
+labelled per perspective), edge width follows call count, bridges are dashed
+red. Hovering a node shows its blast radius and dims everything it cannot
+reach.
 """
 from __future__ import annotations
 
@@ -14,9 +15,10 @@ from pathlib import Path
 
 import numpy as np
 
+from agent_certify.anomaly import AnomalyReport
 from agent_certify.blast import BlastRadiusAnalyzer
 from agent_certify.graph import AgentGraph
-from agent_certify.scanner import AgentFIScanner, ScanResult
+from agent_certify.scanner import HIGH, LEVELS, LOW, AgentFIScanner, Perspective, ScanResult
 
 W, H = 960, 680
 _RING = {"orchestrator": 0.0, "human": 0.55, "agent": 0.45, "tool": 0.9}
@@ -67,9 +69,26 @@ def _short(name: str, limit: int = 22) -> str:
     return name if len(name) <= limit else name[: limit - 1] + "…"
 
 
-def render_html(graph: AgentGraph, result: ScanResult | None = None, title: str | None = None) -> str:
-    """Return the HTML page for ``graph``."""
+# (high, medium, low) fills per perspective, light then dark theme.
+_DEFAULT_COLORS = (("#dc2626", "#d97706", "#16a34a"), ("#f87171", "#f59e0b", "#22c55e"))
+_COLORS = {
+    "compliance": (("#dc2626", "#d97706", "#2563eb"), ("#f87171", "#f59e0b", "#60a5fa")),   # LOGGED: neutral blue
+    "monitoring": (("#dc2626", "#2563eb", "#a8a29e"), ("#f87171", "#60a5fa", "#78716c")),   # IGNORE: grey
+}
+
+
+def render_html(graph: AgentGraph, result: ScanResult | None = None, title: str | None = None,
+                perspective: str | None = None, anomalies: AnomalyReport | None = None) -> str:
+    """Return the HTML page for ``graph``.
+
+    ``perspective`` picks the role labels and colours (default: the result's
+    own perspective). ``anomalies`` adds a list of baseline anomalies.
+    """
     result = result or AgentFIScanner(graph).scan()
+    perspective = (perspective or result.perspective).lower()
+    names = Perspective.labels(perspective)
+    labels = result.labels(perspective)
+    light, dark = _COLORS.get(perspective, _DEFAULT_COLORS)
     blasts = BlastRadiusAnalyzer(graph).analyze_all()
     pos = layout(graph)
     bridge_keys = {e.key for e in result.bridges}
@@ -91,7 +110,7 @@ def render_html(graph: AgentGraph, result: ScanResult | None = None, title: str 
     node_svg = []
     for nid, n in sorted(graph.nodes.items()):
         x, y = pos[nid]
-        role = result.node_classifications.get(nid, "IMMUNE").lower()
+        role = f"lvl-{result.node_levels.get(nid, LOW)}"
         r = 9 + 13 * math.sqrt(n.call_count / max_calls) if n.kind == "tool" else 20
         if n.kind == "orchestrator":
             r = 26
@@ -111,7 +130,7 @@ def render_html(graph: AgentGraph, result: ScanResult | None = None, title: str 
     for nid, b in blasts.items():
         n = graph.nodes[nid]
         info[nid] = {
-            "name": n.name, "kind": n.kind, "role": result.node_classifications.get(nid),
+            "name": n.name, "kind": n.kind, "role": labels.get(nid),
             "calls": n.call_count, "errors": n.error_count,
             "direct": b.direct_impact, "reach": b.total_reachable, "tools": b.accessible_tools,
             "fi_after": round(b.remaining_fi, 4), "fragmented": b.system_fragmented,
@@ -125,24 +144,40 @@ def render_html(graph: AgentGraph, result: ScanResult | None = None, title: str 
         ("Nodes", str(result.node_count)),
         ("Links", str(result.edge_count)),
         ("Bridges", str(len(result.bridges))),
-        ("Critical", str(len(result.critical_nodes))),
+        (names[HIGH].title(), str(len(result.critical_nodes))),
         ("Tool calls", str(graph.total_tool_calls)),
         ("Duration", duration),
     ]
+    if anomalies is not None:
+        stats.append(("Anomalies", str(len(anomalies.anomalies))))
     stat_html = "".join(f'<div class="stat"><span>{html.escape(k)}</span><b>{html.escape(v)}</b></div>'
                         for k, v in stats)
     data = json.dumps(info).replace("</", "<\\/")
 
+    anomaly_html = ""
+    if anomalies is not None:
+        items = "".join(
+            f'<li class="sev-{html.escape(a.severity)}"><b>{html.escape(a.severity.upper())}</b> '
+            f'{html.escape(a.message)}' + (f'<div class="sub">{html.escape(a.detail)}</div>' if a.detail else "")
+            + "</li>" for a in anomalies.anomalies)
+        anomaly_html = (f'<section class="anomalies"><h2>{html.escape(anomalies.summary)}</h2>'
+                        f'<ul>{items}</ul></section>')
+
+    legend = "".join(f'<span><i class="sw" style="background:var(--{lvl})"></i>{html.escape(names[lvl])}</span>'
+                     for lvl in LEVELS)
     return _TEMPLATE.format(
         title=html.escape(title), stats=stat_html, w=W, h=H,
         edges="\n".join(edge_svg), nodes="\n".join(node_svg), data=data,
-        project=html.escape(graph.project or ""),
+        project=html.escape(graph.project or ""), legend=legend, anomalies=anomaly_html,
+        perspective=html.escape(perspective),
+        hl=light[0], ml=light[1], ll=light[2], hd=dark[0], md=dark[1], ld=dark[2],
     )
 
 
-def save_html(graph: AgentGraph, path, result: ScanResult | None = None, title: str | None = None) -> Path:
+def save_html(graph: AgentGraph, path, result: ScanResult | None = None, title: str | None = None,
+              perspective: str | None = None, anomalies: AnomalyReport | None = None) -> Path:
     p = Path(path)
-    p.write_text(render_html(graph, result, title), encoding="utf-8")
+    p.write_text(render_html(graph, result, title, perspective, anomalies), encoding="utf-8")
     return p
 
 
@@ -152,9 +187,10 @@ _TEMPLATE = """<!doctype html>
 <title>{title}</title>
 <style>
 :root {{ --bg:#fafaf9; --fg:#1c1917; --muted:#78716c; --panel:#ffffff; --line:#a8a29e; --border:#e7e5e4;
-  --immune:#16a34a; --buffer:#d97706; --critical:#dc2626; --bridge:#dc2626; }}
+  --high:{hl}; --medium:{ml}; --low:{ll}; --bridge:#dc2626; --warn:#d97706; --info:#2563eb; }}
 @media (prefers-color-scheme: dark) {{ :root {{ --bg:#1c1917; --fg:#f5f5f4; --muted:#a8a29e; --panel:#292524;
-  --line:#78716c; --border:#44403c; --immune:#22c55e; --buffer:#f59e0b; --critical:#f87171; --bridge:#f87171; }} }}
+  --line:#78716c; --border:#44403c; --high:{hd}; --medium:{md}; --low:{ld}; --bridge:#f87171;
+  --warn:#f59e0b; --info:#60a5fa; }} }}
 * {{ box-sizing:border-box; }}
 body {{ margin:0; font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif; background:var(--bg); color:var(--fg); }}
 header {{ padding:16px 20px 8px; }}
@@ -172,24 +208,27 @@ aside dl {{ margin:0; }} aside dt {{ color:var(--muted); font-size:12px; margin-
 .edge {{ stroke:var(--line); stroke-opacity:.7; }}
 .edge.bridge {{ stroke:var(--bridge); stroke-dasharray:6 4; stroke-opacity:.85; }}
 .node rect, .node circle, .node polygon {{ stroke:var(--panel); stroke-width:2; cursor:pointer; }}
-.node.immune > :first-child {{ fill:var(--immune); }} .node.buffer > :first-child {{ fill:var(--buffer); }}
-.node.critical > :first-child {{ fill:var(--critical); }}
+.node.lvl-low > :first-child {{ fill:var(--low); }} .node.lvl-medium > :first-child {{ fill:var(--medium); }}
+.node.lvl-high > :first-child {{ fill:var(--high); }}
+.anomalies {{ margin:4px 20px 8px; background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:10px 14px; }}
+.anomalies h2 {{ font-size:14px; margin:0 0 6px; }} .anomalies ul {{ margin:0; padding-left:18px; }}
+.anomalies li {{ margin:4px 0; }} .anomalies li b {{ font-size:11px; letter-spacing:.04em; }}
+.sev-critical b {{ color:var(--high); }} .sev-warning b {{ color:var(--warn); }} .sev-info b {{ color:var(--info); }}
 .node text {{ fill:var(--fg); font-size:11px; text-anchor:middle; pointer-events:none; }}
 .dim {{ opacity:.12; }} .focus > :first-child {{ stroke:var(--fg); stroke-width:3; }}
 .legend {{ display:flex; flex-wrap:wrap; gap:14px; font-size:12px; color:var(--muted); padding:0 20px 16px; }}
 .sw {{ display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:5px; vertical-align:-1px; }}
 </style></head><body>
-<header><h1>{title}</h1><div class="sub">{project} · structural scan by agent-certify</div></header>
+<header><h1>{title}</h1><div class="sub">{project} · structural scan by agent-certify · {perspective} perspective</div></header>
 <div class="stats">{stats}</div>
+{anomalies}
 <main>
 <div class="canvas"><svg viewBox="0 0 {w} {h}" role="img" aria-label="Agent graph">
 <g id="edges">{edges}</g><g id="nodes">{nodes}</g></svg></div>
 <aside id="panel"><h2>Blast radius</h2><p class="sub">Hover or focus a node to see what compromising it would reach.</p></aside>
 </main>
 <div class="legend">
-<span><i class="sw" style="background:var(--critical)"></i>CRITICAL</span>
-<span><i class="sw" style="background:var(--buffer)"></i>BUFFER</span>
-<span><i class="sw" style="background:var(--immune)"></i>IMMUNE</span>
+{legend}
 <span>▭ agent · ● tool (size = calls) · ◆ human</span>
 <span style="color:var(--bridge)">- - - bridge (no backup path)</span>
 </div>
