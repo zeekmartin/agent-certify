@@ -1,0 +1,231 @@
+"""Agent graph data model.
+
+An :class:`AgentGraph` is the communication topology of a multiagent session:
+agents, tools and humans as nodes, invocations as directed edges. Structural
+analysis (FI, bridges, blast radius) works on the undirected version, where two
+nodes are linked if either one ever invoked the other.
+"""
+from __future__ import annotations
+
+import copy
+from collections.abc import Iterable
+from dataclasses import asdict, dataclass, field
+
+NODE_KINDS = ("human", "orchestrator", "agent", "tool")
+
+
+@dataclass
+class AgentNode:
+    """A node in the agent graph — an agent or a tool."""
+    id: str                          # unique identifier
+    kind: str                        # "agent", "tool", "human", "orchestrator"
+    name: str                        # display name (e.g., "Bash", "Edit", "sub-agent-1")
+    call_count: int = 0              # how many times this node was invoked
+    error_count: int = 0             # how many times it returned an error
+    metadata: dict = field(default_factory=dict)
+
+
+@dataclass
+class AgentEdge:
+    """A directed edge: source invoked target."""
+    source: str                      # caller node id
+    target: str                      # callee node id
+    weight: int = 1                  # number of invocations
+    errors: int = 0                  # number of failed invocations
+    tri_count: int = 0               # triangle participation (computed by scanner)
+
+    @property
+    def key(self) -> frozenset:
+        """Undirected identity of the edge."""
+        return frozenset((self.source, self.target))
+
+
+@dataclass
+class AgentGraph:
+    """The complete topology of a multiagent session."""
+    nodes: dict[str, AgentNode] = field(default_factory=dict)
+    edges: list[AgentEdge] = field(default_factory=list)
+    session_id: str | None = None
+    project: str | None = None
+    total_messages: int = 0
+    total_tool_calls: int = 0
+    duration_seconds: float | None = None
+
+    # ------------------------------------------------------------- building
+    def add_node(self, node_id: str, kind: str, name: str | None = None, **metadata) -> AgentNode:
+        """Add a node, or return the existing one with that id."""
+        if kind not in NODE_KINDS:
+            raise ValueError(f"unknown node kind {kind!r}; expected one of {NODE_KINDS}")
+        node = self.nodes.get(node_id)
+        if node is None:
+            node = self.nodes[node_id] = AgentNode(id=node_id, kind=kind, name=name or node_id)
+        node.metadata.update(metadata)
+        return node
+
+    def get_edge(self, source: str, target: str) -> AgentEdge | None:
+        for e in self.edges:
+            if e.source == source and e.target == target:
+                return e
+        return None
+
+    def add_call(self, source: str, target: str, error: bool = False, count: int = 1) -> AgentEdge:
+        """Record ``count`` invocations of ``target`` by ``source``."""
+        for nid in (source, target):
+            if nid not in self.nodes:
+                raise KeyError(f"unknown node {nid!r}; add it with add_node() first")
+        if source == target:
+            raise ValueError(f"self-loop on {source!r}")
+        edge = self.get_edge(source, target)
+        if edge is None:
+            edge = AgentEdge(source, target, weight=0)
+            self.edges.append(edge)
+        edge.weight += count
+        self.nodes[target].call_count += count
+        if error:
+            edge.errors += 1
+            self.nodes[target].error_count += 1
+        return edge
+
+    def record_error(self, source: str, target: str) -> None:
+        """Mark one already-recorded invocation of ``target`` by ``source`` as failed."""
+        edge = self.get_edge(source, target)
+        if edge is None:
+            raise KeyError(f"no edge {source!r} -> {target!r}")
+        edge.errors += 1
+        self.nodes[target].error_count += 1
+
+    # ------------------------------------------------------------ structure
+    def adjacency_matrix(self) -> tuple[list[str], list[list[int]]]:
+        """Return (node_ids, matrix) for FI computation.
+
+        The matrix is the binary, symmetric adjacency of the undirected graph:
+        ``matrix[i][j] == 1`` when either node ever invoked the other. Node ids
+        are sorted so the matrix is canonical for a given topology.
+        """
+        ids = sorted(self.nodes)
+        index = {nid: i for i, nid in enumerate(ids)}
+        n = len(ids)
+        matrix = [[0] * n for _ in range(n)]
+        for e in self.edges:
+            i, j = index[e.source], index[e.target]
+            matrix[i][j] = matrix[j][i] = 1
+        return ids, matrix
+
+    def neighbors(self, node_id: str) -> set[str]:
+        """Undirected neighbours of ``node_id``."""
+        out = set()
+        for e in self.edges:
+            if e.source == node_id:
+                out.add(e.target)
+            elif e.target == node_id:
+                out.add(e.source)
+        return out
+
+    def successors(self, node_id: str) -> set[str]:
+        """Nodes that ``node_id`` invoked."""
+        return {e.target for e in self.edges if e.source == node_id}
+
+    def undirected_edges(self) -> list[tuple[str, str]]:
+        """Distinct undirected edges as sorted (a, b) pairs."""
+        return sorted({tuple(sorted((e.source, e.target))) for e in self.edges})
+
+    def remove_node(self, node_id: str) -> AgentGraph:
+        """Return a copy with node_id and its edges removed."""
+        if node_id not in self.nodes:
+            raise KeyError(f"unknown node {node_id!r}")
+        g = copy.deepcopy(self)
+        del g.nodes[node_id]
+        g.edges = [e for e in g.edges if node_id not in (e.source, e.target)]
+        return g
+
+    def connected_components(self) -> list[set[str]]:
+        """Return connected components of the undirected version."""
+        adj: dict[str, set[str]] = {nid: set() for nid in self.nodes}
+        for e in self.edges:
+            adj[e.source].add(e.target)
+            adj[e.target].add(e.source)
+        seen: set[str] = set()
+        components = []
+        for start in sorted(adj):
+            if start in seen:
+                continue
+            comp, stack = set(), [start]
+            while stack:
+                v = stack.pop()
+                if v in comp:
+                    continue
+                comp.add(v)
+                stack.extend(adj[v] - comp)
+            seen |= comp
+            components.append(comp)
+        return components
+
+    # ---------------------------------------------------------------- lookup
+    def resolve(self, name: str) -> str:
+        """Find a node id from an id or display name (case-insensitive).
+
+        ``resolve("bash")`` finds ``tool:Bash``. Raises ``KeyError`` when the name
+        matches no node or more than one.
+        """
+        if name in self.nodes:
+            return name
+        low = name.lower()
+        hits = [nid for nid, n in self.nodes.items() if nid.lower() == low or n.name.lower() == low]
+        if len(hits) == 1:
+            return hits[0]
+        if not hits:
+            raise KeyError(f"no node named {name!r}; known: {', '.join(sorted(self.nodes))}")
+        raise KeyError(f"{name!r} is ambiguous: {', '.join(sorted(hits))}")
+
+    # ------------------------------------------------------------------- io
+    def to_dict(self) -> dict:
+        return {
+            "session_id": self.session_id,
+            "project": self.project,
+            "total_messages": self.total_messages,
+            "total_tool_calls": self.total_tool_calls,
+            "duration_seconds": self.duration_seconds,
+            "nodes": [asdict(n) for n in self.nodes.values()],
+            "edges": [asdict(e) for e in self.edges],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> AgentGraph:
+        g = cls(session_id=data.get("session_id"), project=data.get("project"),
+                total_messages=data.get("total_messages", 0),
+                total_tool_calls=data.get("total_tool_calls", 0),
+                duration_seconds=data.get("duration_seconds"))
+        for n in data.get("nodes", []):
+            g.nodes[n["id"]] = AgentNode(**n)
+        g.edges = [AgentEdge(**e) for e in data.get("edges", [])]
+        return g
+
+    @classmethod
+    def merge(cls, graphs: Iterable[AgentGraph], session_id: str | None = None) -> AgentGraph:
+        """Union of several graphs: nodes with the same id are combined and counts summed."""
+        out = cls(session_id=session_id)
+        durations = []
+        projects = set()
+        for g in graphs:
+            for n in g.nodes.values():
+                m = out.add_node(n.id, n.kind, n.name)
+                m.call_count += n.call_count
+                m.error_count += n.error_count
+                for k, v in n.metadata.items():
+                    m.metadata.setdefault(k, v)
+            for e in g.edges:
+                f = out.get_edge(e.source, e.target)
+                if f is None:
+                    out.edges.append(AgentEdge(e.source, e.target, weight=e.weight, errors=e.errors))
+                else:
+                    f.weight += e.weight
+                    f.errors += e.errors
+            out.total_messages += g.total_messages
+            out.total_tool_calls += g.total_tool_calls
+            if g.duration_seconds is not None:
+                durations.append(g.duration_seconds)
+            if g.project:
+                projects.add(g.project)
+        out.duration_seconds = sum(durations) if durations else None
+        out.project = projects.pop() if len(projects) == 1 else None
+        return out
