@@ -68,21 +68,52 @@ Structural verification of multiagent systems.
 - License headers (SPDX) on every source file
 - 154 tests, 94% coverage
 
+### v0.5.0 — Security audit fixes (Oct 2026)
+
+Fixes the actionable findings of the 2026-10-27 security audit (45 findings: 3 high, 14 medium,
+22 low, 6 info).
+
+- MCP server hardened against untrusted (possibly prompt-injected) tool arguments
+  - Paths confined to `~/.claude/projects` and the working directory; symlinks and `..` resolved first
+  - Environment variables never expanded; no resolved path, file content or exception text in replies
+  - No machine-wide session fallback; 30 s limit per request; failures logged with a correlation id
+- Certificate trust model
+  - `verify` requires the issuer's public key; unsigned certificates fail unless `--allow-unsigned`
+  - Validity window (`not_before` / `not_after`, 90 days by default) and `--expect-system-id`
+  - Domain-separated signed bytes, strict type validation, NaN rejected; older certificates still verify
+  - `keygen` writes the private key atomically with mode 600, never through a symlink
+- Hostile logs: malformed, deeply nested or oversized lines skipped and counted (`skipped_records`);
+  directory scans bounded in depth and file count
+- `scan --fail-on critical|warning|never` (exit 2); policy evaluated per session in every format
+- Performance: Tarjan articulation points and incremental FI deltas (identical results; a 3,000-node
+  graph in under a second), blast radius without per-node scans, indexed edges
+- CI: SHA-pinned actions, pinned tools, pip-audit, ruff security rules, 90% coverage floor,
+  Trusted Publishing with attestations (API token fallback)
+- SPDX `BUSL-1.1` everywhere; LICENSE covers all versions; SECURITY.md threat model
+- 279 tests, 95% coverage (Ubuntu and Windows, Python 3.10–3.12)
+
 ## Planned
 
-### v0.5.0 — Multi-framework parsers
+### v0.6.0 — Multi-framework parsers
 
 - Carried over from v0.3.0 / v0.4.0:
   - OTel trace parser: import OpenInference/Arize format spans
   - Alert output: JSON webhook
   - Kill switch recommendation: "isolate node X, keep the rest running"
+- Open items from the v0.5.0 audit:
+  - Signed baselines and policies (ARC-001)
+  - Encrypted private keys (passphrase, PKCS#8) and a revocation list (SEC-003, SEC-004)
+  - Dependency lock / constraints for CI and releases (SCA-001, SCA-002)
+  - Incremental `watch` from the last file offset (PRF-004)
+  - Fuzz tests for the parsers; secret scanning in CI (TST-003, SCR-001)
+  - Contributor licensing (CLA or DCO) before accepting outside contributions (LIC-001)
 - CrewAI parser: task execution logs → AgentGraph
 - LangGraph parser: graph state transitions → AgentGraph
 - AutoGen parser: message history → AgentGraph
 - Extend auto-detection to the new parsers
 - Cross-session trending: FI over time, tool usage patterns
 
-### v0.6.0 — Fleet & dashboard
+### v0.7.0 — Fleet & dashboard
 
 - Fleet mode: scan multiple projects/systems, aggregate results
 - Dashboard: HTML/web view of all monitored systems
