@@ -31,23 +31,33 @@ Structural verification of multiagent systems.
   - Monitoring: WATCH / TRACK / IGNORE
 - 64 tests, 94% coverage
 
-## Planned
-
-### v0.3.0 — Live monitoring & policy
+### v0.3.0 — Live monitoring & policy (Oct 2026)
 
 - `agent-certify watch`: live monitoring of active sessions
-  - Watch JSONL files as they're written
-  - Recalculate graph topology every N seconds
-  - Real-time anomaly alerts against baseline
-  - Detect: new tool link, blast radius expansion, graph fragmentation
-- `agent-certify suggest-policy`: auto-generate a draft policy from baseline
-  - Human reviews and adds overrides: FORBIDDEN / REQUIRED
-  - Policy violations → immediate CRITICAL alert
-- MCP logs parser: aggregate logs from ~/.cache/claude-cli-nodejs/
-- OTel trace parser: import OpenInference/Arize format spans
-- Alert output: JSON webhook, stdout, file
+  - Follows a session JSONL (and its sub-agent transcripts) as it's written
+  - Plain size polling every `--interval` seconds; rescans only when the session grew
+  - Waits for a file that doesn't exist yet; skips half-written lines
+  - Reports new nodes, baseline anomalies and policy violations once each, as they appear
+  - `--scans N` / `--duration S` to stop on its own; given a directory, watches the newest session
+- Policy engine: `forbidden_tool`, `forbidden_link`, `max_sub_agents`, `required_tool`
+  - Glob patterns (`agent:* → *database*`), matched on node id, agent type or name
+  - Reported separately from anomalies by `scan` and `watch`
+- `agent-certify suggest-policy`: draft policy from the baseline (REQUIRED tools, sub-agent caps)
+  - Human adds FORBIDDEN rules; never overwrites an edited policy without `--force`
+- MCP logs parser: Claude Code's per-server logs (`claude-cli-nodejs/Cache/<project>/mcp-logs-*`)
+  - `scan --include-mcp` / `learn --include-mcp`; joined to the session by `sessionId`
+  - Surfaces calls Claude Code makes on its own (IDE `getDiagnostics`), absent from transcripts
+- Certificates compare sub-agents by type (`agent:Explore`), not per-spawn id
+  - Pre-v0.3 certificates keep id comparison and their signatures stay valid
+- 114 tests, 94% coverage
+
+## Planned
 
 ### v0.4.0 — MCP server & self-scan
+
+- Carried over from v0.3.0:
+  - OTel trace parser: import OpenInference/Arize format spans
+  - Alert output beyond stdout: JSON webhook, file
 
 - agent-certify as an MCP server
   - Any MCP-compatible agent can scan its OWN topology
