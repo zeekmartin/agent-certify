@@ -6,9 +6,6 @@ project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Changed
-- License switched from BUSL-1.1 to Apache-2.0 (open source)
-
 ## [0.5.0] - 2026-10-27
 
 Fixes for the security audit of 2026-10-27 (45 findings). Items marked
@@ -49,6 +46,7 @@ Fixes for the security audit of 2026-10-27 (45 findings). Items marked
 - Issue templates, CONTRIBUTING, SECURITY (with a threat model), CODE_OF_CONDUCT, this changelog
 
 ### Changed
+- License switched from BUSL-1.1 to Apache-2.0 (open source)
 - Scanner: articulation points by Tarjan's algorithm and FI per removed node computed incrementally; a
   3,000-node graph scans in under a second (the previous algorithm made one full graph copy and one dense
   n×n matrix product per node), with identical results (PRF-001)
