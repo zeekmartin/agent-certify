@@ -1,5 +1,13 @@
 # agent-certify
 
+[![CI](https://github.com/zeekmartin/agent-certify/actions/workflows/ci.yml/badge.svg)](https://github.com/zeekmartin/agent-certify/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/agent-certify)](https://pypi.org/project/agent-certify/)
+[![Python](https://img.shields.io/pypi/pyversions/agent-certify)](https://pypi.org/project/agent-certify/)
+[![Downloads](https://img.shields.io/pypi/dm/agent-certify)](https://pypi.org/project/agent-certify/)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
+[![Coverage](https://img.shields.io/badge/coverage-95%25-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-279%20passed-brightgreen)]()
+
 Structural verification of multiagent systems.
 
 Scan any multiagent system's communication topology.
@@ -507,5 +515,10 @@ New sources subclass `agent_certify.parser.BaseParser` and return an `AgentGraph
 - [sal-certify](https://cognitive-engineering.dev/sal-certify) — structural AI certification
 - [cognitive-engineering.dev](https://cognitive-engineering.dev)
 
-Built by [Cognitive Engineering](https://cognitive-engineering.dev) (Switzerland).
-License: Apache 2.0.
+---
+
+**agent-certify** is built by [Cognitive Engineering](https://cognitive-engineering.dev) (Switzerland).
+License: [Apache 2.0](LICENSE).
+
+[![sal-torch](https://img.shields.io/pypi/v/sal-torch?label=sal-torch)](https://pypi.org/project/sal-torch/)
+[![sal-certify](https://img.shields.io/badge/sal--certify-cognitive--engineering.dev-ffbf00)](https://cognitive-engineering.dev/sal-certify)
