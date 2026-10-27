@@ -55,12 +55,18 @@ jobs:
       - name: Upload to PyPI
         env:
           TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.CE_PUBLISH }}     # same secret name as sal-torch
+          PYPI_TOKEN: ${{ secrets.AGENT_CERTIFY }}      # PyPI API token (account scope) for this project
         run: |
+          # A pasted secret can carry a trailing newline, which PyPI would reject as bad credentials.
+          TWINE_PASSWORD="$(printf '%s' "$PYPI_TOKEN" | tr -d '[:space:]')"
           if [ -z "$TWINE_PASSWORD" ]; then
-            echo "::error::The CE_PUBLISH secret is not set for this repository (Settings → Secrets → Actions)."
+            echo "::error::The AGENT_CERTIFY secret is not set for this repository (Settings → Secrets → Actions)."
             exit 1
           fi
+          case "$TWINE_PASSWORD" in pypi-*) ;; *)
+            echo "::error::AGENT_CERTIFY does not hold a PyPI API token (expected a pypi-… value)."; exit 1 ;;
+          esac
+          export TWINE_PASSWORD
           twine upload dist/*
 
   github-release:
