@@ -1,6 +1,6 @@
 # agent-certify — Structural verification of multiagent systems
 # Copyright 2026 Cognitive Engineering (Switzerland)
-# SPDX-License-Identifier: BUSL-1.1
+# SPDX-License-Identifier: Apache-2.0
 """Adversarial certificate tests (audit SEC-002, SEC-004, SEC-007, SEC-008, FUN-003, TST-001)."""
 import base64
 import json

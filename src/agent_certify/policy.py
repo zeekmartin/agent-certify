@@ -1,6 +1,6 @@
 # agent-certify — Structural verification of multiagent systems
 # Copyright 2026 Cognitive Engineering (Switzerland)
-# SPDX-License-Identifier: BUSL-1.1
+# SPDX-License-Identifier: Apache-2.0
 """Policy engine: explicit organisational rules for an agent system.
 
 Anomalies say "this is unusual". A policy says "this is not allowed" (or "this

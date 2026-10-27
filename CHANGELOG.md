@@ -6,6 +6,9 @@ project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- License switched from BUSL-1.1 to Apache-2.0 (open source)
+
 ## [0.5.0] - 2026-10-27
 
 Fixes for the security audit of 2026-10-27 (45 findings). Items marked

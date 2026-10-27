@@ -1,6 +1,6 @@
 # agent-certify — Structural verification of multiagent systems
 # Copyright 2026 Cognitive Engineering (Switzerland)
-# SPDX-License-Identifier: BUSL-1.1
+# SPDX-License-Identifier: Apache-2.0
 """OpenTelemetry export without the OpenTelemetry SDK.
 
 Each scan becomes one span, ``agent_certify.scan``, carrying the structural

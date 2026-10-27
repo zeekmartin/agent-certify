@@ -7,7 +7,7 @@ name = "agent-certify"
 dynamic = ["version"]        # single source: agent_certify.__version__
 description = "Structural verification of multiagent systems"
 readme = "README.md"
-license = "BUSL-1.1"            # SPDX id of the Business Source License 1.1; "Apache-2.0" at the license switch
+license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [

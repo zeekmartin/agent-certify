@@ -1,6 +1,6 @@
 # agent-certify — Structural verification of multiagent systems
 # Copyright 2026 Cognitive Engineering (Switzerland)
-# SPDX-License-Identifier: BUSL-1.1
+# SPDX-License-Identifier: Apache-2.0
 """CLI behaviour added by the v0.5 audit fixes (SEC-002, SEC-003, SEC-004, FUN-001, FUN-002, OBS-002)."""
 import json
 import os

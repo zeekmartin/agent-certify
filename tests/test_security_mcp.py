@@ -1,6 +1,6 @@
 # agent-certify — Structural verification of multiagent systems
 # Copyright 2026 Cognitive Engineering (Switzerland)
-# SPDX-License-Identifier: BUSL-1.1
+# SPDX-License-Identifier: Apache-2.0
 """MCP server against untrusted arguments (audit SEC-001, SEC-005, SEC-006, OBS-001, PRV-001)."""
 import json
 import logging

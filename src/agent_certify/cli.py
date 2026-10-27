@@ -1,6 +1,6 @@
 # agent-certify — Structural verification of multiagent systems
 # Copyright 2026 Cognitive Engineering (Switzerland)
-# SPDX-License-Identifier: BUSL-1.1
+# SPDX-License-Identifier: Apache-2.0
 """Command-line interface.
 
     agent-certify scan <session.jsonl | project-dir> [--format text|json|markdown|html] [-o FILE]

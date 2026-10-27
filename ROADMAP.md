@@ -145,4 +145,4 @@ Fixes the actionable findings of the 2026-10-27 security audit (45 findings: 3 h
 - [cognitive-engineering.dev](https://cognitive-engineering.dev)
 
 Built by [Cognitive Engineering](https://cognitive-engineering.dev) (Switzerland).
-License: BSL 1.1.
+License: Apache 2.0.

@@ -508,4 +508,4 @@ New sources subclass `agent_certify.parser.BaseParser` and return an `AgentGraph
 - [cognitive-engineering.dev](https://cognitive-engineering.dev)
 
 Built by [Cognitive Engineering](https://cognitive-engineering.dev) (Switzerland).
-License: BSL 1.1.
+License: Apache 2.0.
