@@ -1,0 +1,91 @@
+name: release
+
+# Final releases only (v1.2.3). Pre-releases (v1.2.3rc1, a1, b1) go to TestPyPI via pre-release.yml.
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Tag must match the package version
+        run: |
+          python - <<'EOF'
+          import os, sys, tomllib
+          version = tomllib.load(open("pyproject.toml", "rb"))["project"]["version"]
+          tag = os.environ["GITHUB_REF_NAME"]
+          if tag != f"v{version}":
+              sys.exit(f"::error::tag {tag} does not match pyproject version {version}")
+          print(f"tag {tag} matches version {version}")
+          EOF
+      - run: pip install build twine
+      - run: python -m build
+      - run: twine check --strict dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi            # add required reviewers in Settings → Environments to gate publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install twine
+      - name: Upload to PyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.CE_PUBLISH }}     # same secret name as sal-torch
+        run: |
+          if [ -z "$TWINE_PASSWORD" ]; then
+            echo "::error::The CE_PUBLISH secret is not set for this repository (Settings → Secrets → Actions)."
+            exit 1
+          fi
+          twine upload dist/*
+
+  github-release:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Release notes from CHANGELOG.md
+        run: |
+          python - <<'EOF'
+          import os, re, sys
+          version = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+          m = re.search(rf"^## \[{re.escape(version)}\][^\n]*\n(.*?)(?=^## \[|\Z)", text, re.S | re.M)
+          if not m:
+              sys.exit(f"::error::CHANGELOG.md has no '## [{version}]' section")
+          open("release-notes.md", "w", encoding="utf-8").write(m.group(1).strip() + "\n")
+          EOF
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "agent-certify $GITHUB_REF_NAME" --notes-file release-notes.md
