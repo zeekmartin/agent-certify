@@ -1,6 +1,6 @@
 # agent-certify — Structural verification of multiagent systems
 # Copyright 2026 Cognitive Engineering (Switzerland)
-# SPDX-License-Identifier: BSL-1.1
+# SPDX-License-Identifier: BUSL-1.1
 """Statistical baseline learned from past sessions.
 
 A :class:`Baseline` summarises what "normal" looks like for a system: the
@@ -16,14 +16,16 @@ deviations, so a baseline learned from one session has std 0.
 from __future__ import annotations
 
 import json
+import math
 import os
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import MISSING, asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 
 from agent_certify.graph import AgentGraph
+from agent_certify.paths import ensure_state_dir
 from agent_certify.scanner import AgentFIScanner, ScanResult
 
 DEFAULT_BASELINE_PATH = Path(".agent-certify") / "baseline.json"
@@ -99,13 +101,41 @@ class Baseline:
 
     @classmethod
     def from_dict(cls, data: dict) -> Baseline:
-        unknown = set(data) - {f.name for f in fields(cls)}
-        if unknown:
-            raise ValueError(f"not an agent-certify baseline (unknown fields: {sorted(unknown)})")
-        data = dict(data)
-        data["known_tools"] = set(data["known_tools"])
-        data["known_links"] = {tuple(link) for link in data["known_links"]}
-        return cls(**data)
+        """Build a baseline from untrusted JSON data, checking every field.
+
+        Raises ``ValueError("Invalid baseline format")``; the message deliberately
+        names no field or value, since the data may not be a baseline at all.
+        """
+        try:
+            _check(isinstance(data, dict))
+            names = {f.name for f in fields(cls)}
+            required = {f.name for f in fields(cls) if f.default is MISSING and f.default_factory is MISSING}
+            _check(set(data) <= names and required <= set(data))
+            for key in ("learned_from", "max_sub_agents_seen"):
+                _check(_is_count(data[key]))
+            for key in ("fi_mean", "fi_std", "node_count_mean", "node_count_std", "edge_count_mean",
+                        "edge_count_std", "sub_agent_count_mean", "sub_agent_count_std", "error_rate_mean",
+                        "error_rate_std", "bridge_count_mean", "bridge_count_std", "fi_min", "fi_max"):
+                if key in data:
+                    _check(_is_number(data[key]) and data[key] >= 0)
+            for key in ("period_start", "period_end", "created_at", "version"):
+                if key in data:
+                    _check(isinstance(data[key], str))
+            _check(isinstance(data["known_tools"], list) and all(isinstance(t, str) for t in data["known_tools"]))
+            _check(isinstance(data["tool_frequency"], dict)
+                   and all(isinstance(k, str) and _is_number(v) and 0 <= v <= 1
+                           for k, v in data["tool_frequency"].items()))
+            _check(isinstance(data["known_links"], list)
+                   and all(isinstance(link, list) and len(link) == 2 and all(isinstance(x, str) for x in link)
+                           for link in data["known_links"]))
+            ids = data.get("session_ids", [])
+            _check(isinstance(ids, list) and all(isinstance(x, str) for x in ids))
+            data = dict(data)
+            data["known_tools"] = set(data["known_tools"])
+            data["known_links"] = {tuple(link) for link in data["known_links"]}
+            return cls(**data)
+        except (TypeError, KeyError, AttributeError):
+            raise ValueError("Invalid baseline format") from None
 
 
 def _mean_std(values: list[float]) -> tuple[float, float]:
@@ -139,7 +169,7 @@ class BaselineLearner:
             paths = [paths]
         graphs = []
         for raw in paths:
-            p = Path(os.path.expandvars(os.path.expanduser(str(raw))))
+            p = Path(str(raw)).expanduser()      # environment variables are the CLI's job, not the library's
             if p.is_dir():
                 graphs += self.parser.parse_directory(str(p))
             elif p.is_file():
@@ -194,7 +224,7 @@ class BaselineLearner:
     def save(self, baseline: Baseline, path: str | os.PathLike | None = None) -> Path:
         """Save baseline as JSON, by default to .agent-certify/baseline.json."""
         p = Path(path) if path is not None else DEFAULT_BASELINE_PATH
-        p.parent.mkdir(parents=True, exist_ok=True)
+        ensure_state_dir(p)
         p.write_text(json.dumps(baseline.to_dict(), indent=2), encoding="utf-8")
         return p
 
@@ -204,4 +234,26 @@ class BaselineLearner:
 
 
 def load_baseline(path: str | os.PathLike) -> Baseline:
-    return Baseline.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+    """Read a baseline written by :meth:`BaselineLearner.save`; NaN and Infinity are rejected."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"), parse_constant=_reject_constant)
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        raise ValueError("Invalid baseline format") from None
+    return Baseline.from_dict(data)
+
+
+def _reject_constant(name: str):
+    raise ValueError("Invalid baseline format")
+
+
+def _check(ok: bool) -> None:
+    if not ok:
+        raise ValueError("Invalid baseline format")
+
+
+def _is_count(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+def _is_number(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)

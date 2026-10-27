@@ -1,6 +1,6 @@
 # agent-certify — Structural verification of multiagent systems
 # Copyright 2026 Cognitive Engineering (Switzerland)
-# SPDX-License-Identifier: BSL-1.1
+# SPDX-License-Identifier: BUSL-1.1
 import io
 import json
 import os
@@ -63,7 +63,7 @@ def test_tools_list(server):
         assert "session_path" in t["inputSchema"]["properties"]
     assert tools["blast_radius"]["inputSchema"]["required"] == ["node"]
     assert tools["scan_topology"]["inputSchema"]["properties"]["perspective"]["enum"] == [
-        "engineering", "risk", "compliance", "monitoring"]
+        "engineering", "risk", "compliance", "monitoring", "classic"]       # COD-001: matches the handler
 
 
 def test_protocol_errors(server):
@@ -88,7 +88,7 @@ def test_batch(server):
 def test_scan_topology_auto_detects_session(server):
     data, err = call(server, "scan_topology")
     assert not err
-    assert data["session"].endswith("sess-1.jsonl")
+    assert data["session"] == "-home-me-proj/sess-1"                      # SEC-001: a label, never a path
     assert data["session_source"] == "newest session of project -home-me-proj"
     assert data["fi"] == 0.5 and data["node_count"] == 6 and data["edge_count"] == 6
     assert data["bridge_count"] == 3 and data["components"] == 1
@@ -195,14 +195,15 @@ def test_session_from_env(session_dir):
 
 
 def test_session_fallbacks(session_dir, tmp_path):
+    # PRV-001: no machine-wide fallback; another project's session is never picked.
     os.utime(session_dir / "sess-1.jsonl", (2_000_000_000, 2_000_000_000))
-    path, how = find_current_session(session_dir.parent, cwd="/not/a/project", env={})
-    assert path.name == "sess-1.jsonl" and how == "newest session on this machine"
+    with pytest.raises(ToolError, match="No session found in the current project"):
+        find_current_session(session_dir.parent, cwd="/not/a/project", env={})
     with pytest.raises(ToolError, match="No Claude Code projects folder"):
         find_current_session(tmp_path / "none", env={})
     empty = tmp_path / "empty-root"
     empty.mkdir()
-    with pytest.raises(ToolError, match="No sessions"):
+    with pytest.raises(ToolError, match="No session found"):
         find_current_session(empty, env={})
 
 
@@ -240,7 +241,7 @@ def test_handler_crash_is_reported_not_fatal(server, monkeypatch):
         raise RuntimeError("boom")
     monkeypatch.setitem(server._handlers, "scan_topology", broken)
     msg, err = call(server, "scan_topology")
-    assert err and "scan_topology failed: boom" in msg
+    assert err and "scan_topology failed (ref " in msg and "boom" not in msg   # OBS-001: no exception text
     assert rpc(server, "ping")["result"] == {}                          # still serving
 
 

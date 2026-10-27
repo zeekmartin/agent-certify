@@ -1,6 +1,6 @@
 # agent-certify — Structural verification of multiagent systems
 # Copyright 2026 Cognitive Engineering (Switzerland)
-# SPDX-License-Identifier: BSL-1.1
+# SPDX-License-Identifier: BUSL-1.1
 """OpenTelemetry export without the OpenTelemetry SDK.
 
 Each scan becomes one span, ``agent_certify.scan``, carrying the structural
@@ -30,6 +30,7 @@ from pathlib import Path
 
 from agent_certify.anomaly import AnomalyReport
 from agent_certify.graph import AgentGraph
+from agent_certify.paths import ensure_state_dir
 from agent_certify.policy import PolicyViolation
 from agent_certify.scanner import ScanResult
 
@@ -120,6 +121,7 @@ class OTelExporter:
                 "agent_certify.high_level_node_count": len(result.critical_nodes),
                 "agent_certify.sub_agent_count": sum(1 for n in graph.nodes.values() if n.kind == "agent"),
                 "agent_certify.tool_call_count": graph.total_tool_calls,
+                "agent_certify.skipped_records": graph.skipped_records,
                 "agent_certify.perspective": result.perspective,
                 "agent_certify.session_id": graph.session_id or "",
                 "agent_certify.project": graph.project or "",
@@ -181,7 +183,7 @@ class OTelExporter:
             sys.stdout.flush()
             return None
         p = Path(path) if path is not None else DEFAULT_TRACES_PATH
-        p.parent.mkdir(parents=True, exist_ok=True)
+        ensure_state_dir(p)
         with open(p, "a", encoding="utf-8") as f:
             f.write(line + "\n")
         return p

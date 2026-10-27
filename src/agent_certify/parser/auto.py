@@ -1,6 +1,6 @@
 # agent-certify — Structural verification of multiagent systems
 # Copyright 2026 Cognitive Engineering (Switzerland)
-# SPDX-License-Identifier: BSL-1.1
+# SPDX-License-Identifier: BUSL-1.1
 """Input format auto-detection.
 
 Detection looks at the content, not only the extension: Agent Trace's own
@@ -19,14 +19,14 @@ anything else                        ``ValueError``
 """
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from agent_certify.graph import AgentGraph
-from agent_certify.parser.base import BaseParser
+from agent_certify.parser.base import BaseParser, decode_json, session_files
 from agent_certify.parser.claude_code import ClaudeCodeParser
 from agent_certify.parser.cursor_trace import TRACE_DIR, TRACE_SUFFIX, CursorTraceParser, looks_like_trace_record
 from agent_certify.parser.mcp_logs import MCPLogsParser
+from agent_certify.paths import iter_lines
 
 CLAUDE, CURSOR, MCP_LOG = "claude-code", "cursor-agent-trace", "mcp-log"
 
@@ -47,24 +47,19 @@ def detect_format(path: str | Path) -> str:
         return CURSOR
     if p.suffix != ".jsonl":
         raise ValueError(f"Unknown format: {p} (expected .jsonl or .agent-trace)")
-    with open(p, encoding="utf-8", errors="replace") as f:
-        for i, line in enumerate(f):
-            if i >= 20:
-                break
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if looks_like_trace_record(rec):
-                return CURSOR
-            if isinstance(rec, dict) and "sessionId" in rec and "cwd" in rec and "type" not in rec \
-                    and ("debug" in rec or "error" in rec):
-                return MCP_LOG
-            if isinstance(rec, dict):
-                return CLAUDE
+    for i, (_, line) in enumerate(iter_lines(p)):     # bounded reads: a huge first line is skipped
+        if i >= 20:
+            break
+        if line is None or not line.strip():
+            continue
+        rec = decode_json(line.strip())
+        if looks_like_trace_record(rec):
+            return CURSOR
+        if isinstance(rec, dict) and "sessionId" in rec and "cwd" in rec and "type" not in rec \
+                and ("debug" in rec or "error" in rec):
+            return MCP_LOG
+        if isinstance(rec, dict):
+            return CLAUDE
     return CLAUDE                               # empty or unreadable lines: v0.1 behaviour
 
 
@@ -113,11 +108,7 @@ class AutoParser(BaseParser):
         if not d.is_dir():
             raise NotADirectoryError(d)
         graphs = []
-        files = sorted(d.glob("*.jsonl"))
-        if not files:
-            files = sorted(f for sub in sorted(d.iterdir()) if sub.is_dir() and sub.name != TRACE_DIR
-                           for f in sub.glob("*.jsonl"))
-        for f in files:
+        for f in session_files(d):
             fmt = detect_format(f)
             if fmt == CLAUDE:
                 graphs.append(self.claude.parse(str(f)))

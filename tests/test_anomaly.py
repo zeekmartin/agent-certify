@@ -1,6 +1,6 @@
 # agent-certify — Structural verification of multiagent systems
 # Copyright 2026 Cognitive Engineering (Switzerland)
-# SPDX-License-Identifier: BSL-1.1
+# SPDX-License-Identifier: BUSL-1.1
 import json
 
 import pytest
@@ -169,11 +169,11 @@ def test_cli_scan_with_baseline(session_dir, capsys):
     other = session_dir / "other.jsonl"
     other.write_text(json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [
         {"type": "tool_use", "id": "x", "name": "deploy_production", "input": {}}]}}) + "\n")
-    assert main(["scan", str(other), "--baseline", ".agent-certify/baseline.json"]) == 0
+    assert main(["scan", str(other), "--baseline", ".agent-certify/baseline.json"]) == 2   # critical: exit 2
     out = capsys.readouterr().out
     assert "[CRITICAL] New tool never seen: deploy_production" in out
 
-    assert main(["scan", str(other), "--format", "json"]) == 0
+    assert main(["scan", str(other), "--format", "json"]) == 2
     assert json.loads(capsys.readouterr().out)["anomalies"]["has_critical"] is True
 
     # --no-baseline: v0.1 output, no anomaly section.
@@ -192,9 +192,9 @@ def test_cli_directory_scan_lists_anomalies_per_session(session_dir, capsys):
     capsys.readouterr()
     (session_dir / "sess-2.jsonl").write_text(json.dumps({"type": "assistant", "message": {
         "role": "assistant", "content": [{"type": "tool_use", "id": "x", "name": "deploy", "input": {}}]}}) + "\n")
-    assert main(["scan", str(session_dir)]) == 0
+    assert main(["scan", str(session_dir)]) == 2                      # sess-2 has a critical anomaly
     table = capsys.readouterr().out.split("Merged graph")[0]
     assert "ANOMALIES" in table.splitlines()[0]
     rows = {line.split()[0]: line for line in table.splitlines()[1:] if line.strip()}
-    assert rows["sess-1"].endswith("-")                  # the learned session itself is normal
+    assert rows["sess-1"].endswith(" 0")                 # evaluated, nothing found ("-" now means not evaluated)
     assert "1 critical" in rows["sess-2"]

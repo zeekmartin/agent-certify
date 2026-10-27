@@ -1,6 +1,6 @@
 # agent-certify — Structural verification of multiagent systems
 # Copyright 2026 Cognitive Engineering (Switzerland)
-# SPDX-License-Identifier: BSL-1.1
+# SPDX-License-Identifier: BUSL-1.1
 import json
 
 import pytest
@@ -109,14 +109,14 @@ def test_policy_and_anomalies_are_separate(session_dir, capsys):
                   PolicyRule("required_tool", "Bash", "warning", "")]).save()
     capsys.readouterr()
 
-    assert main(["scan", session]) == 0                       # both files auto-discovered
+    assert main(["scan", session]) == 2                       # both files auto-discovered; critical violation
     out = capsys.readouterr().out
     assert "No anomalies" in out                              # statistically normal...
     assert "⛔ POLICY VIOLATIONS (1):" in out                 # ...but not allowed
     assert "[CRITICAL] FORBIDDEN tool used: Grep" in out
     assert "Policy:   .agent-certify/policy.json (2 rules)" in out
 
-    assert main(["scan", session, "--format", "json"]) == 0
+    assert main(["scan", session, "--format", "json"]) == 2
     data = json.loads(capsys.readouterr().out)
     assert [v["message"] for v in data["policy_violations"]] == ["FORBIDDEN tool used: Grep"]
 

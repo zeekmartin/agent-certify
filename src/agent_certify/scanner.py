@@ -1,6 +1,6 @@
 # agent-certify — Structural verification of multiagent systems
 # Copyright 2026 Cognitive Engineering (Switzerland)
-# SPDX-License-Identifier: BSL-1.1
+# SPDX-License-Identifier: BUSL-1.1
 """Fragility Index (FI) of an agent graph.
 
 FI is the fraction of communication links with **zero triangle support**: links
@@ -106,15 +106,58 @@ def compute_fi(adjacency) -> float:
     return float(np.sum(common[triu][edges] == 0) / total)
 
 
+class FIStructure:
+    """Triangle bookkeeping for one graph, built once in O(m · min degree).
+
+    Gives FI and, for any node x, the FI of the graph without x in
+    O(Σ_{u∈N(x)} min(deg u, deg x)) without copying anything. Removing x drops
+    its deg(x) edges; a surviving edge (u, v) loses a triangle only when both u
+    and v were neighbours of x, so it becomes fragile exactly when x was its
+    only common neighbour (tri = 1). Hence
+
+        FI(G − x) = (F − F_x + N_x) / (E − deg x)
+
+    with F the fragile edges, F_x those incident to x, N_x the edges among
+    N(x) whose only triangle was through x. This equals recomputing FI on
+    G − x from scratch (checked against that in the test suite).
+    """
+
+    def __init__(self, graph: AgentGraph):
+        self.adj = graph.adjacency()
+        self.tri: dict[tuple[str, str], int] = {}
+        for u, nbrs in self.adj.items():
+            for v in nbrs:
+                if u < v:
+                    a, b = (nbrs, self.adj[v]) if len(nbrs) <= len(self.adj[v]) else (self.adj[v], nbrs)
+                    self.tri[(u, v)] = sum(1 for w in a if w in b)
+        self.edge_count = len(self.tri)
+        self.fragile = sum(1 for t in self.tri.values() if t == 0)
+
+    @staticmethod
+    def _key(u: str, v: str) -> tuple[str, str]:
+        return (u, v) if u < v else (v, u)
+
+    @property
+    def fi(self) -> float:
+        return self.fragile / self.edge_count if self.edge_count else 0.0
+
+    def fi_without(self, x: str) -> float:
+        nbrs = self.adj.get(x, set())
+        remaining = self.edge_count - len(nbrs)
+        if remaining <= 0:
+            return 0.0
+        incident_fragile = sum(1 for v in nbrs if self.tri[self._key(x, v)] == 0)
+        newly_fragile = 0
+        for u in nbrs:
+            for v in (self.adj[u] if len(self.adj[u]) < len(nbrs) else nbrs):
+                if u < v and v in nbrs and v in self.adj[u] and self.tri[(u, v)] == 1:
+                    newly_fragile += 1
+        return (self.fragile - incident_fragile + newly_fragile) / remaining
+
+
 def triangle_counts(graph: AgentGraph) -> dict[frozenset, int]:
     """tri(e) for every undirected edge: the number of triangles containing it."""
-    ids, matrix = graph.adjacency_matrix()
-    if not ids:
-        return {}
-    A = np.array(matrix, dtype=np.int64)
-    common = A @ A
-    index = {nid: i for i, nid in enumerate(ids)}
-    return {frozenset((a, b)): int(common[index[a], index[b]]) for a, b in graph.undirected_edges()}
+    return {frozenset(k): t for k, t in FIStructure(graph).tri.items()}
 
 
 def find_bridges(graph: AgentGraph) -> set[frozenset]:
@@ -157,15 +200,49 @@ def find_bridges(graph: AgentGraph) -> set[frozenset]:
 
 
 def articulation_points(graph: AgentGraph) -> set[str]:
-    """Nodes whose removal splits their component into more pieces."""
-    base = len(graph.connected_components())
-    out = set()
-    for nid in graph.nodes:
-        # Removing an isolated node lowers the count by one; anything above
-        # ``base - 1`` means the node held other nodes together.
-        if len(graph.remove_node(nid).connected_components()) > base - (1 if not graph.neighbors(nid) else 0):
-            out.add(nid)
-    return out
+    """Nodes whose removal splits their component into more pieces (iterative Tarjan, O(n + m)).
+
+    A DFS root is an articulation point when it has two or more DFS children;
+    any other node u is one when some child v cannot reach above u
+    (``low[v] >= disc[u]``). Isolated nodes and leaves never are.
+    """
+    adj = {nid: sorted(nbrs) for nid, nbrs in graph.adjacency().items()}
+    disc: dict[str, int] = {}
+    low: dict[str, int] = {}
+    cut: set[str] = set()
+    t = 0
+    for root in sorted(adj):
+        if root in disc:
+            continue
+        disc[root] = low[root] = t
+        t += 1
+        root_children = 0
+        stack = [(root, None, iter(adj[root]))]
+        while stack:
+            v, parent, it = stack[-1]
+            advanced = False
+            for w in it:
+                if w == parent:
+                    continue
+                if w in disc:
+                    low[v] = min(low[v], disc[w])
+                else:
+                    disc[w] = low[w] = t
+                    t += 1
+                    if v == root:
+                        root_children += 1
+                    stack.append((w, v, iter(adj[w])))
+                    advanced = True
+                    break
+            if not advanced:
+                stack.pop()
+                if parent is not None:
+                    low[parent] = min(low[parent], low[v])
+                    if parent != root and low[v] >= disc[parent]:
+                        cut.add(parent)
+        if root_children >= 2:
+            cut.add(root)
+    return cut
 
 
 @dataclass
@@ -182,6 +259,7 @@ class ScanResult:
     components: int = 1
     node_levels: dict[str, str] = field(default_factory=dict)           # high / medium / low
     perspective: str = Perspective.DEFAULT
+    skipped_records: int = 0          # records the parser could not read: the graph may be incomplete
 
     def __post_init__(self):
         if not self.node_levels and self.node_classifications:
@@ -228,6 +306,7 @@ class ScanResult:
             "node_classifications": self.node_classifications,
             "node_levels": self.node_levels,
             "fi_deltas": self.fi_deltas,
+            "skipped_records": self.skipped_records,
         }
 
 
@@ -266,9 +345,10 @@ class AgentFIScanner:
 
     def scan(self) -> ScanResult:
         """Compute FI, classify nodes, identify bridges."""
-        tri = triangle_counts(self.graph)
+        self.structure = FIStructure(self.graph)
+        tri = self.structure.tri
         for e in self.graph.edges:
-            e.tri_count = tri.get(e.key, 0)
+            e.tri_count = tri.get(FIStructure._key(e.source, e.target), 0)
         fi = self._compute_fi()
         bridges = self._find_bridges()
         levels, deltas, cut_nodes = self._classify_nodes(fi)
@@ -280,17 +360,17 @@ class AgentFIScanner:
             node_levels=levels,
             perspective=self.perspective,
             node_count=len(self.graph.nodes),
-            edge_count=len(tri),
-            fragile_edges=sorted(tuple(sorted(k)) for k, v in tri.items() if v == 0),
+            edge_count=self.structure.edge_count,
+            fragile_edges=sorted(k for k, v in tri.items() if v == 0),
             articulation_points=sorted(cut_nodes),
             fi_deltas=deltas,
             components=len(self.graph.connected_components()),
+            skipped_records=self.graph.skipped_records,
         )
 
     def _compute_fi(self) -> float:
         """FI = proportion of edges with tri(e) = 0, on the undirected graph."""
-        _, matrix = self.graph.adjacency_matrix()
-        return compute_fi(matrix)
+        return self.structure.fi
 
     def _find_bridges(self) -> list[AgentEdge]:
         """Edges whose removal disconnects the graph."""
@@ -308,8 +388,7 @@ class AgentFIScanner:
         cut_nodes = articulation_points(self.graph)
         classes, deltas = {}, {}
         for nid in sorted(self.graph.nodes):
-            _, m = self.graph.remove_node(nid).adjacency_matrix()
-            new_fi = compute_fi(m)
+            new_fi = self.structure.fi_without(nid)
             delta = (new_fi - base_fi) / base_fi if base_fi > 1e-12 else new_fi - base_fi
             deltas[nid] = round(new_fi - base_fi, 6)
             if nid in cut_nodes or delta >= self.critical_thr:

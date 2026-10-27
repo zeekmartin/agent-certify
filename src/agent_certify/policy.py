@@ -1,6 +1,6 @@
 # agent-certify — Structural verification of multiagent systems
 # Copyright 2026 Cognitive Engineering (Switzerland)
-# SPDX-License-Identifier: BSL-1.1
+# SPDX-License-Identifier: BUSL-1.1
 """Policy engine: explicit organisational rules for an agent system.
 
 Anomalies say "this is unusual". A policy says "this is not allowed" (or "this
@@ -33,6 +33,7 @@ from pathlib import Path
 
 from agent_certify.baseline import Baseline
 from agent_certify.graph import AgentGraph
+from agent_certify.paths import ensure_state_dir
 
 DEFAULT_POLICY_PATH = Path(".agent-certify") / "policy.json"
 KINDS = ("forbidden_tool", "forbidden_link", "max_sub_agents", "required_tool")
@@ -145,17 +146,38 @@ class Policy:
     def save(self, path: str | os.PathLike | None = None) -> Path:
         """Write the policy as human-editable JSON (default: .agent-certify/policy.json)."""
         p = Path(path) if path is not None else DEFAULT_POLICY_PATH
-        p.parent.mkdir(parents=True, exist_ok=True)
+        ensure_state_dir(p)
         p.write_text(json.dumps(self.to_dict(), indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         return p
 
     @classmethod
     def load(cls, path: str | os.PathLike) -> Policy:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
-        if not isinstance(data, dict) or "rules" not in data:
-            raise ValueError(f"{path} is not an agent-certify policy (no 'rules' list)")
-        return cls(rules=[PolicyRule(**r) for r in data["rules"]],
-                   generated_from=data.get("generated_from"), created_at=data.get("created_at"))
+        """Read a policy file. Raises ``ValueError`` for anything that is not a valid policy.
+
+        Errors about individual rules name the rule's kind or severity (useful to
+        whoever edits the file); the MCP server replaces every load error with a
+        generic message.
+        """
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"), parse_constant=_reject_constant)
+        except (ValueError, UnicodeDecodeError, RecursionError):
+            raise ValueError("Invalid policy format (not JSON)") from None
+        if not isinstance(data, dict) or not isinstance(data.get("rules"), list):
+            raise ValueError("Invalid policy format (no 'rules' list)")  # noqa: TRY004 — one error type for bad files
+        for key in ("generated_from", "created_at"):
+            if data.get(key) is not None and not isinstance(data[key], str):
+                raise ValueError("Invalid policy format")
+        rules = []
+        for r in data["rules"]:
+            if not (isinstance(r, dict) and set(r) == {"kind", "target", "severity", "message"}
+                    and all(isinstance(v, str) for v in r.values())):
+                raise ValueError("Invalid policy format (each rule needs string kind, target, severity, message)")
+            rules.append(PolicyRule(**r))
+        return cls(rules=rules, generated_from=data.get("generated_from"), created_at=data.get("created_at"))
+
+
+def _reject_constant(name: str):
+    raise ValueError("Invalid policy format")
 
 
 class PolicyGenerator:

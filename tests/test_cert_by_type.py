@@ -1,6 +1,6 @@
 # agent-certify — Structural verification of multiagent systems
 # Copyright 2026 Cognitive Engineering (Switzerland)
-# SPDX-License-Identifier: BSL-1.1
+# SPDX-License-Identifier: BUSL-1.1
 import base64
 import json
 
@@ -51,7 +51,7 @@ def test_different_type_fails_with_type_messages():
 
 def test_more_agents_of_same_type_changes_fi_only():
     cert = AgentCertificate.create(_session({"abc": "Explore"}))
-    report = cert.verify(_session({"x1": "Explore", "x2": "Explore"}))
+    report = cert.verify(_session({"x1": "Explore", "x2": "Explore"}), allow_unsigned=True)   # unsigned on purpose
     assert report.graph_hash_match                            # same types, same links
     assert not report.is_valid
     assert report.reasons == [f"FI changed by {report.fi_delta:+.4f} (tolerance 0.001)"]
@@ -68,7 +68,8 @@ def test_pre_v03_certificate_still_verifies_and_compares_by_id(tmp_path):
     # signed over exactly the fields it had.
     g = _session({"abc": "Explore"})
     data = AgentCertificate.create(g).to_dict()
-    data.pop("identity")
+    for newer in ("identity", "cert_format", "not_before", "not_after", "skipped_records"):   # not in v0.2 files
+        data.pop(newer)
     topo = _topology(g, "id")
     data.update(nodes=dict(topo["nodes"]), edges=[list(e) for e in topo["edges"]],
                 graph_hash=graph_hash(g, identity="id"), agent_certify_version="0.2.0")
@@ -83,9 +84,12 @@ def test_pre_v03_certificate_still_verifies_and_compares_by_id(tmp_path):
 
     cert = AgentCertificate.load(path)
     assert cert.identity == "id"
-    assert cert.signature_valid()                              # old signature still checks out
-    assert cert.verify(g).is_valid
-    report = cert.verify(_session({"xyz": "Explore"}))         # legacy semantics: ids differ
+    issuer = data["signer_public_key"]                         # the issuer's key, known out of band
+    assert cert.signature_valid(issuer)                        # old signature still checks out
+    legacy = cert.verify(g, public_key=issuer)
+    assert legacy.is_valid
+    assert any("before v0.5" in w for w in legacy.warnings)    # no validity period, legacy format
+    report = cert.verify(_session({"xyz": "Explore"}), public_key=issuer)   # legacy semantics: ids differ
     assert not report.is_valid and report.added_nodes == ["agent:xyz"]
 
 
@@ -105,5 +109,5 @@ def test_cli_certify_verify_by_type(tmp_path):
     other = write(tmp_path / "c", "toolu_C", "Research")
     cert = str(tmp_path / "c.json")
     assert main(["certify", first, "-o", cert]) == 0
-    assert main(["verify", cert, same]) == 0
-    assert main(["verify", cert, other]) == 1
+    assert main(["verify", cert, same, "--allow-unsigned"]) == 0      # unsigned on purpose
+    assert main(["verify", cert, other, "--allow-unsigned"]) == 1

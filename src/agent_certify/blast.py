@@ -1,6 +1,6 @@
 # agent-certify — Structural verification of multiagent systems
 # Copyright 2026 Cognitive Engineering (Switzerland)
-# SPDX-License-Identifier: BSL-1.1
+# SPDX-License-Identifier: BUSL-1.1
 """Blast radius: what a compromised agent or tool can touch.
 
 A compromised node can act on everything it invokes, and can influence
@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 
 from agent_certify.graph import AgentGraph
-from agent_certify.scanner import AgentFIScanner
+from agent_certify.scanner import FIStructure
 
 
 @dataclass
@@ -62,7 +62,8 @@ class BlastRadiusAnalyzer:
             raise ValueError("hops must be at least 1")
         self.graph = graph
         self.hops = hops
-        self._baseline_fi = None
+        self._structure: FIStructure | None = None
+        self._components_before: int | None = None
 
     def analyze(self, compromised_node: str) -> BlastReport:
         """What happens if this node is compromised?"""
@@ -72,12 +73,14 @@ class BlastRadiusAnalyzer:
         reachable = sorted(set().union(*by_hop.values())) if by_hop else []
         tools = self._reachable_tools(node)
 
-        if self._baseline_fi is None:
-            self._baseline_fi = AgentFIScanner(self.graph).scan().fi
-        remaining = self.graph.remove_node(node)
-        remaining_fi = AgentFIScanner(remaining).scan().fi
-        before = len(self.graph.connected_components())
-        after = remaining.connected_components()
+        # One triangle structure serves every node: FI without a node is a local
+        # computation, and components are counted without copying the graph.
+        if self._structure is None:
+            self._structure = FIStructure(self.graph)
+            self._components_before = len(self.graph.connected_components())
+        remaining_fi = self._structure.fi_without(node)
+        before = self._components_before
+        after = self.graph.connected_components(without=node)
         # More pieces than the system had before (an already-split system is
         # not "fragmented" by this node).
         fragmented = len(after) > before
@@ -91,7 +94,7 @@ class BlastRadiusAnalyzer:
             system_fragmented=fragmented,
             isolation_recommendation=self._recommend(node, fragmented, after, tools),
             hops=self.hops,
-            baseline_fi=self._baseline_fi,
+            baseline_fi=self._structure.fi,
             components_after=[sorted(c) for c in after],
             reach_by_hop={k: sorted(v) for k, v in by_hop.items()},
         )

@@ -1,6 +1,6 @@
 # agent-certify — Structural verification of multiagent systems
 # Copyright 2026 Cognitive Engineering (Switzerland)
-# SPDX-License-Identifier: BSL-1.1
+# SPDX-License-Identifier: BUSL-1.1
 import pytest
 
 from agent_certify import AgentCertificate, generate_keypair, graph_hash
@@ -10,7 +10,8 @@ def test_sign_and_verify(star_graph, tmp_path):
     priv, pub = generate_keypair()
     cert = AgentCertificate.create(star_graph, system_id="star-system", signing_key=priv)
     assert cert.is_signed and cert.signer_public_key == pub
-    assert cert.signature_valid()
+    assert not cert.signature_valid()          # SEC-002: without a trusted key nothing is proven
+    assert cert.signature_valid(pub)
     assert cert.signature_valid(pub)
     assert cert.fi_score == 1.0 and cert.bridge_count == 4 and cert.critical_nodes == ["claude"]
 

@@ -1,6 +1,6 @@
 # agent-certify — Structural verification of multiagent systems
 # Copyright 2026 Cognitive Engineering (Switzerland)
-# SPDX-License-Identifier: BSL-1.1
+# SPDX-License-Identifier: BUSL-1.1
 """Quick demo on this machine's Claude Code sessions.
 
 Picks the session with the most sub-agents (ties broken by tool calls) under
@@ -9,6 +9,7 @@ issues a signed certificate and verifies the session against it.
 
     python scripts/demo.py [~/.claude/projects]
 """
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -36,7 +37,10 @@ def main(root: str = "~/.claude/projects") -> None:
 
     priv, pub = generate_keypair()
     cert = AgentCertificate.create(g, system_id=f"demo-{g.session_id[:8]}", signing_key=priv)
-    path = Path(tempfile.gettempdir()) / "agent-certify-demo.cert.json"
+    # A fresh, unpredictable name created atomically: no other user can pre-place a symlink there.
+    fd, name = tempfile.mkstemp(prefix="agent-certify-demo-", suffix=".cert.json")
+    os.close(fd)
+    path = Path(name)
     cert.save(path)
     print(f"\ncertificate written to {path}")
     print(cert.verify(g, public_key=pub))

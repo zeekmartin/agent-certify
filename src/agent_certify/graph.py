@@ -1,16 +1,22 @@
 # agent-certify — Structural verification of multiagent systems
 # Copyright 2026 Cognitive Engineering (Switzerland)
-# SPDX-License-Identifier: BSL-1.1
+# SPDX-License-Identifier: BUSL-1.1
 """Agent graph data model.
 
 An :class:`AgentGraph` is the communication topology of a multiagent session:
 agents, tools and humans as nodes, invocations as directed edges. Structural
 analysis (FI, bridges, blast radius) works on the undirected version, where two
 nodes are linked if either one ever invoked the other.
+
+Edges are indexed by (source, target) and adjacency sets are kept alongside, so
+edge lookups are O(1) and neighbourhoods O(degree). The index follows ``edges``:
+it is rebuilt whenever that list is replaced or changes length outside
+:meth:`AgentGraph.add_call`.
 """
 from __future__ import annotations
 
 import copy
+import math
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 
@@ -55,6 +61,33 @@ class AgentGraph:
     duration_seconds: float | None = None
     started_at: str | None = None        # ISO 8601, UTC
     ended_at: str | None = None
+    skipped_records: int = 0             # malformed / oversized records the parser could not read
+
+    _edge_index: dict = field(default=None, init=False, repr=False, compare=False)
+    _adjacency: dict = field(default=None, init=False, repr=False, compare=False)
+    _successors: dict = field(default=None, init=False, repr=False, compare=False)
+    _index_key: tuple = field(default=None, init=False, repr=False, compare=False)
+
+    # ---------------------------------------------------------------- index
+    def _ensure_index(self) -> None:
+        key = (id(self.edges), len(self.edges))
+        if self._index_key == key:
+            return
+        index, adj, succ = {}, {}, {}
+        for e in self.edges:
+            index[(e.source, e.target)] = e
+            adj.setdefault(e.source, set()).add(e.target)
+            adj.setdefault(e.target, set()).add(e.source)
+            succ.setdefault(e.source, set()).add(e.target)
+        self._edge_index, self._adjacency, self._successors, self._index_key = index, adj, succ, key
+
+    def _index_append(self, e: AgentEdge) -> None:
+        """Record an edge just appended to ``edges`` without rebuilding the index."""
+        self._edge_index[(e.source, e.target)] = e
+        self._adjacency.setdefault(e.source, set()).add(e.target)
+        self._adjacency.setdefault(e.target, set()).add(e.source)
+        self._successors.setdefault(e.source, set()).add(e.target)
+        self._index_key = (id(self.edges), len(self.edges))
 
     # ------------------------------------------------------------- building
     def add_node(self, node_id: str, kind: str, name: str | None = None, **metadata) -> AgentNode:
@@ -68,10 +101,8 @@ class AgentGraph:
         return node
 
     def get_edge(self, source: str, target: str) -> AgentEdge | None:
-        for e in self.edges:
-            if e.source == source and e.target == target:
-                return e
-        return None
+        self._ensure_index()
+        return self._edge_index.get((source, target))
 
     def add_call(self, source: str, target: str, error: bool = False, count: int = 1) -> AgentEdge:
         """Record ``count`` invocations of ``target`` by ``source``."""
@@ -84,6 +115,7 @@ class AgentGraph:
         if edge is None:
             edge = AgentEdge(source, target, weight=0)
             self.edges.append(edge)
+            self._index_append(edge)
         edge.weight += count
         self.nodes[target].call_count += count
         if error:
@@ -105,7 +137,8 @@ class AgentGraph:
 
         The matrix is the binary, symmetric adjacency of the undirected graph:
         ``matrix[i][j] == 1`` when either node ever invoked the other. Node ids
-        are sorted so the matrix is canonical for a given topology.
+        are sorted so the matrix is canonical for a given topology. O(n²) memory:
+        the scanner itself works on :meth:`adjacency` instead.
         """
         ids = sorted(self.nodes)
         index = {nid: i for i, nid in enumerate(ids)}
@@ -117,18 +150,20 @@ class AgentGraph:
         return ids, matrix
 
     def neighbors(self, node_id: str) -> set[str]:
-        """Undirected neighbours of ``node_id``."""
-        out = set()
-        for e in self.edges:
-            if e.source == node_id:
-                out.add(e.target)
-            elif e.target == node_id:
-                out.add(e.source)
-        return out
+        """Undirected neighbours of ``node_id`` (a copy; safe to modify)."""
+        self._ensure_index()
+        return set(self._adjacency.get(node_id, ()))
+
+    def adjacency(self) -> dict[str, set[str]]:
+        """Undirected adjacency of every node, isolated ones included. Do not modify the sets."""
+        self._ensure_index()
+        empty: set[str] = set()
+        return {nid: self._adjacency.get(nid, empty) for nid in self.nodes}
 
     def successors(self, node_id: str) -> set[str]:
         """Nodes that ``node_id`` invoked."""
-        return {e.target for e in self.edges if e.source == node_id}
+        self._ensure_index()
+        return set(self._successors.get(node_id, ()))
 
     def undirected_edges(self) -> list[tuple[str, str]]:
         """Distinct undirected edges as sorted (a, b) pairs."""
@@ -143,13 +178,13 @@ class AgentGraph:
         g.edges = [e for e in g.edges if node_id not in (e.source, e.target)]
         return g
 
-    def connected_components(self) -> list[set[str]]:
-        """Return connected components of the undirected version."""
-        adj: dict[str, set[str]] = {nid: set() for nid in self.nodes}
-        for e in self.edges:
-            adj[e.source].add(e.target)
-            adj[e.target].add(e.source)
-        seen: set[str] = set()
+    def connected_components(self, without: str | None = None) -> list[set[str]]:
+        """Return connected components of the undirected version.
+
+        ``without`` leaves one node out, as if it were removed, without copying the graph.
+        """
+        adj = self.adjacency()
+        seen: set[str] = {without} if without is not None else set()
         components = []
         for start in sorted(adj):
             if start in seen:
@@ -160,7 +195,7 @@ class AgentGraph:
                 if v in comp:
                     continue
                 comp.add(v)
-                stack.extend(adj[v] - comp)
+                stack.extend(w for w in adj[v] if w not in comp and w != without)
             seen |= comp
             components.append(comp)
         return components
@@ -203,20 +238,40 @@ class AgentGraph:
             "duration_seconds": self.duration_seconds,
             "started_at": self.started_at,
             "ended_at": self.ended_at,
+            "skipped_records": self.skipped_records,
             "nodes": [asdict(n) for n in self.nodes.values()],
             "edges": [asdict(e) for e in self.edges],
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> AgentGraph:
-        g = cls(session_id=data.get("session_id"), project=data.get("project"),
-                total_messages=data.get("total_messages", 0),
-                total_tool_calls=data.get("total_tool_calls", 0),
-                duration_seconds=data.get("duration_seconds"),
-                started_at=data.get("started_at"), ended_at=data.get("ended_at"))
-        for n in data.get("nodes", []):
-            g.nodes[n["id"]] = AgentNode(**n)
-        g.edges = [AgentEdge(**e) for e in data.get("edges", [])]
+        """Rebuild a graph from :meth:`to_dict` output; ``ValueError("Invalid graph format")`` otherwise."""
+        try:
+            _check(isinstance(data, dict))
+            _check(all(data.get(k) is None or isinstance(data[k], str)
+                       for k in ("session_id", "project", "started_at", "ended_at")))
+            _check(all(_is_count(data.get(k, 0)) for k in ("total_messages", "total_tool_calls", "skipped_records")))
+            duration = data.get("duration_seconds")
+            _check(duration is None or (_is_number(duration) and duration >= 0))
+            nodes, edges = data.get("nodes", []), data.get("edges", [])
+            _check(isinstance(nodes, list) and isinstance(edges, list))
+            g = cls(session_id=data.get("session_id"), project=data.get("project"),
+                    total_messages=data.get("total_messages", 0), total_tool_calls=data.get("total_tool_calls", 0),
+                    duration_seconds=duration, started_at=data.get("started_at"), ended_at=data.get("ended_at"),
+                    skipped_records=data.get("skipped_records", 0))
+            for n in nodes:
+                _check(isinstance(n, dict) and set(n) <= set(AgentNode.__dataclass_fields__))
+                _check(isinstance(n.get("id"), str) and n.get("kind") in NODE_KINDS and isinstance(n.get("name"), str))
+                _check(_is_count(n.get("call_count", 0)) and _is_count(n.get("error_count", 0)))
+                _check(isinstance(n.get("metadata", {}), dict))
+                g.nodes[n["id"]] = AgentNode(**n)
+            for e in edges:
+                _check(isinstance(e, dict) and set(e) <= set(AgentEdge.__dataclass_fields__))
+                _check(e.get("source") in g.nodes and e.get("target") in g.nodes and e["source"] != e["target"])
+                _check(all(_is_count(e.get(k, 0)) for k in ("weight", "errors", "tri_count")))
+            g.edges = [AgentEdge(**e) for e in edges]
+        except (TypeError, KeyError, AttributeError):
+            raise ValueError("Invalid graph format") from None
         return g
 
     @classmethod
@@ -235,12 +290,15 @@ class AgentGraph:
             for e in g.edges:
                 f = out.get_edge(e.source, e.target)
                 if f is None:
-                    out.edges.append(AgentEdge(e.source, e.target, weight=e.weight, errors=e.errors))
+                    f = AgentEdge(e.source, e.target, weight=e.weight, errors=e.errors)
+                    out.edges.append(f)
+                    out._index_append(f)
                 else:
                     f.weight += e.weight
                     f.errors += e.errors
             out.total_messages += g.total_messages
             out.total_tool_calls += g.total_tool_calls
+            out.skipped_records += g.skipped_records
             if g.duration_seconds is not None:
                 durations.append(g.duration_seconds)
             if g.project:
@@ -252,3 +310,16 @@ class AgentGraph:
         out.duration_seconds = sum(durations) if durations else None
         out.project = projects.pop() if len(projects) == 1 else None
         return out
+
+
+def _check(ok: bool) -> None:
+    if not ok:
+        raise ValueError("Invalid graph format")
+
+
+def _is_count(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+def _is_number(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)

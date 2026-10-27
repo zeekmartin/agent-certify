@@ -45,8 +45,8 @@ or in an MCP client's settings:
 Every tool takes an optional `session_path`. Without it the server finds the
 **current** session: `CLAUDE_CODE_SESSION_ID` (Claude Code sets it for the
 processes it starts), then the newest session of the working directory's
-project, then the newest session on the machine. A real `topology_summary`
-from this repository's own development session:
+project. It never falls back to another project's sessions. A real
+`topology_summary` from this repository's own development session:
 
 > Your current session has 12 nodes (1 orchestrator, 10 tools, the human) and
 > 11 links. Fragility Index is 1.0 — every connection is a single point of
@@ -63,6 +63,16 @@ versions 2024-11-05 to 2025-06-18) without the `mcp` package. A tool that
 cannot run (no baseline yet, unknown node, missing session) returns a normal
 result with `isError: true` and a message saying what to do; protocol errors
 are JSON-RPC errors; nothing a request does stops the server.
+
+Tool arguments come from an AI agent, which may be following injected
+instructions, so the server treats them as untrusted. Path arguments
+(`session_path`, `baseline_path`, `policy_path`) expand `~` but never
+environment variables, are resolved (symlinks, `..`), and must lie inside
+`~/.claude/projects` or the server's working directory; anything else gets
+"Path not allowed". Responses and errors never contain a resolved path, file
+contents or exception text: unexpected failures are logged with their
+traceback on stderr and reported with a correlation id. Each request is limited
+to 30 seconds.
 
 ## Quick start
 
@@ -124,30 +134,32 @@ agent-certify watch ... --otel                               # one span per scan
 agent-certify scan path/to/repo/.agent-trace/                # Cursor Agent Trace
 
 # Structural baseline and drift detection
-agent-certify keygen signing.key                             # writes signing.key and signing.key.pub
-agent-certify certify <path> --key signing.key -o system.cert.json
+agent-certify keygen ~/keys/signing.key                      # mode 600; keep it outside the repository
+agent-certify certify <path> --key ~/keys/signing.key -o system.cert.json   # valid 90 days (--validity-days)
 agent-certify verify system.cert.json <path> --public-key signing.key.pub   # exit 1 on drift
+#   --public-key is required: it is the issuer's key, obtained out of band
+#   --expect-system-id ID   --ignore-expiry   --allow-unsigned (skips the signature check; warns)
+
+# In CI: scan exits 2 when a finding reaches --fail-on (critical by default)
+agent-certify scan session.jsonl --fail-on warning           # or critical (default), never
 ```
 
 Node names are matched case-insensitively: `--node bash` finds `tool:Bash`.
 
 ## What it measures
 
-The **Fragility Index (FI)** measures the proportion of communication links
-in your multiagent system that have no backup path (zero triangle participation).
+The **Fragility Index (FI)** measures the proportion of 
+communication links in your multiagent system that have 
+no structural backup path.
 
-- **FI = 0**: Fully redundant — every communication path has an alternative
+- **FI = 0**: Fully redundant — every path has an alternative
 - **FI = 1**: Fully fragile — every link is a single point of failure
 - **Bridges**: edges whose removal disconnects the system
 
-Formally, with `tri(e)` the number of triangles containing edge `e`,
-`FI = |{e : tri(e) = 0}| / |E|`, computed on the undirected graph (two nodes are
-linked if either ever invoked the other). Call counts do not affect FI. This is
-the same measure sal-torch computes on transformer attention graphs. A graph
-with no edges has FI 0.
-
-Every bridge has `tri(e) = 0`, but not every fragile link is a bridge: a
-4-cycle has FI 1 and no bridges.
+FI is computed on the agent communication graph using triangle 
+participation analysis. The same structural measure is used by 
+[sal-torch](https://pypi.org/project/sal-torch/) on transformer 
+attention graphs (published at PPAM 2026, Springer LNCS).
 
 ## Node classification and perspectives
 
@@ -293,6 +305,35 @@ Missing agent type: agent:Explore (was in certified baseline)
 Certificates issued before v0.3 have no `identity` field; they keep comparing
 agents by id, and their signatures remain valid.
 
+### Trust model
+
+A signature proves something only when it is checked against a key you
+already trust. `verify` therefore **requires** the issuer's public key
+(`--public-key`, or `public_key=` in Python), obtained through a trusted
+channel. The `signer_public_key` written inside a certificate is informational
+only: whoever can edit the certificate can replace it. A certificate fails
+verification when it is unsigned, signed by another key, edited after
+signing, outside its validity window, or issued for another system
+(`--expect-system-id`). `--allow-unsigned` skips the signature check
+explicitly and prints a warning; use it only for local experiments.
+
+Since v0.5 every certificate carries `not_before` / `not_after` (90 days by
+default, `--validity-days`), so an older, more permissive certificate cannot be
+replayed indefinitely. Certificates from earlier versions have no validity
+window; they still verify, with a warning, and should be re-issued.
+
+The signed bytes are `b"agent-certify/cert/v1\x00"` followed by the
+certificate as JSON with sorted keys, compact separators, ASCII escaping and
+`fi_score` written as a 10-place decimal string; see `certificate.py` for the
+exact rules. Older certificates keep their original encoding, and the format
+is part of what is signed, so a certificate cannot be downgraded.
+
+Keys: `agent-certify keygen` creates the private key with mode 600 and refuses
+to overwrite an existing file or follow a symlink. `certify` warns when the key
+is readable by other users. On Windows the file inherits the folder's ACL, so
+keep keys in a folder only you can read. Never commit a key; `*.key` is in
+`.gitignore`.
+
 ## Policy
 
 Anomalies say *this is unusual*. A policy says *this is not allowed* (or *this
@@ -435,7 +476,14 @@ left out; they enrich sessions via `--include-mcp`).
 | `tool_result` with `is_error: true` | error count on the edge and the tool |
 
 Streamed messages repeat `tool_use` blocks, so calls are de-duplicated by id.
-Malformed lines are skipped with a warning. Files are streamed line by line.
+Claude Code transcripts and MCP logs are read line by line; a Cursor
+`.agent-trace` file of up to 50 MB is read whole (it may be a single JSON
+document), larger ones line by line. Lines that cannot be read — malformed,
+nested too deeply, or longer than 10 MB — are skipped and counted: the count
+appears in the scan report, in JSON (`skipped_records`), in OTel spans and in
+certificates, with a warning when more than 5% of a session's records were
+skipped. A directory scan reads at most 1,000 session files and walks at most
+5 folder levels.
 
 A session without sub-agents is a star (one orchestrator, many tools) and has
 FI = 1 by construction. Structure becomes informative once sub-agents share

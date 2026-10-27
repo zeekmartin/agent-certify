@@ -1,6 +1,6 @@
 # agent-certify — Structural verification of multiagent systems
 # Copyright 2026 Cognitive Engineering (Switzerland)
-# SPDX-License-Identifier: BSL-1.1
+# SPDX-License-Identifier: BUSL-1.1
 """Live monitoring of an active Claude Code session.
 
 The transcript is append-only. The watcher polls its size (plus the sizes of
@@ -16,6 +16,14 @@ Each anomaly or violation is reported once, when it first appears (again only
 if its severity changes), not on every scan. A file that does not exist yet is
 waited for; a half-written last line is skipped until it is complete.
 No file-system notification library: plain size polling.
+
+Any format :class:`~agent_certify.parser.AutoParser` reads can be watched: a
+Claude Code transcript, a Cursor ``traces.jsonl`` or an MCP server log.
+
+Known limitation (v0.5): every change triggers a full re-parse and rescan of
+the session, so the cost of each scan grows with the session's length. The
+scan itself is near-linear since v0.5, which keeps this practical for long
+sessions; incremental parsing from the last file offset is planned.
 """
 from __future__ import annotations
 
@@ -29,7 +37,7 @@ from pathlib import Path
 from agent_certify.anomaly import AnomalyDetector
 from agent_certify.baseline import Baseline
 from agent_certify.graph import AgentGraph
-from agent_certify.parser.claude_code import ClaudeCodeParser
+from agent_certify.parser.auto import AutoParser
 from agent_certify.policy import Policy, PolicyViolation
 from agent_certify.scanner import HIGH, AgentFIScanner, Perspective
 
@@ -156,15 +164,17 @@ class SessionWatcher:
 
     def _scan_and_report(self) -> None:
         """Parse, scan, detect anomalies, check policy."""
-        parser_log = logging.getLogger("agent_certify.parser.claude_code")
-        level = parser_log.level
-        parser_log.setLevel(logging.ERROR)     # a half-written last line is normal here
+        # A half-written last line is normal while the file grows: keep the parsers quiet about it.
+        loggers = [logging.getLogger(f"agent_certify.parser.{m}") for m in ("claude_code", "cursor_trace", "mcp_logs")]
+        levels = [lg.level for lg in loggers]
+        for lg in loggers:
+            lg.setLevel(logging.ERROR)
         started = datetime.now(timezone.utc)
         try:
-            parser = ClaudeCodeParser()
-            graph = parser.parse(str(self.session_path))
+            graph = AutoParser().parse(str(self.session_path))
         finally:
-            parser_log.setLevel(level)
+            for lg, level in zip(loggers, levels):
+                lg.setLevel(level)
         result = AgentFIScanner(graph, perspective=self.perspective).scan()
 
         fi_str = f"FI: {result.fi:.4f}"

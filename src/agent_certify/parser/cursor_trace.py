@@ -1,6 +1,6 @@
 # agent-certify — Structural verification of multiagent systems
 # Copyright 2026 Cognitive Engineering (Switzerland)
-# SPDX-License-Identifier: BSL-1.1
+# SPDX-License-Identifier: BUSL-1.1
 """Cursor Agent Trace parser.
 
 `Agent Trace <https://agent-trace.dev>`_ (github.com/cursor/agent-trace) is an
@@ -38,14 +38,13 @@ are the useful views.
 """
 from __future__ import annotations
 
-import json
 import logging
-import os
 from collections.abc import Iterator
 from pathlib import Path
 
 from agent_certify.graph import AgentGraph
-from agent_certify.parser.base import BaseParser
+from agent_certify.parser.base import BaseParser, decode_json
+from agent_certify.paths import MAX_DOCUMENT_BYTES, MAX_FILES, iter_lines, walk
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +92,7 @@ class CursorTraceParser(BaseParser):
         if stamps:
             g.started_at, g.ended_at = min(stamps), max(stamps)
         g.total_messages = len(ids)
+        g.skipped_records = self.skipped
         if self.skipped:
             logger.warning("%s: skipped %d malformed trace record(s) or field(s)", p, self.skipped)
         return g
@@ -103,18 +103,22 @@ class CursorTraceParser(BaseParser):
     def find_traces(self, directory: str = ".") -> list[Path]:
         """``.agent-trace`` directories and ``*.agent-trace`` files under ``directory``.
 
-        Skips ``.git``, ``node_modules``, virtualenvs and build output.
+        Skips ``.git``, ``node_modules``, virtualenvs and build output, walks at
+        most :data:`~agent_certify.paths.MAX_DEPTH` levels down and returns at
+        most :data:`~agent_certify.paths.MAX_FILES` traces.
         """
         root = self._expand(directory)
         found = []
-        for dirpath, dirnames, filenames in os.walk(root):
-            if Path(dirpath).name == TRACE_DIR:
-                found.append(Path(dirpath))
+        for here, dirnames, filenames in walk(root, skip=_SKIP_DIRS):
+            if here.name == TRACE_DIR:
+                found.append(here)
                 dirnames[:] = []
-                continue
-            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
-            found += [Path(dirpath) / f for f in filenames if f.endswith(TRACE_SUFFIX)]
-        return sorted(found)
+            else:
+                found += [here / f for f in filenames if f.endswith(TRACE_SUFFIX)]
+            if len(found) >= MAX_FILES:
+                logger.warning("%s: stopped after %d traces", root, MAX_FILES)
+                break
+        return sorted(found[:MAX_FILES])
 
     # ------------------------------------------------------------ internals
     @staticmethod
@@ -134,28 +138,34 @@ class CursorTraceParser(BaseParser):
         return p.name
 
     def _records(self, path: Path) -> Iterator[dict]:
-        text = path.read_text(encoding="utf-8", errors="replace").strip()
-        if not text:
-            return
-        try:
-            whole = json.loads(text)
-        except json.JSONDecodeError:
-            whole = None
+        """Trace records from one file.
+
+        A file of at most :data:`~agent_certify.paths.MAX_DOCUMENT_BYTES` is first
+        tried as one JSON document (an object, or an array of records); otherwise,
+        and for larger files, it is streamed as JSONL with the line-size limit.
+        """
+        whole = None
+        if path.stat().st_size <= MAX_DOCUMENT_BYTES:
+            text = path.read_text(encoding="utf-8", errors="replace").strip()
+            if not text:
+                return
+            whole = decode_json(text)
         if whole is not None:
             candidates = whole if isinstance(whole, list) else [whole]
-        else:
-            candidates = []
-            for line in text.splitlines():
-                if line.strip():
-                    try:
-                        candidates.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        self.skipped += 1
-        for rec in candidates:
-            if looks_like_trace_record(rec) and isinstance(rec["files"], list):
-                yield rec
-            else:
+            for rec in candidates:
+                yield from self._accept(rec)
+            return
+        for _, line in iter_lines(path):
+            if line is None:
                 self.skipped += 1
+            elif line.strip():
+                yield from self._accept(decode_json(line))
+
+    def _accept(self, rec) -> Iterator[dict]:
+        if looks_like_trace_record(rec) and isinstance(rec["files"], list):
+            yield rec
+        else:
+            self.skipped += 1
 
     @staticmethod
     def _add_editor(g: AgentGraph, tool: dict) -> str:

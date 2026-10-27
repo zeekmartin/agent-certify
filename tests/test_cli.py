@@ -1,6 +1,6 @@
 # agent-certify — Structural verification of multiagent systems
 # Copyright 2026 Cognitive Engineering (Switzerland)
-# SPDX-License-Identifier: BSL-1.1
+# SPDX-License-Identifier: BUSL-1.1
 import json
 
 from agent_certify.cli import main
@@ -39,5 +39,5 @@ def test_certify_and_verify(session_dir, tmp_path, capsys):
     # Same session without its sub-agent's transcript: topology drifted.
     (session_dir / "sess-1" / "subagents" / "agent-sub1.jsonl").unlink()
     capsys.readouterr()
-    assert main(["verify", str(cert), session]) == 1
+    assert main(["verify", str(cert), session, "--public-key", str(key) + ".pub"]) == 1
     assert "certified link(s) gone" in capsys.readouterr().out

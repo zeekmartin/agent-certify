@@ -1,6 +1,6 @@
 # agent-certify — Structural verification of multiagent systems
 # Copyright 2026 Cognitive Engineering (Switzerland)
-# SPDX-License-Identifier: BSL-1.1
+# SPDX-License-Identifier: BUSL-1.1
 """Self-contained HTML view of an agent graph.
 
 One file, inline SVG, a few lines of inline script, no external requests.
@@ -80,12 +80,26 @@ _COLORS = {
 }
 
 
+def script_json(value) -> str:
+    """JSON safe to embed in an inline ``<script>``: ``<``, ``>`` and ``&`` become ``\\u003c`` etc.
+
+    That keeps names such as ``</script>`` or ``<!--`` in tool or agent names from
+    ending the script block or switching the HTML parser's state.
+    """
+    return (json.dumps(value).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+            .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
+
+
 def render_html(graph: AgentGraph, result: ScanResult | None = None, title: str | None = None,
-                perspective: str | None = None, anomalies: AnomalyReport | None = None) -> str:
+                perspective: str | None = None, anomalies: AnomalyReport | None = None,
+                violations: list | None = None, session_findings: list | None = None) -> str:
     """Return the HTML page for ``graph``.
 
     ``perspective`` picks the role labels and colours (default: the result's
-    own perspective). ``anomalies`` adds a list of baseline anomalies.
+    own perspective). ``anomalies`` and ``violations`` add the baseline
+    anomalies and policy violations of a single session; ``session_findings``
+    — ``[(session_id, AnomalyReport | None, violations | None), ...]`` — adds a
+    per-session summary when several sessions were merged.
     """
     result = result or AgentFIScanner(graph).scan()
     perspective = (perspective or result.perspective).lower()
@@ -157,16 +171,36 @@ def render_html(graph: AgentGraph, result: ScanResult | None = None, title: str 
         stats.append(("Anomalies", str(len(anomalies.anomalies))))
     stat_html = "".join(f'<div class="stat"><span>{html.escape(k)}</span><b>{html.escape(v)}</b></div>'
                         for k, v in stats)
-    data = json.dumps(info).replace("</", "<\\/")
+    data = script_json(info)
 
-    anomaly_html = ""
+    def item(severity: str, message: str, detail: str = "") -> str:
+        return (f'<li class="sev-{html.escape(severity)}"><b>{html.escape(severity.upper())}</b> '
+                f'{html.escape(message)}' + (f'<div class="sub">{html.escape(detail)}</div>' if detail else "")
+                + "</li>")
+
+    panels = []
     if anomalies is not None:
-        items = "".join(
-            f'<li class="sev-{html.escape(a.severity)}"><b>{html.escape(a.severity.upper())}</b> '
-            f'{html.escape(a.message)}' + (f'<div class="sub">{html.escape(a.detail)}</div>' if a.detail else "")
-            + "</li>" for a in anomalies.anomalies)
-        anomaly_html = (f'<section class="anomalies"><h2>{html.escape(anomalies.summary)}</h2>'
-                        f'<ul>{items}</ul></section>')
+        items = "".join(item(a.severity, a.message, a.detail) for a in anomalies.anomalies)
+        panels.append(f'<section class="anomalies"><h2>{html.escape(anomalies.summary)}</h2><ul>{items}</ul></section>')
+    if violations is not None:
+        items = "".join(item(v.severity, v.message, f"Rule: {v.rule.describe()}") for v in violations)
+        heading = f"{len(violations)} policy violation(s)" if violations else "No policy violations"
+        panels.append(f'<section class="anomalies"><h2>{html.escape(heading)}</h2><ul>{items}</ul></section>')
+    if session_findings:
+        rows = []
+        for sid, rep, viol in session_findings:
+            parts = []
+            if rep is not None:
+                parts.append(rep.summary)
+            if viol is not None:
+                parts.append(f"{len(viol)} policy violation(s)" + (": " + "; ".join(v.message for v in viol[:3])
+                                                                    if viol else ""))
+            worst = ("critical" if (rep and rep.has_critical) or any(v.severity == "critical" for v in viol or [])
+                     else "warning" if (rep and rep.anomalies) or viol else "info")
+            rows.append(item(worst, sid, " · ".join(parts)))
+        panels.append('<section class="anomalies"><h2>Per session (anomalies and policy are evaluated per '
+                      f'session)</h2><ul>{"".join(rows)}</ul></section>')
+    anomaly_html = "\n".join(panels)
 
     legend = "".join(f'<span><i class="sw" style="background:var(--{lvl})"></i>{html.escape(names[lvl])}</span>'
                      for lvl in LEVELS)
@@ -180,9 +214,10 @@ def render_html(graph: AgentGraph, result: ScanResult | None = None, title: str 
 
 
 def save_html(graph: AgentGraph, path, result: ScanResult | None = None, title: str | None = None,
-              perspective: str | None = None, anomalies: AnomalyReport | None = None) -> Path:
+              perspective: str | None = None, anomalies: AnomalyReport | None = None,
+              violations: list | None = None) -> Path:
     p = Path(path)
-    p.write_text(render_html(graph, result, title, perspective, anomalies), encoding="utf-8")
+    p.write_text(render_html(graph, result, title, perspective, anomalies, violations), encoding="utf-8")
     return p
 
 

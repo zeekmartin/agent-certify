@@ -14,6 +14,7 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Actions are pinned by commit SHA (version in the comment); Dependabot keeps them current.
 jobs:
   test:
     name: test (${{ matrix.os }}, py${{ matrix.python }})
@@ -24,18 +25,18 @@ jobs:
         os: [ubuntu-latest, windows-latest]
         python: ["3.10", "3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: ${{ matrix.python }}
           cache: pip
           cache-dependency-path: pyproject.toml
       - run: python -m pip install --upgrade pip
       - run: pip install -e ".[dev]"
-      - run: pytest tests/ -v --cov=agent_certify --cov-report=term-missing --cov-report=xml
+      - run: pytest tests/ -v --cov=agent_certify --cov-report=term-missing --cov-report=xml --cov-fail-under=90
       - name: Upload coverage report
         if: matrix.os == 'ubuntu-latest' && matrix.python == '3.12'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: coverage-xml
           path: coverage.xml
@@ -44,21 +45,35 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.12"
-      - run: pip install ruff
+      - run: pip install "ruff==0.17.3"
       - run: ruff check src/ tests/ examples/ scripts/
+      - name: Security rules (flake8-bandit)
+        run: ruff check --select S src/
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip
+      - run: pip install -e ".[dev]" "pip-audit==2.10.1"
+      - name: Known vulnerabilities in the installed dependencies
+        run: pip-audit --skip-editable
 
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.12"
-      - run: pip install build twine
+      - run: pip install "build==1.6.1" "twine==7.0.0"
       - run: python -m build
       - run: twine check --strict dist/*
       - name: Install the wheel in a clean venv and run it
@@ -69,7 +84,7 @@ jobs:
           /tmp/wheel-venv/bin/agent-certify scan --help > /dev/null
           echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
             | /tmp/wheel-venv/bin/agent-certify mcp | grep -q '"serverInfo"'
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: dist
           path: dist/

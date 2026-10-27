@@ -9,3 +9,4 @@ dist/
 *.key.pub
 .coverage
 .agent-certify/
+*.html

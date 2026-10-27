@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-certify"
-version = "0.4.0"
+dynamic = ["version"]        # single source: agent_certify.__version__
 description = "Structural verification of multiagent systems"
 readme = "README.md"
-license = "LicenseRef-BSL-1.1"   # same form as sal-torch; becomes "Apache-2.0" at the license switch
+license = "BUSL-1.1"            # SPDX id of the Business Source License 1.1; "Apache-2.0" at the license switch
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [
@@ -52,6 +52,9 @@ Repository = "https://github.com/zeekmartin/agent-certify"
 Documentation = "https://github.com/zeekmartin/agent-certify#readme"
 Changelog = "https://github.com/zeekmartin/agent-certify/blob/main/CHANGELOG.md"
 Issues = "https://github.com/zeekmartin/agent-certify/issues"
+
+[tool.setuptools.dynamic]
+version = {attr = "agent_certify.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]

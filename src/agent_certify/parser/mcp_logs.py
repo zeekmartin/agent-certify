@@ -1,6 +1,6 @@
 # agent-certify — Structural verification of multiagent systems
 # Copyright 2026 Cognitive Engineering (Switzerland)
-# SPDX-License-Identifier: BSL-1.1
+# SPDX-License-Identifier: BUSL-1.1
 """MCP server logs parser.
 
 Claude Code writes one JSONL log per MCP server and process start:
@@ -26,7 +26,6 @@ tool. Calls already present in the transcript are not counted twice.
 from __future__ import annotations
 
 import copy
-import json
 import logging
 import os
 import re
@@ -36,8 +35,9 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from agent_certify.graph import AgentGraph
-from agent_certify.parser.base import BaseParser
+from agent_certify.parser.base import BaseParser, decode_json
 from agent_certify.parser.claude_code import ORCHESTRATOR, tool_id
+from agent_certify.paths import MAX_FILES, iter_lines, walk
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +132,7 @@ class MCPLogsParser(BaseParser):
             elif g.get_edge(ORCHESTRATOR, nid):
                 g.record_error(ORCHESTRATOR, nid)
         sessions.discard(None)
+        g.skipped_records = self.skipped_lines
         g.session_id = sessions.pop() if len(sessions) == 1 else p.stem
         if stamps:
             g.started_at, g.ended_at = min(stamps), max(stamps)
@@ -139,8 +140,7 @@ class MCPLogsParser(BaseParser):
 
     def parse_directory(self, directory: str) -> list[AgentGraph]:
         """One graph per log file under ``directory``."""
-        d = self._expand(directory)
-        return [self.parse(str(f)) for f in sorted(d.rglob(f"{_LOG_DIR_PREFIX}*/*.jsonl"))]
+        return [self.parse(str(f)) for f in self._log_files_under(self._expand(directory))]
 
     # -------------------------------------------------------------- enrich
     def enrich(self, graph: AgentGraph, mcp_log_dir: str | None = None) -> AgentGraph:
@@ -154,7 +154,7 @@ class MCPLogsParser(BaseParser):
         are added. ``added_calls`` holds how many were added.
         """
         if mcp_log_dir is not None:
-            files = sorted(self._expand(mcp_log_dir).rglob(f"{_LOG_DIR_PREFIX}*/*.jsonl"))
+            files = self._log_files_under(self._expand(mcp_log_dir))
         else:
             files = self.find_logs(graph.project) if graph.project else []
         calls: dict[tuple[str, str], int] = defaultdict(int)
@@ -189,6 +189,17 @@ class MCPLogsParser(BaseParser):
 
     # ------------------------------------------------------------ internals
     @staticmethod
+    def _log_files_under(root: Path) -> list[Path]:
+        """``mcp-logs-*/*.jsonl`` below ``root``, with the shared depth and file-count limits."""
+        found = []
+        for here, _dirs, filenames in walk(root):
+            if here.name.startswith(_LOG_DIR_PREFIX):
+                found += [here / f for f in filenames if f.endswith(".jsonl")]
+            if len(found) >= MAX_FILES:
+                break
+        return sorted(found[:MAX_FILES])
+
+    @staticmethod
     def _server(path: Path) -> str:
         name = path.parent.name
         return name.removeprefix(_LOG_DIR_PREFIX) if name.startswith(_LOG_DIR_PREFIX) else "unknown"
@@ -205,25 +216,25 @@ class MCPLogsParser(BaseParser):
         return None
 
     def _events(self, path: Path, server: str) -> Iterator[dict]:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    self.skipped_lines += 1
-                    continue
-                if not isinstance(rec, dict):
-                    continue
-                msg = rec.get("debug") or rec.get("error") or ""
-                if not isinstance(msg, str):
-                    continue
-                m = _CALL.match(msg)
-                kind = "call"
-                if not m:
-                    m, kind = _FAIL.match(msg), "error"
-                if m:
-                    yield {"kind": kind, "tool": m.group("tool"), "session": rec.get("sessionId"),
-                           "ts": rec.get("timestamp")}
+        """Tool-call and tool-failure events, skipping unreadable or oversized lines."""
+        for _, line in iter_lines(path):
+            if line is None:
+                self.skipped_lines += 1
+                continue
+            line = line.strip()
+            if not line:
+                continue
+            rec = decode_json(line)
+            if not isinstance(rec, dict):
+                self.skipped_lines += 1
+                continue
+            msg = rec.get("debug") or rec.get("error") or ""
+            if not isinstance(msg, str):
+                continue
+            m = _CALL.match(msg)
+            kind = "call"
+            if not m:
+                m, kind = _FAIL.match(msg), "error"
+            if m:
+                yield {"kind": kind, "tool": m.group("tool"), "session": rec.get("sessionId"),
+                       "ts": rec.get("timestamp")}

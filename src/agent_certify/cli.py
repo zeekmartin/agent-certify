@@ -1,12 +1,13 @@
 # agent-certify — Structural verification of multiagent systems
 # Copyright 2026 Cognitive Engineering (Switzerland)
-# SPDX-License-Identifier: BSL-1.1
+# SPDX-License-Identifier: BUSL-1.1
 """Command-line interface.
 
     agent-certify scan <session.jsonl | project-dir> [--format text|json|markdown|html] [-o FILE]
                        [--perspective engineering|risk|compliance|monitoring|classic]
                        [--baseline FILE | --no-baseline] [--policy FILE | --no-policy] [--include-mcp]
-    agent-certify watch <session.jsonl | project-dir> [--interval S] [--scans N]
+                       [--fail-on critical|warning|never]
+    agent-certify watch <session.jsonl | project-dir> [--interval S] [--scans N] [--duration S]
                         [--baseline FILE | --no-baseline] [--policy FILE | --no-policy] [--perspective P]
     agent-certify learn <session.jsonl | dir>... [-o FILE]
     agent-certify suggest-policy [--baseline FILE] [-o FILE] [--force]
@@ -14,12 +15,17 @@
     (scan and watch take --otel / --otel-stdout to emit OpenTelemetry spans)
     agent-certify blast <path> --node bash
     agent-certify keygen signing.key
-    agent-certify certify <path> --key signing.key -o system.cert.json
-    agent-certify verify system.cert.json <path>
+    agent-certify certify <path> --key signing.key [--validity-days 90] -o system.cert.json
+    agent-certify verify system.cert.json <path> --public-key signing.key.pub
+                         [--ignore-expiry] [--expect-system-id ID] [--allow-unsigned]
+
+Exit codes: ``scan`` returns 2 when a finding reaches ``--fail-on`` (default:
+any critical anomaly or critical policy violation); ``verify`` returns 1 on
+drift or an untrusted certificate, 2 on usage errors.
 
 A directory is scanned session by session and as one merged graph (every
 session's agents and tools combined); ``html``, ``blast``, ``certify`` and
-``verify`` use the merged graph.
+``verify`` use the merged graph. Anomalies and policy are evaluated per session.
 """
 from __future__ import annotations
 
@@ -28,6 +34,7 @@ import contextlib
 import json
 import logging
 import os
+import stat
 import sys
 import textwrap
 from datetime import datetime, timezone
@@ -37,21 +44,29 @@ from agent_certify import __version__
 from agent_certify.anomaly import AnomalyDetector, AnomalyReport
 from agent_certify.baseline import DEFAULT_BASELINE_PATH, Baseline, BaselineLearner, load_baseline
 from agent_certify.blast import BlastRadiusAnalyzer
-from agent_certify.certificate import AgentCertificate, generate_keypair
+from agent_certify.certificate import DEFAULT_VALIDITY_DAYS, AgentCertificate, _public_key_hex, generate_keypair
 from agent_certify.graph import AgentGraph
 from agent_certify.mcp_server import AgentCertifyMCPServer
 from agent_certify.otel import DEFAULT_TRACES_PATH, OTelExporter
 from agent_certify.parser import AutoParser, MCPLogsParser
 from agent_certify.parser.auto import is_trace_dir
+from agent_certify.paths import expand_cli
 from agent_certify.policy import DEFAULT_POLICY_PATH, Policy, PolicyGenerator, PolicyViolation
 from agent_certify.scanner import AgentFIScanner, Perspective, ScanResult
 from agent_certify.watcher import SessionWatcher, latest_session
 
 DEFAULT_PATH = "~/.claude/projects"
+FAIL_EXIT = 2
+SKIPPED_WARN_RATIO = 0.05
 
 
 def _path(p: str) -> Path:
-    return Path(os.path.expandvars(os.path.expanduser(p)))
+    """A path typed by the user: ``~`` and environment variables are expanded, as a shell would."""
+    return expand_cli(p)
+
+
+def _warn(message: str) -> None:
+    print(f"WARNING: {message}", file=sys.stderr)
 
 
 def load(path: str, include_mcp: bool = False) -> tuple[list[AgentGraph], AgentGraph]:
@@ -98,6 +113,16 @@ def _fmt_duration(s: float | None) -> str:
 _LEVEL_ORDER = {"high": 0, "medium": 1, "low": 2}
 
 
+def _skipped_note(g: AgentGraph) -> str | None:
+    """A line about unreadable records, or None when every record was read."""
+    if not g.skipped_records:
+        return None
+    total = g.total_messages + g.skipped_records
+    share = g.skipped_records / total if total else 1.0
+    return (f"Skipped records  {g.skipped_records} ({share:.1%} of {total}) — malformed or oversized lines; "
+            "the graph may be incomplete")
+
+
 def _text_report(g: AgentGraph, r: ScanResult, anomalies: AnomalyReport | None = None,
                  baseline: Baseline | None = None, violations: str | None = None) -> str:
     fi_line = f"Fragility Index  {r.fi:.4f}   ({len(r.fragile_edges)}/{r.edge_count} links with tri(e)=0"
@@ -107,8 +132,11 @@ def _text_report(g: AgentGraph, r: ScanResult, anomalies: AnomalyReport | None =
         f"Project   {g.project or '-'}",
         f"Messages  {g.total_messages}   Tool calls {g.total_tool_calls}   Duration {_fmt_duration(g.duration_seconds)}",
         fi_line,
-        "",
     ]
+    note = _skipped_note(g)
+    if note:
+        lines.append(note)
+    lines.append("")
     if anomalies is not None:
         lines += [str(anomalies), ""]
     if violations is not None:
@@ -138,9 +166,12 @@ def _markdown_report(g: AgentGraph, r: ScanResult, anomalies: AnomalyReport | No
         f"- **Fragility Index:** {r.fi:.4f} ({len(r.fragile_edges)}/{r.edge_count} links with tri(e)=0)",
         f"- **Nodes / links / bridges:** {r.node_count} / {r.edge_count} / {len(r.bridges)}",
         (f"- **Tool calls:** {g.total_tool_calls} · **Messages:** {g.total_messages} · "
-        f"**Duration:** {_fmt_duration(g.duration_seconds)}"),
-        "", "| Node | Kind | Calls | Errors | ΔFI | Role |", "|---|---|--:|--:|--:|---|",
+         f"**Duration:** {_fmt_duration(g.duration_seconds)}"),
     ]
+    note = _skipped_note(g)
+    if note:
+        lines.append(f"- **{note}**")
+    lines += ["", "| Node | Kind | Calls | Errors | ΔFI | Role |", "|---|---|--:|--:|--:|---|"]
     for nid in sorted(g.nodes, key=lambda n: -g.nodes[n].call_count):
         n = g.nodes[nid]
         lines.append(f"| `{nid}` | {n.kind} | {n.call_count} | {n.error_count} | "
@@ -152,20 +183,32 @@ def _markdown_report(g: AgentGraph, r: ScanResult, anomalies: AnomalyReport | No
     return "\n".join(lines)
 
 
-def _session_table(graphs: list[AgentGraph], detector: AnomalyDetector | None = None) -> str:
+def _counts(rep: AnomalyReport | None, violations: list[PolicyViolation] | None) -> tuple[str, str]:
+    anomalies = "-" if rep is None else (
+        ", ".join(f"{rep.count(s)} {s}" for s in ("critical", "warning", "info") if rep.count(s)) or "0")
+    if violations is None:
+        return anomalies, "-"
+    by = {s: sum(1 for v in violations if v.severity == s) for s in ("critical", "warning")}
+    return anomalies, ", ".join(f"{n} {s}" for s, n in by.items() if n) or "0"
+
+
+def _session_table(sessions: list[dict], with_anomalies: bool, with_policy: bool) -> str:
     head = f"{'SESSION':<38} {'AGENTS':>6} {'TOOLS':>5} {'CALLS':>6} {'LINKS':>5} {'BRIDGES':>7} {'FI':>7}"
-    lines = [head + ("  ANOMALIES" if detector else "")]
-    for g in graphs:
-        r = AgentFIScanner(g).scan()
+    head += "  ANOMALIES" + " " * 10 if with_anomalies else ""
+    head += "  VIOLATIONS" if with_policy else ""
+    lines = [head.rstrip()]
+    for s in sessions:
+        g, r = s["graph"], s["result"]
         agents = sum(1 for n in g.nodes.values() if n.kind == "agent")
         tools = sum(1 for n in g.nodes.values() if n.kind == "tool")
         row = (f"{(g.session_id or '')[:38]:<38} {agents:>6} {tools:>5} {g.total_tool_calls:>6} "
                f"{r.edge_count:>5} {len(r.bridges):>7} {r.fi:>7.4f}")
-        if detector:
-            rep = detector.detect(g, r)
-            row += "  " + (", ".join(f"{rep.count(s)} {s}" for s in ("critical", "warning", "info") if rep.count(s))
-                           or "-")
-        lines.append(row)
+        anomaly_text, violation_text = _counts(s["anomalies"], s["violations"])
+        if with_anomalies:
+            row += f"  {anomaly_text:<19}"
+        if with_policy:
+            row += f"  {violation_text}"
+        lines.append(row.rstrip())
     return "\n".join(lines)
 
 
@@ -189,7 +232,7 @@ def _learn_report(b: Baseline, saved: Path) -> str:
                               initial_indent="  ", subsequent_indent="  ", break_on_hyphens=False)
     return "\n".join([
         (f"Learned baseline from {b.learned_from} session{'s' if b.learned_from != 1 else ''} "
-        f"({_fmt_period(b.period_start, b.period_end)})"),
+         f"({_fmt_period(b.period_start, b.period_end)})"),
         "",
         "Structural profile:",
         f"  FI:           {b.fi_mean:.2f} ± {b.fi_std:.2f}  (range: {b.fi_min:.2f} — {b.fi_max:.2f})",
@@ -201,7 +244,7 @@ def _learn_report(b: Baseline, saved: Path) -> str:
         tool_text,
         "",
         (f"Sub-agents:    {b.sub_agent_count_mean:.1f} ± {b.sub_agent_count_std:.1f}  "
-        f"(max seen: {b.max_sub_agents_seen})"),
+         f"(max seen: {b.max_sub_agents_seen})"),
         f"Error rate:    {b.error_rate_mean:.1%} ± {b.error_rate_std:.1%}",
         f"Known links:   {len(b.known_links)}",
         "",
@@ -232,8 +275,8 @@ def _find_file(explicit: str | None, disabled: bool, default: Path, loader, what
             return None, ""
     try:
         return loader(p), p.as_posix()
-    except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
-        raise SystemExit(f"agent-certify: {p} is not a valid {what} ({exc})")
+    except (ValueError, KeyError, TypeError, OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"agent-certify: {p} is not a valid {what} ({exc})") from None
 
 
 def _find_baseline(args) -> tuple[Baseline | None, str]:
@@ -257,36 +300,59 @@ def _violations_text(violations: list[PolicyViolation]) -> str:
     return "\n".join(lines).rstrip()
 
 
+def _fails(sessions: list[dict], fail_on: str) -> bool:
+    """True when a session has a finding at or above ``fail_on`` (info-level anomalies never count)."""
+    if fail_on == "never":
+        return False
+    levels = {"critical"} if fail_on == "critical" else {"critical", "warning"}
+    for s in sessions:
+        if s["anomalies"] is not None and any(a.severity in levels for a in s["anomalies"].anomalies):
+            return True
+        if s["violations"] is not None and any(v.severity in levels for v in s["violations"]):
+            return True
+    return False
+
+
 def cmd_scan(args) -> int:
     started = datetime.now(timezone.utc)
-    otel = args.otel or args.otel_stdout
     # --otel-stdout keeps stdout for OTLP lines (to pipe into a collector); the report goes to stderr.
     with contextlib.redirect_stdout(sys.stderr) if args.otel_stdout else contextlib.nullcontext():
-        graphs, baseline, policy = _scan_report(args)
-    if otel:
+        sessions = _scan_report(args)
+    if args.otel or args.otel_stdout:
         exporter = OTelExporter()
-        detector = AnomalyDetector(baseline) if baseline else None
         written = None
-        for g in graphs:                                    # one span per session
-            r = AgentFIScanner(g, perspective=args.perspective).scan()
-            span = exporter.export_scan(g, r, detector.detect(g, r) if detector else None,
-                                        policy.check(g) if policy else None, start_time=started)
+        for s in sessions:                                  # one span per session
+            span = exporter.export_scan(s["graph"], s["result"], s["anomalies"], s["violations"], start_time=started)
             written = exporter.write(span, args.otel_file, stdout=args.otel_stdout)
         if written:
-            print(f"OTel: {len(graphs)} span(s) appended to {written.as_posix()}", file=sys.stderr)
+            print(f"OTel: {len(sessions)} span(s) appended to {written.as_posix()}", file=sys.stderr)
+    for s in sessions:
+        g = s["graph"]
+        total = g.total_messages + g.skipped_records
+        if total and g.skipped_records / total > SKIPPED_WARN_RATIO:
+            _warn(f"{g.session_id}: {g.skipped_records} of {total} records could not be read")
+    if _fails(sessions, args.fail_on):
+        print(f"agent-certify: findings at or above '{args.fail_on}' (exit {FAIL_EXIT})", file=sys.stderr)
+        return FAIL_EXIT
     return 0
 
 
-def _scan_report(args):
+def _scan_report(args) -> list[dict]:
+    """Print the report; return every session's graph, scan, anomalies and violations."""
     graphs, merged = load(args.path, include_mcp=args.include_mcp)
-    result = AgentFIScanner(merged, perspective=args.perspective).scan()
     baseline, source = _find_baseline(args)
     policy, policy_source = _find_policy(args)
     detector = AnomalyDetector(baseline, source) if baseline else None
-    # Anomalies and policy describe one session; a merged multi-session graph has no single counterpart.
+    sessions = []
+    for g in graphs:
+        r = AgentFIScanner(g, perspective=args.perspective).scan()
+        sessions.append({"graph": g, "result": r,
+                         "anomalies": detector.detect(g, r) if detector else None,
+                         "violations": policy.check(g) if policy else None})
     single = len(graphs) == 1
-    anomalies = detector.detect(merged, result) if detector and single else None
-    violations = policy.check(merged) if policy and single else None
+    result = sessions[0]["result"] if single else AgentFIScanner(merged, perspective=args.perspective).scan()
+    anomalies = sessions[0]["anomalies"] if single else None
+    violations = sessions[0]["violations"] if single else None
 
     if args.format == "json":
         payload = {"graph": merged.to_dict(), "scan": result.to_dict()}
@@ -294,40 +360,55 @@ def _scan_report(args):
             payload["anomalies"] = anomalies.to_dict()
         if violations is not None:
             payload["policy_violations"] = [v.to_dict() for v in violations]
-        if len(graphs) > 1:
+        if not single:
             payload["sessions"] = []
-            for g in graphs:
-                r = AgentFIScanner(g, perspective=args.perspective).scan()
-                entry = {"session_id": g.session_id, "project": g.project, "scan": r.to_dict()}
-                if detector:
-                    entry["anomalies"] = detector.detect(g, r).to_dict()
-                if policy:
-                    entry["policy_violations"] = [v.to_dict() for v in policy.check(g)]
+            for s in sessions:
+                entry = {"session_id": s["graph"].session_id, "project": s["graph"].project,
+                         "scan": s["result"].to_dict()}
+                if s["anomalies"] is not None:
+                    entry["anomalies"] = s["anomalies"].to_dict()
+                if s["violations"] is not None:
+                    entry["policy_violations"] = [v.to_dict() for v in s["violations"]]
                 payload["sessions"].append(entry)
         _emit(json.dumps(payload, indent=2), args.output)
     elif args.format == "html":
         from agent_certify.viz import render_html
         out = args.output or f"agent-graph-{_safe(merged.session_id)}.html"
-        Path(out).write_text(render_html(merged, result, perspective=args.perspective, anomalies=anomalies),
-                             encoding="utf-8")
+        per_session = None if single or not (detector or policy) else [
+            (s["graph"].session_id or "", s["anomalies"], s["violations"]) for s in sessions]
+        Path(out).write_text(render_html(merged, result, perspective=args.perspective, anomalies=anomalies,
+                                         violations=violations, session_findings=per_session), encoding="utf-8")
         print(f"wrote {out}")
     elif args.format == "markdown":
         text = _markdown_report(merged, result, anomalies)
         if violations is not None:
             text += f"\n\n### Policy violations: {len(violations)}\n\n" + "\n".join(
                 f"- **{v.severity.upper()}** {v.message} (rule: {v.rule.describe()})" for v in violations)
+        if not single and (detector or policy):
+            text += "\n\n### Per session\n\n| Session | Anomalies | Policy violations |\n|---|---|---|\n"
+            text += "\n".join(f"| `{s['graph'].session_id}` | {a} | {v} |"
+                              for s in sessions for a, v in [_counts(s["anomalies"], s["violations"])])
+            if policy:
+                text += "\n\n" + "\n".join(f"- `{s['graph'].session_id}`: **{v.severity.upper()}** {v.message}"
+                                           for s in sessions for v in (s["violations"] or []))
         _emit(text, args.output)
     else:
         text = _text_report(merged, result, anomalies, baseline if single else None,
                             _violations_text(violations) if violations is not None else None)
-        if len(graphs) > 1:
-            text = _session_table(graphs, detector) + "\n\nMerged graph\n============\n" + text
+        if not single:
+            text = (_session_table(sessions, detector is not None, policy is not None)
+                    + "\n\nMerged graph\n============\n" + text)
+            if policy:
+                listed = [f"  {s['graph'].session_id}: [{v.severity.upper()}] {v.message}"
+                          for s in sessions for v in s["violations"]]
+                text += "\n\nPolicy violations per session:\n" + ("\n".join(listed) if listed else "  none")
         if source:
             text += f"\n\nBaseline: {source} ({baseline.learned_from} sessions)"
         if policy_source:
-            text += f"\nPolicy:   {policy_source} ({len(policy.rules)} rules)"
+            scope = "" if single else ", evaluated per session"
+            text += f"\nPolicy:   {policy_source} ({len(policy.rules)} rules{scope})"
         _emit(text, args.output)
-    return graphs, baseline, policy
+    return sessions
 
 
 def cmd_watch(args) -> int:
@@ -381,9 +462,9 @@ def cmd_suggest_policy(args) -> int:
     lines += ["", f"Saved draft to {saved.as_posix()}", "",
               "Edit the file to add FORBIDDEN rules, for example:",
               ('  {"kind": "forbidden_tool", "target": "deploy_production", "severity": "critical", '
-              '"message": "No agent may deploy to production"}'),
+               '"message": "No agent may deploy to production"}'),
               ('  {"kind": "forbidden_link", "target": "agent:* → *database*", "severity": "critical", '
-              '"message": "Sub-agents may not reach the database"}')]
+               '"message": "Sub-agents may not reach the database"}')]
     print("\n".join(lines))
     return 0
 
@@ -402,9 +483,9 @@ def cmd_learn(args) -> int:
         else:
             baseline = learner.learn([str(_path(p)) for p in args.paths])
     except FileNotFoundError as exc:
-        raise SystemExit(f"agent-certify: {exc.args[0]} does not exist")
+        raise SystemExit(f"agent-certify: {exc.args[0]} does not exist") from None
     except ValueError as exc:
-        raise SystemExit(f"agent-certify: {exc}")
+        raise SystemExit(f"agent-certify: {exc}") from None
     saved = learner.save(baseline, args.output)
     print(_learn_report(baseline, saved))
     return 0
@@ -415,39 +496,93 @@ def cmd_blast(args) -> int:
     try:
         report = BlastRadiusAnalyzer(g, hops=args.hops).analyze(args.node)
     except KeyError as exc:
-        raise SystemExit(f"agent-certify: {exc.args[0]}")
+        raise SystemExit(f"agent-certify: {exc.args[0]}") from None
     _emit(json.dumps(report.to_dict(), indent=2) if args.format == "json" else str(report), args.output)
     return 0
 
 
+def _create_exclusive(path: Path, text: str, mode: int) -> None:
+    """Create ``path`` atomically with ``mode``; fail if it exists, never follow a symlink there.
+
+    On Windows ``mode`` only controls the read-only flag: the file inherits the
+    ACL of its directory, so keep keys in a directory only you can read.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    fd = os.open(path, flags, mode)
+    try:
+        os.write(fd, text.encode("ascii"))
+    finally:
+        os.close(fd)
+
+
 def cmd_keygen(args) -> int:
     out = Path(args.output)
-    if out.exists() and not args.force:
-        raise SystemExit(f"agent-certify: {out} exists (use --force to overwrite)")
+    pub_path = Path(str(out) + ".pub")
+    if args.force:
+        for p in (out, pub_path):
+            if p.is_symlink() or p.exists():
+                p.unlink()              # unlinking a symlink removes the link, not its target
     priv, pub = generate_keypair()
-    out.write_text(priv + "\n", encoding="utf-8")
-    Path(str(out) + ".pub").write_text(pub + "\n", encoding="utf-8")
-    print(f"private key: {out}\npublic key:  {out}.pub ({pub})")
+    for path, text, mode in ((out, priv, 0o600), (pub_path, pub, 0o644)):
+        try:
+            _create_exclusive(path, text + "\n", mode)
+        except FileExistsError:
+            raise SystemExit(f"agent-certify: {path} exists (use --force to replace it)") from None
+        except OSError as exc:
+            raise SystemExit(f"agent-certify: cannot create {path} safely ({exc.strerror})") from None
+    print(f"private key: {out}  (mode 600 — store it outside the repository and never commit it)")
+    print(f"public key:  {pub_path} ({pub})")
     return 0
+
+
+def _read_private_key(path: str) -> str:
+    p = _path(path)
+    if os.name == "posix":
+        mode = p.stat().st_mode
+        if mode & (stat.S_IRGRP | stat.S_IROTH | stat.S_IWGRP | stat.S_IWOTH):
+            _warn(f"{p} is accessible by other users (mode {stat.S_IMODE(mode):o}); run: chmod 600 {p}")
+    return p.read_text(encoding="utf-8").strip()
 
 
 def cmd_certify(args) -> int:
     _, g = load(args.path)
-    key = _path(args.key).read_text(encoding="utf-8").strip() if args.key else None
-    cert = AgentCertificate.create(g, system_id=args.system_id, signing_key=key)
+    key = _read_private_key(args.key) if args.key else None
+    if key is None:
+        _warn("issuing an UNSIGNED certificate (no --key): it can only be checked with --allow-unsigned")
+    if g.skipped_records:
+        _warn(f"{g.skipped_records} record(s) could not be read; the certificate covers a possibly "
+              "incomplete graph (recorded in the certificate as skipped_records)")
+    cert = AgentCertificate.create(g, system_id=args.system_id, signing_key=key, validity_days=args.validity_days)
     out = args.output or f"{_safe(cert.system_id)}.cert.json"
     cert.save(out)
     print(f"certificate {cert.certificate_id} -> {out}")
     print(f"  FI {cert.fi_score:.4f} | {cert.node_count} nodes, {cert.edge_count} links, "
-          f"{cert.bridge_count} bridges | signed: {cert.is_signed}")
+          f"{cert.bridge_count} bridges | signed: {cert.is_signed} | valid until {cert.not_after}")
     return 0
 
 
 def cmd_verify(args) -> int:
-    cert = AgentCertificate.load(args.certificate)
+    if not args.public_key and not args.allow_unsigned:
+        print("agent-certify: verify needs --public-key ISSUER.pub (the issuer's public key, obtained out of "
+              "band); --allow-unsigned skips the signature check", file=sys.stderr)
+        return 2
+    if args.allow_unsigned:
+        _warn("--allow-unsigned: the certificate's signature is NOT checked; anyone could have written it")
+    try:
+        cert = AgentCertificate.load(_path(args.certificate))
+    except (OSError, ValueError):
+        raise SystemExit(f"agent-certify: {args.certificate} is not a readable agent-certify certificate") from None
+    pub = None
+    if args.public_key:
+        try:
+            pub = _path(args.public_key).read_text(encoding="utf-8").strip()
+        except OSError:
+            raise SystemExit(f"agent-certify: cannot read public key {args.public_key}") from None
+        if _public_key_hex(pub) is None:
+            raise SystemExit(f"agent-certify: {args.public_key} does not hold an Ed25519 public key (64 hex chars)")
     _, g = load(args.path)
-    pub = _path(args.public_key).read_text(encoding="utf-8").strip() if args.public_key else None
-    report = cert.verify(g, fi_tolerance=args.fi_tolerance, public_key=pub)
+    report = cert.verify(g, fi_tolerance=args.fi_tolerance, public_key=pub, allow_unsigned=args.allow_unsigned,
+                         ignore_expiry=args.ignore_expiry, expected_system_id=args.expect_system_id)
     _emit(json.dumps(report.to_dict(), indent=2) if args.format == "json" else str(report), None)
     return 0 if report.is_valid else 1
 
@@ -487,17 +622,19 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("path", nargs="?", default=DEFAULT_PATH, help="session .jsonl or a directory of sessions")
     s.add_argument("--format", choices=["text", "json", "markdown", "html"], default="text")
     s.add_argument("-o", "--output")
-    s.add_argument("--perspective", choices=[n for n in Perspective.NAMES], default="engineering",
+    s.add_argument("--perspective", choices=list(Perspective.NAMES), default="engineering",
                    help="labels for node roles (default: engineering)")
     _baseline_args(s)
     _policy_args(s)
     s.add_argument("--include-mcp", action="store_true",
                    help="add the session's calls from MCP server logs (claude-cli-nodejs cache)")
+    s.add_argument("--fail-on", choices=["critical", "warning", "never"], default="critical",
+                   help=f"exit {FAIL_EXIT} when an anomaly or policy violation reaches this severity (default: critical)")
     _otel_args(s)
     s.set_defaults(func=cmd_scan)
 
     w = sub.add_parser("watch", help="watch an active session live")
-    w.add_argument("path", help="session .jsonl (may not exist yet), or a project directory (newest session)")
+    w.add_argument("path", help="session file (may not exist yet), or a project directory (newest session)")
     w.add_argument("--interval", type=float, default=30.0, help="seconds between checks (default: 30)")
     w.add_argument("--perspective", choices=list(Perspective.NAMES), default="engineering")
     w.add_argument("--scans", type=int, help="stop after this many scans (default: until Ctrl+C)")
@@ -531,22 +668,28 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("-o", "--output")
     b.set_defaults(func=cmd_blast)
 
-    k = sub.add_parser("keygen", help="create an Ed25519 signing key (writes KEY and KEY.pub)")
-    k.add_argument("output")
-    k.add_argument("--force", action="store_true")
+    k = sub.add_parser("keygen", help="create an Ed25519 signing key (writes KEY with mode 600, and KEY.pub)")
+    k.add_argument("output", help="private key file; keep it outside the repository")
+    k.add_argument("--force", action="store_true", help="replace existing key files")
     k.set_defaults(func=cmd_keygen)
 
     c = sub.add_parser("certify", help="issue a structural certificate for a graph")
     c.add_argument("path")
     c.add_argument("--key", help="private key file from `agent-certify keygen`; omit for an unsigned certificate")
     c.add_argument("--system-id")
+    c.add_argument("--validity-days", type=int, default=DEFAULT_VALIDITY_DAYS,
+                   help=f"how long the certificate is valid (default: {DEFAULT_VALIDITY_DAYS})")
     c.add_argument("-o", "--output")
     c.set_defaults(func=cmd_certify)
 
     v = sub.add_parser("verify", help="check a graph against a certificate (exit 1 on drift)")
     v.add_argument("certificate")
     v.add_argument("path")
-    v.add_argument("--public-key", help="issuer's public key file, to check who signed")
+    v.add_argument("--public-key", help="REQUIRED: the issuer's public key file (KEY.pub), obtained out of band")
+    v.add_argument("--allow-unsigned", action="store_true",
+                   help="skip the signature check (unsafe: anyone can write an unsigned certificate)")
+    v.add_argument("--ignore-expiry", action="store_true", help="accept a certificate outside its validity period")
+    v.add_argument("--expect-system-id", help="fail unless the certificate was issued for this system id")
     v.add_argument("--fi-tolerance", type=float, default=0.001)
     v.add_argument("--format", choices=["text", "json"], default="text")
     v.set_defaults(func=cmd_verify)

@@ -1,6 +1,6 @@
 # agent-certify — Structural verification of multiagent systems
 # Copyright 2026 Cognitive Engineering (Switzerland)
-# SPDX-License-Identifier: BSL-1.1
+# SPDX-License-Identifier: BUSL-1.1
 """Scan one Claude Code session: FI, bridges, node roles, blast radius, HTML.
 
     python examples/scan_claude_session.py ~/.claude/projects/<project>/<session>.jsonl

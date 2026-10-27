@@ -1,6 +1,6 @@
 # agent-certify — Structural verification of multiagent systems
 # Copyright 2026 Cognitive Engineering (Switzerland)
-# SPDX-License-Identifier: BSL-1.1
+# SPDX-License-Identifier: BUSL-1.1
 """Claude Code session parser.
 
 Claude Code writes one JSONL transcript per session under
@@ -30,7 +30,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from agent_certify.graph import AgentGraph
-from agent_certify.parser.base import BaseParser
+from agent_certify.parser.base import BaseParser, decode_json, session_files
+from agent_certify.paths import MAX_LINE_BYTES, iter_lines
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +62,9 @@ class ClaudeCodeParser(BaseParser):
 
     ``include_subagents=False`` ignores sub-agent transcripts; spawned agents
     then appear as leaf nodes. ``include_human=False`` drops the human node.
-    After a parse, ``skipped_lines`` holds the number of malformed lines skipped.
+    After a parse, ``skipped_lines`` (and ``graph.skipped_records``) hold the
+    number of lines that could not be read: malformed or too deeply nested JSON,
+    or a line over :data:`agent_certify.paths.MAX_LINE_BYTES`.
     """
 
     def __init__(self, include_subagents: bool = True, include_human: bool = True):
@@ -107,8 +110,9 @@ class ClaudeCodeParser(BaseParser):
             g.duration_seconds = (state.last - state.first).total_seconds()
             g.started_at = _iso(state.first)
             g.ended_at = _iso(state.last)
+        g.skipped_records = self.skipped_lines
         if self.skipped_lines:
-            logger.warning("%s: skipped %d malformed line(s)", p, self.skipped_lines)
+            logger.warning("%s: skipped %d unreadable line(s)", p, self.skipped_lines)
         return g
 
     def parse_directory(self, directory: str) -> list[AgentGraph]:
@@ -121,9 +125,7 @@ class ClaudeCodeParser(BaseParser):
         d = self._expand(directory)
         if not d.is_dir():
             raise NotADirectoryError(d)
-        files = sorted(d.glob("*.jsonl"))
-        if not files:
-            files = sorted(f for sub in sorted(d.iterdir()) if sub.is_dir() for f in sub.glob("*.jsonl"))
+        files = session_files(d)
         graphs = []
         for f in files:
             try:
@@ -200,22 +202,21 @@ class ClaudeCodeParser(BaseParser):
             g.add_call(HUMAN, ORCHESTRATOR)
 
     def _records(self, path: Path) -> Iterator[dict]:
-        """Stream records, skipping malformed lines."""
-        with open(path, encoding="utf-8", errors="replace") as f:
-            for lineno, line in enumerate(f, 1):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    self.skipped_lines += 1
-                    logger.debug("%s:%d: malformed JSON, skipped", path, lineno)
-                    continue
-                if isinstance(rec, dict):
-                    yield rec
-                else:
-                    self.skipped_lines += 1
+        """Stream records, skipping lines that are malformed, too deeply nested or too long."""
+        for lineno, line in iter_lines(path):
+            if line is None:
+                self.skipped_lines += 1
+                logger.debug("%s:%d: line over the size limit, skipped", path, lineno)
+                continue
+            line = line.strip()
+            if not line:
+                continue
+            rec = decode_json(line)
+            if isinstance(rec, dict):
+                yield rec
+            else:
+                self.skipped_lines += 1
+                logger.debug("%s:%d: unreadable record, skipped", path, lineno)
 
 
 class _State:
@@ -234,8 +235,12 @@ def _load_metas(sub_dir: Path) -> dict[str, dict]:
         return metas
     for m in sub_dir.glob("agent-*.meta.json"):
         try:
-            metas[m.name[len("agent-"):-len(".meta.json")]] = json.loads(m.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            meta = json.loads(m.read_text(encoding="utf-8")) if m.stat().st_size <= MAX_LINE_BYTES else None
+        except (OSError, ValueError, RecursionError):
+            meta = None
+        if isinstance(meta, dict):
+            metas[m.name[len("agent-"):-len(".meta.json")]] = meta
+        else:
             logger.warning("%s: unreadable sub-agent metadata", m)
     return metas
 

@@ -1,6 +1,6 @@
 # agent-certify — Structural verification of multiagent systems
 # Copyright 2026 Cognitive Engineering (Switzerland)
-# SPDX-License-Identifier: BSL-1.1
+# SPDX-License-Identifier: BUSL-1.1
 """agent-certify as an MCP server: an agent can scan its own topology.
 
 Model Context Protocol over stdio: newline-delimited JSON-RPC 2.0 on
@@ -11,7 +11,21 @@ stdin/stdout, no third-party MCP package. Implements ``initialize``,
 Errors never stop the server. Protocol problems (bad JSON, unknown method,
 unknown tool) are JSON-RPC errors; a tool that fails (missing session, no
 baseline, unknown node...) returns a normal result with ``isError: true`` and a
-message the calling agent can read and act on, as the MCP specification asks.
+message the calling agent can act on, as the MCP specification asks.
+
+Untrusted input
+---------------
+Tool arguments come from an AI agent, which may be acting on injected
+instructions. So:
+
+* path arguments (``session_path``, ``baseline_path``, ``policy_path``) expand
+  ``~`` but **never** environment variables, are resolved (symlinks, ``..``)
+  and must lie inside an allowed root: ``~/.claude/projects`` or the server's
+  working directory. Anything else is refused with "Path not allowed";
+* no response or error message contains a resolved path, a file's contents or
+  an exception's text. Unexpected failures are logged with their traceback on
+  stderr and reported to the client as a generic message with a correlation id;
+* each request runs under a time limit (30 s by default).
 
 stdout carries protocol messages only: anything else the library would print
 goes to stderr while the server runs.
@@ -26,13 +40,19 @@ Current session detection (when a tool's ``session_path`` is omitted):
    or ``CLAUDE_SESSION_ID``: ``~/.claude/projects/*/<id>.jsonl``
 2. the newest session of the project in the working directory
    (``~/.claude/projects/<cwd with separators as dashes>/``)
-3. the newest session anywhere under ``~/.claude/projects/``
+
+There is no machine-wide fallback: sessions of other projects are never read
+unless the caller names them (and they lie under ``~/.claude/projects``).
 """
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
 import sys
+import threading
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -43,19 +63,24 @@ from agent_certify.blast import BlastRadiusAnalyzer
 from agent_certify.graph import AgentGraph
 from agent_certify.parser.auto import AutoParser
 from agent_certify.parser.mcp_logs import project_key
+from agent_certify.paths import PathNotAllowed, confine
 from agent_certify.policy import DEFAULT_POLICY_PATH, Policy
 from agent_certify.scanner import HIGH, AgentFIScanner, Perspective, ScanResult
 from agent_certify.watcher import latest_session
 
+logger = logging.getLogger(__name__)
+
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 SESSION_ENV_VARS = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID")
-PERSPECTIVES = ["engineering", "risk", "compliance", "monitoring"]
+PERSPECTIVES = list(Perspective.NAMES)          # engineering, risk, compliance, monitoring, classic
+DEFAULT_REQUEST_TIMEOUT = 30.0
+_SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
 PARSE_ERROR, INVALID_REQUEST, METHOD_NOT_FOUND, INVALID_PARAMS, INTERNAL_ERROR = -32700, -32600, -32601, -32602, -32603
 
 _SESSION = {"type": "string",
-            "description": "Session transcript (.jsonl), Cursor .agent-trace, or a project folder (newest session). "
-                           "Omit to use the current session."}
+            "description": "Session transcript (.jsonl), Cursor .agent-trace, or a project folder (newest session), "
+                           "inside ~/.claude/projects or the working directory. Omit to use the current session."}
 
 TOOLS = [
     {
@@ -112,14 +137,18 @@ class ToolError(Exception):
 # --------------------------------------------------------------- sessions
 def find_current_session(projects_root: Path | None = None, cwd: str | None = None,
                          env: dict | None = None) -> tuple[Path, str]:
-    """(session file, how it was found). Raises ToolError when there is none."""
+    """(session file, how it was found) for the current session. Raises ToolError when there is none.
+
+    Only the session named by ``CLAUDE_CODE_SESSION_ID`` / ``CLAUDE_SESSION_ID``
+    or the newest session of the working directory's project qualify.
+    """
     root = projects_root or Path.home() / ".claude" / "projects"
     env = os.environ if env is None else env
     if not root.is_dir():
-        raise ToolError(f"No Claude Code projects folder at {root}; pass session_path explicitly.")
+        raise ToolError("No Claude Code projects folder found; pass session_path explicitly.")
     for var in SESSION_ENV_VARS:
         sid = env.get(var)
-        if sid:
+        if sid and _SESSION_ID.fullmatch(sid):
             hits = sorted(root.glob(f"*/{sid}.jsonl"))
             if hits:
                 return hits[0], f"{var}={sid}"
@@ -128,10 +157,7 @@ def find_current_session(projects_root: Path | None = None, cwd: str | None = No
     newest = latest_session(project) if project.is_dir() else None
     if newest:
         return newest, f"newest session of project {project.name}"
-    candidates = [f for d in root.iterdir() if d.is_dir() for f in d.glob("*.jsonl")]
-    if not candidates:
-        raise ToolError(f"No sessions under {root}; pass session_path explicitly.")
-    return max(candidates, key=lambda f: f.stat().st_mtime), "newest session on this machine"
+    raise ToolError("No session found in the current project; pass session_path explicitly.")
 
 
 # ------------------------------------------------------------ summaries
@@ -176,7 +202,7 @@ def describe(graph: AgentGraph, result: ScanResult, anomalies=None, violations=N
         parts.append("the human")
     links = result.edge_count
     out = [(f"{subject} has {result.node_count} nodes ({', '.join(parts)}) and {links} "
-           f"link{'s' if links != 1 else ''}.")]
+            f"link{'s' if links != 1 else ''}.")]
 
     fragile = len(result.fragile_edges)
     if links == 0:
@@ -205,11 +231,10 @@ def describe(graph: AgentGraph, result: ScanResult, anomalies=None, violations=N
     keystones = sorted((n for n, lvl in result.node_levels.items() if lvl == HIGH),
                        key=lambda n: (graph.nodes[n].kind != "orchestrator", -graph.nodes[n].call_count, n))
     if keystones:
-        blast = BlastRadiusAnalyzer(graph)
         first = keystones[0]
         node = graph.nodes[first]
         who = f"The orchestrator ({node.name})" if node.kind == "orchestrator" else _readable(graph, [first])
-        b = blast.analyze(first)
+        b = BlastRadiusAnalyzer(graph).analyze(first)
         single = all(len(c) == 1 for c in b.components_after)
         if b.system_fragmented:
             effect = f"if it fails, the system fragments into {_pieces(len(b.components_after), single)}"
@@ -231,29 +256,28 @@ def describe(graph: AgentGraph, result: ScanResult, anomalies=None, violations=N
         if errs and graph.total_tool_calls:
             line += f" Overall {errs / graph.total_tool_calls:.1%} of {graph.total_tool_calls} tool calls failed."
         out.append(line)
+    if graph.skipped_records:
+        out.append(f"{_plural(graph.skipped_records, 'record')} of the session could not be read, so this picture "
+                   "may be incomplete.")
 
-    if not checks:
-        pass
-    elif anomalies is None:
-        out.append(baseline_note or "No baseline is loaded, so anomalies can't be judged "
-                                    "(run `agent-certify learn` to create one).")
-    elif not anomalies.anomalies:
-        out.append(f"No anomalies detected against the baseline of {anomalies.learned_from} sessions.")
-    else:
-        top = "; ".join(a.message for a in anomalies.anomalies[:3])
-        more = f" (and {len(anomalies.anomalies) - 3} more)" if len(anomalies.anomalies) > 3 else ""
-        out.append(f"Against the baseline of {anomalies.learned_from} sessions: {anomalies.summary} — {top}{more}.")
-
-    if not checks:
-        pass
-    elif violations is None:
-        out.append(policy_note or "No policy is loaded.")
-    elif not violations:
-        out.append("No policy violations.")
-    else:
-        out.append(f"{len(violations)} policy violation{'s' if len(violations) != 1 else ''}: "
-                   + "; ".join(f"{v.severity.upper()} {v.message}" for v in violations[:3])
-                   + (" …" if len(violations) > 3 else "") + ".")
+    if checks:
+        if anomalies is None:
+            out.append(baseline_note or "No baseline is loaded, so anomalies can't be judged "
+                                        "(run `agent-certify learn` to create one).")
+        elif not anomalies.anomalies:
+            out.append(f"No anomalies detected against the baseline of {anomalies.learned_from} sessions.")
+        else:
+            top = "; ".join(a.message for a in anomalies.anomalies[:3])
+            more = f" (and {len(anomalies.anomalies) - 3} more)" if len(anomalies.anomalies) > 3 else ""
+            out.append(f"Against the baseline of {anomalies.learned_from} sessions: {anomalies.summary} — {top}{more}.")
+        if violations is None:
+            out.append(policy_note or "No policy is loaded.")
+        elif not violations:
+            out.append("No policy violations.")
+        else:
+            out.append(f"{len(violations)} policy violation{'s' if len(violations) != 1 else ''}: "
+                       + "; ".join(f"{v.severity.upper()} {v.message}" for v in violations[:3])
+                       + (" …" if len(violations) > 3 else "") + ".")
 
     if links and fragile == links and not kinds["agent"] and not kinds["file"]:
         out.append("This is the usual shape of a single-agent session — one orchestrator calling each tool "
@@ -267,18 +291,21 @@ class AgentCertifyMCPServer:
 
     ``handle(message)`` processes one decoded JSON-RPC message and returns the
     response (``None`` for notifications); ``run()`` is the stdio loop.
-    ``projects_root``, ``cwd`` and ``env`` override session auto-detection.
+    ``projects_root``, ``cwd`` and ``env`` override session auto-detection;
+    ``projects_root`` and the process working directory are the roots that
+    path arguments are confined to. ``request_timeout`` bounds each tool call.
     """
 
     TOOLS = TOOLS
 
     def __init__(self, projects_root: str | os.PathLike | None = None, cwd: str | None = None,
-                 env: dict | None = None):
+                 env: dict | None = None, request_timeout: float = DEFAULT_REQUEST_TIMEOUT):
         from agent_certify import __version__
         self.version = __version__
         self.projects_root = Path(projects_root) if projects_root else None
         self.cwd = cwd
         self.env = env
+        self.request_timeout = request_timeout
         self.protocol_version = PROTOCOL_VERSIONS[0]
         self._handlers: dict[str, Callable[..., dict]] = {
             "scan_topology": self._scan_topology,
@@ -287,6 +314,13 @@ class AgentCertifyMCPServer:
             "check_policy": self._check_policy,
             "topology_summary": self._topology_summary,
         }
+
+    def allowed_roots(self) -> list[Path]:
+        """Directories that path arguments may point into."""
+        roots = [self.projects_root or Path.home() / ".claude" / "projects", Path(os.getcwd())]
+        if self.cwd and Path(self.cwd).is_dir():
+            roots.append(Path(self.cwd))
+        return roots
 
     # ------------------------------------------------------------ transport
     def run(self, stdin: BinaryIO | None = None, stdout: BinaryIO | None = None) -> None:
@@ -309,22 +343,24 @@ class AgentCertifyMCPServer:
     def handle_line(self, line: str) -> Any:
         try:
             message = json.loads(line)
-        except json.JSONDecodeError as exc:
-            return self._error(None, PARSE_ERROR, f"Parse error: {exc}")
+        except (json.JSONDecodeError, RecursionError):
+            return self._error(None, PARSE_ERROR, "Parse error")
         if isinstance(message, list):                        # JSON-RPC batch (2025-03-26)
             replies = [r for r in (self.handle(m) for m in message) if r is not None]
             return replies or None
         return self.handle(message)
 
     def handle(self, message: Any) -> dict | None:
-        if not isinstance(message, dict) or message.get("jsonrpc") != "2.0" or "method" not in message:
+        if not isinstance(message, dict) or message.get("jsonrpc") != "2.0" or not isinstance(message.get("method"),
+                                                                                                str):
             return self._error(message.get("id") if isinstance(message, dict) else None,
                                INVALID_REQUEST, "Invalid Request")
         is_notification = "id" not in message
         try:
             response = self._dispatch(message)
-        except Exception as exc:  # noqa: BLE001 — one bad request must never kill the server
-            response = self._error(message.get("id"), INTERNAL_ERROR, f"Internal error: {exc}")
+        except Exception:  # noqa: BLE001 — one bad request must never kill the server
+            ref = self._log_failure("dispatch")
+            response = self._error(message.get("id"), INTERNAL_ERROR, f"Internal error (ref {ref})")
         return None if is_notification else response
 
     def _dispatch(self, request: dict) -> dict | None:
@@ -339,7 +375,7 @@ class AgentCertifyMCPServer:
             return self._result(request, {"tools": self.TOOLS})
         if method == "tools/call":
             return self._handle_tool_call(request)
-        return self._error(request.get("id"), METHOD_NOT_FOUND, f"Method not found: {method}")
+        return self._error(request.get("id"), METHOD_NOT_FOUND, "Method not found")
 
     def _handle_initialize(self, request: dict) -> dict:
         asked = (request.get("params") or {}).get("protocolVersion")
@@ -358,9 +394,9 @@ class AgentCertifyMCPServer:
         params = request.get("params") or {}
         name = params.get("name")
         arguments = params.get("arguments") or {}
-        handler = self._handlers.get(name)
+        handler = self._handlers.get(name) if isinstance(name, str) else None
         if handler is None:
-            return self._error(request.get("id"), INVALID_PARAMS, f"Unknown tool: {name}")
+            return self._error(request.get("id"), INVALID_PARAMS, "Unknown tool")
         if not isinstance(arguments, dict):
             return self._error(request.get("id"), INVALID_PARAMS, "arguments must be an object")
         schema = next(t["inputSchema"] for t in self.TOOLS if t["name"] == name)
@@ -368,19 +404,49 @@ class AgentCertifyMCPServer:
         missing = set(schema.get("required", [])) - set(arguments)
         try:
             if unknown:
-                raise ToolError(f"Unknown argument(s) for {name}: {', '.join(sorted(unknown))}")
+                raise ToolError(f"Unknown argument(s) for {name}: {', '.join(sorted(map(str, unknown)))}")
             if missing:
                 raise ToolError(f"Missing required argument(s) for {name}: {', '.join(sorted(missing))}")
-            payload = handler(**arguments)
+            if not all(isinstance(v, str) for v in arguments.values()):
+                raise ToolError("Every argument must be a string")
+            payload = self._run_with_timeout(handler, arguments)
         except ToolError as exc:
             return self._result(request, {"content": [{"type": "text", "text": str(exc)}], "isError": True})
-        except Exception as exc:  # noqa: BLE001 — report any tool failure to the caller, keep serving
-            return self._result(request, {"content": [{"type": "text", "text": f"{name} failed: {exc}"}],
+        except Exception:  # noqa: BLE001 — report any tool failure to the caller, keep serving
+            ref = self._log_failure(name)
+            return self._result(request, {"content": [{"type": "text",
+                                                       "text": f"{name} failed (ref {ref}; details in the server log)"}],
                                           "isError": True})
         result = {"content": [{"type": "text", "text": json.dumps(payload, indent=2, ensure_ascii=False)}]}
         if self.protocol_version >= "2025-06-18":
             result["structuredContent"] = payload
         return self._result(request, result)
+
+    def _run_with_timeout(self, handler: Callable[..., dict], arguments: dict) -> dict:
+        """Run a tool in a worker thread; give up after ``request_timeout`` seconds."""
+        outcome: dict[str, Any] = {}
+
+        def target():
+            try:
+                outcome["value"] = handler(**arguments)
+            except BaseException as exc:  # noqa: BLE001 — re-raised in the calling thread
+                outcome["error"] = exc
+
+        worker = threading.Thread(target=target, daemon=True)
+        worker.start()
+        worker.join(self.request_timeout)
+        if worker.is_alive():
+            # The thread cannot be killed; it is a daemon and its result is discarded.
+            raise ToolError(f"Request timed out after {self.request_timeout:g} s")
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["value"]
+
+    @staticmethod
+    def _log_failure(where: str) -> str:
+        ref = uuid.uuid4().hex[:12]
+        logger.exception("agent-certify MCP: %s failed (ref %s)", where, ref)
+        return ref
 
     @staticmethod
     def _result(request: dict, result: dict) -> dict:
@@ -390,54 +456,66 @@ class AgentCertifyMCPServer:
     def _error(msg_id, code: int, message: str) -> dict:
         return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": code, "message": message}}
 
+    # ---------------------------------------------------------------- paths
+    def _confined(self, raw: str) -> Path:
+        try:
+            return confine(raw, self.allowed_roots())
+        except PathNotAllowed:
+            raise ToolError("Path not allowed") from None
+
     # ---------------------------------------------------------------- tools
     def _load(self, session_path: str | None) -> tuple[AgentGraph, str, str]:
-        """(graph, session file, how it was found)."""
+        """(graph, session label for responses, how it was found). Never exposes a resolved path."""
         if session_path:
-            p = Path(os.path.expandvars(os.path.expanduser(session_path)))
+            p = self._confined(session_path)
             if not p.exists():
-                raise ToolError(f"Session not found: {p}")
-            how = "given"
+                raise ToolError("Session not found")
+            label, how = session_path, "given"
             if p.is_dir() and any(p.glob("*.jsonl")):
-                p, how = latest_session(p), f"newest session in {p}"
+                p, how = latest_session(p), "newest session in the given folder"
         else:
             p, how = find_current_session(self.projects_root, self.cwd, self.env)
+            label = f"{p.parent.name}/{p.stem}"
         try:
-            return AutoParser().parse(str(p)), str(p), how
-        except (ValueError, OSError) as exc:
-            raise ToolError(f"Cannot read {p}: {exc}") from exc
+            graph = AutoParser().parse(str(p))
+        except (ValueError, OSError, RecursionError, MemoryError):
+            raise ToolError("Session could not be read (unsupported or malformed file)") from None
+        return graph, label, how
+
+    def _artifact(self, raw: str | None, default: Path, loader, what: str, hint: str, absent_note: str,
+                  required: bool):
+        """Load a baseline or policy from a confined path; (None, absent_note) when absent and optional."""
+        p = self._confined(raw) if raw else default
+        if not p.is_file():
+            if raw:
+                raise ToolError(f"{what.capitalize()} not found")
+            if required:
+                raise ToolError(f"No {what} at {default.as_posix()}. {hint}")
+            return None, absent_note
+        try:
+            return loader(p), (raw if raw else default.as_posix())
+        except (ValueError, KeyError, TypeError, OSError, RecursionError, json.JSONDecodeError):
+            raise ToolError(f"Invalid {what} format") from None
 
     def _baseline(self, baseline_path: str | None, required: bool):
-        p = Path(baseline_path) if baseline_path else DEFAULT_BASELINE_PATH
-        if not p.is_file():
-            if required:
-                raise ToolError(f"No baseline at {p.as_posix()}. Learn one first: "
-                                "`agent-certify learn ~/.claude/projects/<project>/`.")
-            return None, (f"No baseline at {p.as_posix()}, so anomalies can't be judged "
-                          "(run `agent-certify learn` to create one).")
-        try:
-            return load_baseline(p), p.as_posix()
-        except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
-            raise ToolError(f"{p.as_posix()} is not a valid baseline: {exc}") from exc
+        where = DEFAULT_BASELINE_PATH.as_posix()
+        return self._artifact(baseline_path, DEFAULT_BASELINE_PATH, load_baseline, "baseline",
+                              "Learn one first: `agent-certify learn ~/.claude/projects/<project>/`.",
+                              f"No baseline at {where}, so anomalies can't be judged "
+                              "(run `agent-certify learn` to create one).", required)
 
     def _policy(self, policy_path: str | None, required: bool):
-        p = Path(policy_path) if policy_path else DEFAULT_POLICY_PATH
-        if not p.is_file():
-            if required:
-                raise ToolError(f"No policy at {p.as_posix()}. Draft one with `agent-certify suggest-policy`.")
-            return None, f"No policy at {p.as_posix()}."
-        try:
-            return Policy.load(p), p.as_posix()
-        except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
-            raise ToolError(f"{p.as_posix()} is not a valid policy: {exc}") from exc
+        return self._artifact(policy_path, DEFAULT_POLICY_PATH, Policy.load, "policy",
+                              "Draft one with `agent-certify suggest-policy`.",
+                              f"No policy at {DEFAULT_POLICY_PATH.as_posix()}.", required)
 
     def _scan_topology(self, session_path: str | None = None, perspective: str = "engineering") -> dict:
-        if perspective.lower() not in PERSPECTIVES + ["classic"]:
-            raise ToolError(f"Unknown perspective {perspective!r}; choose from {', '.join(PERSPECTIVES)}.")
-        graph, path, how = self._load(session_path)
+        if perspective.lower() not in PERSPECTIVES:
+            raise ToolError(f"Unknown perspective; choose from {', '.join(PERSPECTIVES)}.")
+        graph, label, how = self._load(session_path)
         r = AgentFIScanner(graph, perspective=perspective).scan()
         return {
-            "session": path,
+            "session": label,
             "session_source": how,
             "fi": round(r.fi, 6),
             "node_count": r.node_count,
@@ -445,6 +523,7 @@ class AgentCertifyMCPServer:
             "bridge_count": len(r.bridges),
             "components": r.components,
             "articulation_points": r.articulation_points,
+            "skipped_records": r.skipped_records,
             "perspective": r.perspective,
             "labels": Perspective.labels(perspective),
             "nodes": [{"id": n.id, "kind": n.kind, "name": n.name, "calls": n.call_count,
@@ -457,10 +536,10 @@ class AgentCertifyMCPServer:
 
     def _check_anomalies(self, session_path: str | None = None, baseline_path: str | None = None) -> dict:
         baseline, source = self._baseline(baseline_path, required=True)
-        graph, path, _ = self._load(session_path)
+        graph, label, _ = self._load(session_path)
         report = AnomalyDetector(baseline, source).detect(graph, AgentFIScanner(graph).scan())
         return {
-            "session": path,
+            "session": label,
             "baseline": source,
             "learned_from": baseline.learned_from,
             "anomaly_count": len(report.anomalies),
@@ -470,13 +549,13 @@ class AgentCertifyMCPServer:
         }
 
     def _blast_radius(self, node: str, session_path: str | None = None) -> dict:
-        graph, path, _ = self._load(session_path)
+        graph, label, _ = self._load(session_path)
         try:
             b = BlastRadiusAnalyzer(graph).analyze(node)
         except KeyError as exc:
-            raise ToolError(str(exc.args[0])) from exc
+            raise ToolError(str(exc.args[0])) from None       # names of this session's own nodes
         return {
-            "session": path,
+            "session": label,
             "compromised": b.compromised,
             "direct_impact": b.direct_impact,
             "total_reachable": b.total_reachable,
@@ -490,10 +569,10 @@ class AgentCertifyMCPServer:
 
     def _check_policy(self, session_path: str | None = None, policy_path: str | None = None) -> dict:
         policy, source = self._policy(policy_path, required=True)
-        graph, path, _ = self._load(session_path)
+        graph, label, _ = self._load(session_path)
         violations = policy.check(graph)
         return {
-            "session": path,
+            "session": label,
             "policy": source,
             "rule_count": len(policy.rules),
             "violation_count": len(violations),
@@ -505,19 +584,19 @@ class AgentCertifyMCPServer:
         }
 
     def _topology_summary(self, session_path: str | None = None) -> dict:
-        graph, path, how = self._load(session_path)
+        graph, label, how = self._load(session_path)
         r = AgentFIScanner(graph, perspective="engineering").scan()
         baseline, b_note = self._baseline(None, required=False)
         policy, p_note = self._policy(None, required=False)
         anomalies = AnomalyDetector(baseline).detect(graph, r) if baseline else None
         violations = policy.check(graph) if policy else None
-        return {"session": path, "session_source": how,
+        return {"session": label, "session_source": how,
                 "summary": describe(graph, r, anomalies, violations, baseline_note=b_note, policy_note=p_note,
                                     subject=_subject(how))}
 
 
 def _subject(how: str) -> str:
-    return "This session" if how == "given" else "Your current session"
+    return "Your current session" if how.startswith(("CLAUDE", "newest session of project")) else "This session"
 
 
 def main() -> None:
