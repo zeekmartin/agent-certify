@@ -27,11 +27,8 @@ DEFAULT_BASELINE_PATH = Path(".agent-certify") / "baseline.json"
 
 
 def node_role(graph: AgentGraph, node_id: str) -> str:
-    """Stable identity of a node across sessions (agents by type)."""
-    node = graph.nodes[node_id]
-    if node.kind == "agent":
-        return f"agent:{node.metadata.get('agentType') or 'unknown'}"
-    return node_id
+    """Stable identity of a node across sessions (agents by type); see :meth:`AgentGraph.role`."""
+    return graph.role(node_id)
 
 
 def session_features(graph: AgentGraph, scan: ScanResult | None = None) -> dict:

@@ -163,6 +163,17 @@ class AgentGraph:
         return components
 
     # ---------------------------------------------------------------- lookup
+    def role(self, node_id: str) -> str:
+        """Stable identity of a node across sessions.
+
+        Sub-agent ids are unique per spawn, so an agent's role is its type
+        (``agent:Explore``, or ``agent:unknown``); every other node is its own role.
+        """
+        node = self.nodes[node_id]
+        if node.kind == "agent":
+            return f"agent:{node.metadata.get('agentType') or 'unknown'}"
+        return node_id
+
     def resolve(self, name: str) -> str:
         """Find a node id from an id or display name (case-insensitive).
 

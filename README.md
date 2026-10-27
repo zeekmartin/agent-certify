@@ -50,6 +50,18 @@ agent-certify scan session.jsonl                             # compares against 
 agent-certify scan session.jsonl --baseline path/to/baseline.json
 agent-certify scan session.jsonl --no-baseline
 
+# Policy: explicit rules, drafted from the baseline, edited by a human
+agent-certify suggest-policy                                 # writes .agent-certify/policy.json
+agent-certify scan session.jsonl                             # also checks ./.agent-certify/policy.json if present
+agent-certify scan session.jsonl --policy path/to/policy.json   # or --no-policy
+
+# Live monitoring
+agent-certify watch ~/.claude/projects/C--dev-myproject/     # newest session in the project
+agent-certify watch path/to/session.jsonl --interval 10 --perspective risk
+
+# MCP server logs as a second data source
+agent-certify scan session.jsonl --include-mcp
+
 # Structural baseline and drift detection
 agent-certify keygen signing.key                             # writes signing.key and signing.key.pub
 agent-certify certify <path> --key signing.key -o system.cert.json
@@ -204,9 +216,112 @@ Fragility Index  0.3103   (9/29 links with tri(e)=0; baseline: 0.98 ± 0.09)
 
 An `AgentCertificate` is a signed (Ed25519) structural baseline: the nodes, the
 directed invocation links, FI and node roles. `graph_hash` covers the topology
-only, not call counts. `verify(graph)` names each change: new agents, new tool
-links, links that disappeared, FI movement, role changes. A topology change can
-be detected before the behaviour it enables shows up.
+only, not call counts. `verify(graph)` names each change: new agent types, new
+tool links, links that disappeared, FI movement, role changes. A topology change
+can be detected before the behaviour it enables shows up.
+
+Sub-agents are compared by **type**, not by their per-spawn id: a session that
+spawns a fresh `Explore` agent for the same tools matches a certificate issued
+for another `Explore` agent. A different type is reported as such:
+
+```
+New agent type: agent:Research (not in certified baseline)
+Missing agent type: agent:Explore (was in certified baseline)
+```
+
+Certificates issued before v0.3 have no `identity` field; they keep comparing
+agents by id, and their signatures remain valid.
+
+## Policy
+
+Anomalies say *this is unusual*. A policy says *this is not allowed* (or *this
+must be there*), whatever the statistics. A session can have both, and `scan`
+reports them separately.
+
+```json
+{
+  "rules": [
+    {"kind": "forbidden_tool", "target": "deploy_production", "severity": "critical", "message": "No agent may deploy to production"},
+    {"kind": "forbidden_link", "target": "agent:* → *database*", "severity": "critical", "message": "Sub-agents may not reach the database"},
+    {"kind": "max_sub_agents", "target": "5", "severity": "warning", "message": "More than 5 sub-agents is unusual"},
+    {"kind": "required_tool", "target": "Bash", "severity": "warning", "message": "Bash is expected in every session"}
+  ],
+  "generated_from": "baseline (25 sessions)",
+  "created_at": "2026-10-27T20:00:00Z"
+}
+```
+
+| kind | target | violated when |
+|---|---|---|
+| `forbidden_tool` | tool pattern | a matching tool is used |
+| `forbidden_link` | `"source → target"` (or `->`) | a matching invocation link exists |
+| `max_sub_agents` | integer | more sub-agents than that |
+| `required_tool` | tool pattern | no matching tool is used |
+
+Patterns are shell-style globs (`*`, `?`), case-insensitive, matched against a
+node's id (`tool:Bash`), type (`agent:Explore`) and name (`Bash`). `agent:*`
+matches every sub-agent; a bare name matches exactly (`deploy` does not match
+`deploy_production`; `deploy*` does).
+
+`agent-certify suggest-policy` drafts a conservative policy from the baseline:
+tools seen in every session become REQUIRED (warning), and the sub-agent count
+is capped at the baseline maximum + 1 (warning) and + 3 (critical). FORBIDDEN
+rules are an organisational decision, so the draft never contains any; add
+them by hand. `suggest-policy` refuses to overwrite an existing policy file
+(which may hold your edits) without `--force`.
+
+## Live monitoring
+
+`agent-certify watch` follows a session while Claude Code writes it. Given a
+project directory it picks the most recently modified session. Every
+`--interval` seconds (default 30) it checks whether the transcript or any of
+its sub-agent transcripts grew; if so it re-parses, rescans and prints:
+
+```
+Watching C:\Users\me\.claude\projects\H--agent-certify\c603eabc-….jsonl (every 5s, Ctrl+C to stop)
+Baseline: loaded (25 sessions)
+Policy: loaded (4 rules)
+────────────────────────────────────────────────────────────
+[11:35:02] Nodes: 7   Links: 6   FI: 1.0000   Calls: 192
+  [CRITICAL] POLICY VIOLATION: FORBIDDEN tool used: Edit
+[11:35:07] Nodes: 7   Links: 6   FI: 1.0000   Calls: 192
+[11:35:27] Nodes: 7   Links: 6   FI: 1.0000   Calls: 196
+[11:35:37] Nodes: 7   Links: 6   FI: 1.0000   Calls: 197
+[11:35:52] Nodes: 7   Links: 6   FI: 1.0000   Calls: 200
+```
+
+(A real run on this repository's own development session, with a demo policy
+that forbids `Edit`.)
+
+Each anomaly (critical and warning) and each policy violation is printed once,
+when it first appears, and again only if its severity changes. A session file
+that does not exist yet is waited for; a half-written last line is skipped
+until it is complete. It uses plain size polling, no file-system notification
+library. `--scans N` stops after N scans; in Python, `SessionWatcher(...)`
+takes `on_anomaly` / `on_policy_violation` callbacks and has `stop()`.
+
+## MCP server logs
+
+Claude Code also logs every MCP server connection, one JSONL file per server
+and process start:
+
+| Platform | Location |
+|---|---|
+| Windows | `%LOCALAPPDATA%\claude-cli-nodejs\Cache\<project>\mcp-logs-<server>\*.jsonl` |
+| Linux | `~/.cache/claude-cli-nodejs/<project>/mcp-logs-<server>/*.jsonl` |
+| macOS | `~/Library/Caches/claude-cli-nodejs/<project>/mcp-logs-<server>/*.jsonl` |
+
+Records are `{"timestamp", "sessionId", "cwd", "debug" | "error"}`; tool calls
+appear as `Calling MCP tool: <tool>` and failures as `Tool '<tool>' failed …`.
+These logs include calls Claude Code makes **on its own**, such as the IDE
+server's `getDiagnostics` after an edit, which never appear in the transcript.
+
+`--include-mcp` (or `MCPLogsParser().enrich(graph)`) adds the calls whose
+`sessionId` matches the session, as `claude → tool:mcp__<server>__<tool>`. A
+tool the transcript already shows keeps its node, and calls already counted
+there are not counted twice. The logs do not say which agent made a call, so
+all of them are attributed to the orchestrator. No logs (no MCP servers, or a
+platform without the cache) is not an error: the graph is returned unchanged.
 
 ## How Claude Code sessions map to graphs
 
@@ -229,6 +344,7 @@ tools: each shared tool closes a triangle with the orchestrator.
 ## Supported systems
 
 - [x] Claude Code (JSONL logs from ~/.claude/)
+- [x] Claude Code MCP server logs (`--include-mcp`)
 - [ ] CrewAI (planned)
 - [ ] LangGraph (planned)
 - [ ] AutoGen (planned)

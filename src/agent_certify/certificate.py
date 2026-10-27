@@ -36,16 +36,28 @@ def _now() -> str:
     return time.strftime(_TS, time.gmtime())
 
 
-def _topology(graph: AgentGraph) -> dict:
+ROLE, ID = "role", "id"
+
+
+def _topology(graph: AgentGraph, identity: str = ROLE) -> dict:
+    """Nodes and directed links, with agents named by type (``role``) or by unique id (``id``)."""
+    name = graph.role if identity == ROLE else (lambda nid: nid)
     return {
-        "nodes": sorted([nid, n.kind] for nid, n in graph.nodes.items()),
-        "edges": sorted({(e.source, e.target) for e in graph.edges}),
+        "nodes": sorted({(name(nid), n.kind) for nid, n in graph.nodes.items()}),
+        "edges": sorted({(name(e.source), name(e.target)) for e in graph.edges}),
     }
 
 
-def graph_hash(graph: AgentGraph) -> str:
-    """SHA-256 of the graph's nodes and directed binary adjacency."""
-    blob = json.dumps(_topology(graph), sort_keys=True, separators=(",", ":"))
+def graph_hash(graph: AgentGraph, identity: str = ROLE) -> str:
+    """SHA-256 of the graph's nodes and directed binary adjacency.
+
+    With ``identity="role"`` (the default since v0.3) sub-agents count by type,
+    so two sessions that spawn the same kinds of agent for the same tools hash
+    the same. ``identity="id"`` is the v0.1/v0.2 behaviour.
+    """
+    topo = _topology(graph, identity)
+    blob = json.dumps({"nodes": [list(n) for n in topo["nodes"]], "edges": [list(e) for e in topo["edges"]]},
+                      sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
@@ -102,10 +114,14 @@ class AgentCertificate:
     graph_hash: str           # SHA-256 of the adjacency matrix
     signature: str = ""       # Ed25519 signature, base64
     signer_public_key: str = ""   # Ed25519 public key, hex
-    nodes: dict[str, str] = field(default_factory=dict)      # id -> kind
+    nodes: dict[str, str] = field(default_factory=dict)      # role (or id) -> kind
     edges: list[list[str]] = field(default_factory=list)     # directed [source, target]
     certificate_id: str = ""
     agent_certify_version: str = ""
+    # How agents are named in nodes/edges/graph_hash: "role" (by type, v0.3+) or
+    # "id" (unique spawn id). Certificates written before v0.3 have no such field
+    # and load as "id", so they keep comparing exactly as they did.
+    identity: str = ID
 
     @classmethod
     def create(cls, graph: AgentGraph, system_id: str | None = None, signing_key=None) -> AgentCertificate:
@@ -113,7 +129,7 @@ class AgentCertificate:
         from agent_certify import __version__
 
         result = AgentFIScanner(graph).scan()
-        topo = _topology(graph)
+        topo = _topology(graph, ROLE)
         cert = cls(
             system_id=system_id or graph.session_id or "unnamed-system",
             timestamp=_now(),
@@ -123,11 +139,12 @@ class AgentCertificate:
             bridge_count=len(result.bridges),
             critical_nodes=result.critical_nodes,
             node_classifications=result.node_classifications,
-            graph_hash=graph_hash(graph),
+            graph_hash=graph_hash(graph, ROLE),
             nodes={nid: kind for nid, kind in topo["nodes"]},
             edges=[list(e) for e in topo["edges"]],
             certificate_id=str(uuid4()),
             agent_certify_version=__version__,
+            identity=ROLE,
         )
         if signing_key is not None:
             cert.sign(signing_key)
@@ -138,6 +155,8 @@ class AgentCertificate:
         """The canonical bytes that the signature covers (every field but it)."""
         data = asdict(self)
         data.pop("signature")
+        if data["identity"] == ID:
+            data.pop("identity")      # pre-v0.3 certificates were signed without this field
         return json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
     def sign(self, signing_key) -> AgentCertificate:
@@ -176,10 +195,14 @@ class AgentCertificate:
     # ------------------------------------------------------------ verification
     def verify(self, graph: AgentGraph, fi_tolerance: float = DEFAULT_FI_TOLERANCE,
                public_key: str | bytes | None = None) -> DriftReport:
-        """Compare a live graph against this certificate."""
+        """Compare a live graph against this certificate.
+
+        Agents are compared the way the certificate names them: by type for
+        certificates issued since v0.3, by spawn id for older ones.
+        """
         result = AgentFIScanner(graph).scan()
-        topo = _topology(graph)
-        now_nodes = {nid: kind for nid, kind in topo["nodes"]}
+        topo = _topology(graph, self.identity)
+        now_nodes = dict(topo["nodes"])
         now_edges = {tuple(e) for e in topo["edges"]}
         cert_edges = {tuple(e) for e in self.edges}
 
@@ -187,18 +210,30 @@ class AgentCertificate:
         removed_nodes = sorted(set(self.nodes) - set(now_nodes))
         added_edges = sorted(list(e) for e in now_edges - cert_edges)
         removed_edges = sorted(list(e) for e in cert_edges - now_edges)
+        # Roles of individual agents can't be paired across sessions; compare the rest.
+        comparable = {n for n in result.node_classifications
+                      if self.identity == ID or graph.nodes[n].kind != "agent"}
         changed = [{"node": n, "was": self.node_classifications[n], "now": c}
                    for n, c in sorted(result.node_classifications.items())
-                   if n in self.node_classifications and self.node_classifications[n] != c]
+                   if n in comparable and n in self.node_classifications and self.node_classifications[n] != c]
         fi_delta = result.fi - self.fi_score
-        hash_match = graph_hash(graph) == self.graph_hash
+        hash_match = graph_hash(graph, self.identity) == self.graph_hash
         sig_ok = self.signature_valid(public_key) if self.is_signed else None
 
-        reasons = []
-        if added_nodes:
-            reasons.append(f"{len(added_nodes)} node(s) not in the certified topology: {', '.join(added_nodes)}")
-        if removed_nodes:
-            reasons.append(f"{len(removed_nodes)} certified node(s) missing: {', '.join(removed_nodes)}")
+        def is_agent_type(n):
+            return self.identity == ROLE and n.startswith("agent:")
+
+        added_types = [n for n in added_nodes if is_agent_type(n)]
+        removed_types = [n for n in removed_nodes if is_agent_type(n)]
+        added_other = [n for n in added_nodes if not is_agent_type(n)]
+        removed_other = [n for n in removed_nodes if not is_agent_type(n)]
+
+        reasons = [f"New agent type: {n} (not in certified baseline)" for n in added_types]
+        reasons += [f"Missing agent type: {n} (was in certified baseline)" for n in removed_types]
+        if added_other:
+            reasons.append(f"{len(added_other)} node(s) not in the certified topology: {', '.join(added_other)}")
+        if removed_other:
+            reasons.append(f"{len(removed_other)} certified node(s) missing: {', '.join(removed_other)}")
         if added_edges:
             reasons.append(f"{len(added_edges)} new invocation link(s): "
                            + ", ".join(f"{s} -> {t}" for s, t in added_edges))
@@ -219,6 +254,7 @@ class AgentCertificate:
             added_edges=added_edges, removed_edges=removed_edges,
             changed_classifications=changed, signature_valid=sig_ok,
             certificate_id=self.certificate_id, verified_at=_now(), reasons=reasons,
+            added_agent_types=added_types, removed_agent_types=removed_types,
         )
 
     # --------------------------------------------------------------------- io
@@ -256,6 +292,8 @@ class DriftReport:
     certificate_id: str
     verified_at: str
     reasons: list[str] = field(default_factory=list)
+    added_agent_types: list[str] = field(default_factory=list)
+    removed_agent_types: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)

@@ -2,8 +2,11 @@
 
     agent-certify scan <session.jsonl | project-dir> [--format text|json|markdown|html] [-o FILE]
                        [--perspective engineering|risk|compliance|monitoring|classic]
-                       [--baseline FILE | --no-baseline]
+                       [--baseline FILE | --no-baseline] [--policy FILE | --no-policy] [--include-mcp]
+    agent-certify watch <session.jsonl | project-dir> [--interval S] [--scans N]
+                        [--baseline FILE | --no-baseline] [--policy FILE | --no-policy] [--perspective P]
     agent-certify learn <session.jsonl | dir>... [-o FILE]
+    agent-certify suggest-policy [--baseline FILE] [-o FILE] [--force]
     agent-certify blast <path> --node bash
     agent-certify keygen signing.key
     agent-certify certify <path> --key signing.key -o system.cert.json
@@ -30,8 +33,10 @@ from agent_certify.baseline import DEFAULT_BASELINE_PATH, Baseline, BaselineLear
 from agent_certify.blast import BlastRadiusAnalyzer
 from agent_certify.certificate import AgentCertificate, generate_keypair
 from agent_certify.graph import AgentGraph
-from agent_certify.parser import ClaudeCodeParser
+from agent_certify.parser import ClaudeCodeParser, MCPLogsParser
+from agent_certify.policy import DEFAULT_POLICY_PATH, Policy, PolicyGenerator, PolicyViolation
 from agent_certify.scanner import AgentFIScanner, Perspective, ScanResult
+from agent_certify.watcher import SessionWatcher, latest_session
 
 DEFAULT_PATH = "~/.claude/projects"
 
@@ -40,19 +45,33 @@ def _path(p: str) -> Path:
     return Path(os.path.expandvars(os.path.expanduser(p)))
 
 
-def load(path: str) -> tuple[list[AgentGraph], AgentGraph]:
-    """(per-session graphs, merged graph) for a session file or a directory."""
+def load(path: str, include_mcp: bool = False) -> tuple[list[AgentGraph], AgentGraph]:
+    """(per-session graphs, merged graph) for a session file or a directory.
+
+    ``include_mcp`` adds each session's calls from the MCP server logs.
+    """
     p = _path(path)
     parser = ClaudeCodeParser()
     if p.is_file():
-        g = parser.parse(str(p))
-        return [g], g
-    if p.is_dir():
+        graphs = [parser.parse(str(p))]
+    elif p.is_dir():
         graphs = parser.parse_directory(str(p))
         if not graphs:
             raise SystemExit(f"agent-certify: no .jsonl sessions found under {p}")
-        return graphs, AgentGraph.merge(graphs, session_id=f"{p.name} ({len(graphs)} sessions)")
-    raise SystemExit(f"agent-certify: {p} does not exist")
+    else:
+        raise SystemExit(f"agent-certify: {p} does not exist")
+    if include_mcp:
+        mcp = MCPLogsParser()
+        enriched, added = [], 0
+        for g in graphs:
+            enriched.append(mcp.enrich(g))
+            added += mcp.added_calls
+        graphs = enriched
+        print(f"MCP logs: {added} call(s) added from {len(mcp.find_logs())} log file(s) on this machine"
+              if mcp.roots else "MCP logs: no log directory on this platform", file=sys.stderr)
+    if len(graphs) == 1:
+        return graphs, graphs[0]
+    return graphs, AgentGraph.merge(graphs, session_id=f"{p.name} ({len(graphs)} sessions)")
 
 
 # ---------------------------------------------------------------- formatting
@@ -66,7 +85,7 @@ _LEVEL_ORDER = {"high": 0, "medium": 1, "low": 2}
 
 
 def _text_report(g: AgentGraph, r: ScanResult, anomalies: AnomalyReport | None = None,
-                 baseline: Baseline | None = None) -> str:
+                 baseline: Baseline | None = None, violations: str | None = None) -> str:
     fi_line = f"Fragility Index  {r.fi:.4f}   ({len(r.fragile_edges)}/{r.edge_count} links with tri(e)=0"
     fi_line += f"; baseline: {baseline.fi_mean:.2f} ± {baseline.fi_std:.2f})" if baseline else ")"
     lines = [
@@ -78,6 +97,8 @@ def _text_report(g: AgentGraph, r: ScanResult, anomalies: AnomalyReport | None =
     ]
     if anomalies is not None:
         lines += [str(anomalies), ""]
+    if violations is not None:
+        lines += [violations, ""]
     lines += [
         (f"Nodes {r.node_count}   Links {r.edge_count}   Bridges {len(r.bridges)}   "
          f"Components {r.components}   Articulation points {len(r.articulation_points)}"),
@@ -183,36 +204,62 @@ def _emit(text: str, output: str | None) -> None:
 
 
 # ------------------------------------------------------------------ commands
-def _find_baseline(args) -> tuple[Baseline | None, str]:
-    """The baseline to compare against: --baseline, else ./.agent-certify/baseline.json if present."""
-    if args.no_baseline:
+def _find_file(explicit: str | None, disabled: bool, default: Path, loader, what: str):
+    """Load ``explicit``, else ``default`` if it exists; (None, "") when disabled or absent."""
+    if disabled:
         return None, ""
-    if args.baseline:
-        p = _path(args.baseline)
+    if explicit:
+        p = _path(explicit)
         if not p.is_file():
-            raise SystemExit(f"agent-certify: baseline {p} not found")
+            raise SystemExit(f"agent-certify: {what} {p} not found")
     else:
-        p = DEFAULT_BASELINE_PATH
+        p = default
         if not p.is_file():
             return None, ""
     try:
-        return load_baseline(p), str(p)
-    except (ValueError, KeyError, json.JSONDecodeError) as exc:
-        raise SystemExit(f"agent-certify: {p} is not a valid baseline ({exc})")
+        return loader(p), p.as_posix()
+    except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"agent-certify: {p} is not a valid {what} ({exc})")
+
+
+def _find_baseline(args) -> tuple[Baseline | None, str]:
+    """The baseline to compare against: --baseline, else ./.agent-certify/baseline.json if present."""
+    return _find_file(args.baseline, args.no_baseline, DEFAULT_BASELINE_PATH, load_baseline, "baseline")
+
+
+def _find_policy(args) -> tuple[Policy | None, str]:
+    """The policy to enforce: --policy, else ./.agent-certify/policy.json if present."""
+    return _find_file(args.policy, args.no_policy, DEFAULT_POLICY_PATH, Policy.load, "policy")
+
+
+def _violations_text(violations: list[PolicyViolation]) -> str:
+    if not violations:
+        return "✓  No policy violations"
+    lines = [f"⛔ POLICY VIOLATIONS ({len(violations)}):", ""]
+    for v in violations:
+        lines.append(f"{'[' + v.severity.upper() + ']':<11}{v.message}")
+        lines.append(f"{'':<11}Rule: {v.rule.describe()} — {v.rule.message}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
 
 
 def cmd_scan(args) -> int:
-    graphs, merged = load(args.path)
+    graphs, merged = load(args.path, include_mcp=args.include_mcp)
     result = AgentFIScanner(merged, perspective=args.perspective).scan()
     baseline, source = _find_baseline(args)
+    policy, policy_source = _find_policy(args)
     detector = AnomalyDetector(baseline, source) if baseline else None
-    # Anomalies describe one session; a merged multi-session graph has no single baseline counterpart.
-    anomalies = detector.detect(merged, result) if detector and len(graphs) == 1 else None
+    # Anomalies and policy describe one session; a merged multi-session graph has no single counterpart.
+    single = len(graphs) == 1
+    anomalies = detector.detect(merged, result) if detector and single else None
+    violations = policy.check(merged) if policy and single else None
 
     if args.format == "json":
         payload = {"graph": merged.to_dict(), "scan": result.to_dict()}
         if anomalies is not None:
             payload["anomalies"] = anomalies.to_dict()
+        if violations is not None:
+            payload["policy_violations"] = [v.to_dict() for v in violations]
         if len(graphs) > 1:
             payload["sessions"] = []
             for g in graphs:
@@ -220,6 +267,8 @@ def cmd_scan(args) -> int:
                 entry = {"session_id": g.session_id, "project": g.project, "scan": r.to_dict()}
                 if detector:
                     entry["anomalies"] = detector.detect(g, r).to_dict()
+                if policy:
+                    entry["policy_violations"] = [v.to_dict() for v in policy.check(g)]
                 payload["sessions"].append(entry)
         _emit(json.dumps(payload, indent=2), args.output)
     elif args.format == "html":
@@ -229,21 +278,78 @@ def cmd_scan(args) -> int:
                              encoding="utf-8")
         print(f"wrote {out}")
     elif args.format == "markdown":
-        _emit(_markdown_report(merged, result, anomalies), args.output)
+        text = _markdown_report(merged, result, anomalies)
+        if violations is not None:
+            text += f"\n\n### Policy violations: {len(violations)}\n\n" + "\n".join(
+                f"- **{v.severity.upper()}** {v.message} (rule: {v.rule.describe()})" for v in violations)
+        _emit(text, args.output)
     else:
-        text = _text_report(merged, result, anomalies, baseline if len(graphs) == 1 else None)
+        text = _text_report(merged, result, anomalies, baseline if single else None,
+                            _violations_text(violations) if violations is not None else None)
         if len(graphs) > 1:
             text = _session_table(graphs, detector) + "\n\nMerged graph\n============\n" + text
         if source:
             text += f"\n\nBaseline: {source} ({baseline.learned_from} sessions)"
+        if policy_source:
+            text += f"\nPolicy:   {policy_source} ({len(policy.rules)} rules)"
         _emit(text, args.output)
+    return 0
+
+
+def cmd_watch(args) -> int:
+    p = _path(args.path)
+    if p.is_dir():
+        session = latest_session(p)
+        if session is None:
+            raise SystemExit(f"agent-certify: no .jsonl sessions in {p}")
+    else:
+        session = p                     # may not exist yet: the watcher waits for it
+    baseline, _ = _find_baseline(args)
+    policy, _ = _find_policy(args)
+    SessionWatcher(str(session), baseline=baseline, policy=policy, interval=args.interval,
+                   perspective=args.perspective, max_scans=args.scans, max_seconds=args.duration).watch()
+    return 0
+
+
+def cmd_suggest_policy(args) -> int:
+    baseline, _source = _find_file(args.baseline, False, DEFAULT_BASELINE_PATH, load_baseline, "baseline")
+    if baseline is None:
+        raise SystemExit(f"agent-certify: no baseline at {DEFAULT_BASELINE_PATH.as_posix()}; "
+                         "run `agent-certify learn <sessions>` first or pass --baseline")
+    out = Path(args.output) if args.output else DEFAULT_POLICY_PATH
+    if out.exists() and not args.force:
+        raise SystemExit(f"agent-certify: {out.as_posix()} exists and may hold your edits; "
+                         "use --force to overwrite or --output for another file")
+    policy = PolicyGenerator().suggest(baseline)
+    saved = policy.save(out)
+    lines = [f"Generated policy from {policy.generated_from}:", ""]
+    for r in policy.rules:
+        note = (f"seen in {baseline.tool_frequency.get(r.target, 0):.0%} of sessions" if r.kind == "required_tool"
+                else r.message)
+        lines.append(f"  {'[' + r.severity.upper() + ']':<11}{r.describe()} ({note})")
+    lines += ["", f"Saved draft to {saved.as_posix()}", "",
+              "Edit the file to add FORBIDDEN rules, for example:",
+              ('  {"kind": "forbidden_tool", "target": "deploy_production", "severity": "critical", '
+              '"message": "No agent may deploy to production"}'),
+              ('  {"kind": "forbidden_link", "target": "agent:* → *database*", "severity": "critical", '
+              '"message": "Sub-agents may not reach the database"}')]
+    print("\n".join(lines))
     return 0
 
 
 def cmd_learn(args) -> int:
     learner = BaselineLearner()
     try:
-        baseline = learner.learn([str(_path(p)) for p in args.paths])
+        if args.include_mcp:
+            # Learn from the same data `scan --include-mcp` will compare against.
+            graphs = []
+            for p in args.paths:
+                if not _path(p).exists():
+                    raise FileNotFoundError(str(_path(p)))
+                graphs += load(p, include_mcp=True)[0]
+            baseline = learner.learn_graphs(graphs)
+        else:
+            baseline = learner.learn([str(_path(p)) for p in args.paths])
     except FileNotFoundError as exc:
         raise SystemExit(f"agent-certify: {exc.args[0]} does not exist")
     except ValueError as exc:
@@ -300,6 +406,18 @@ def _safe(s: str | None) -> str:
 
 
 # ---------------------------------------------------------------------- main
+def _baseline_args(p: argparse.ArgumentParser) -> None:
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--baseline", help=f"baseline to compare against (default: {DEFAULT_BASELINE_PATH} if present)")
+    g.add_argument("--no-baseline", action="store_true", help="skip anomaly detection")
+
+
+def _policy_args(p: argparse.ArgumentParser) -> None:
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--policy", help=f"policy to enforce (default: {DEFAULT_POLICY_PATH} if present)")
+    g.add_argument("--no-policy", action="store_true", help="skip policy checks")
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="agent-certify", description="Structural verification of multiagent systems.")
     ap.add_argument("--version", action="version", version=f"agent-certify {__version__}")
@@ -312,14 +430,33 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("-o", "--output")
     s.add_argument("--perspective", choices=[n for n in Perspective.NAMES], default="engineering",
                    help="labels for node roles (default: engineering)")
-    g = s.add_mutually_exclusive_group()
-    g.add_argument("--baseline", help=f"baseline to compare against (default: {DEFAULT_BASELINE_PATH} if present)")
-    g.add_argument("--no-baseline", action="store_true", help="skip anomaly detection")
+    _baseline_args(s)
+    _policy_args(s)
+    s.add_argument("--include-mcp", action="store_true",
+                   help="add the session's calls from MCP server logs (claude-cli-nodejs cache)")
     s.set_defaults(func=cmd_scan)
+
+    w = sub.add_parser("watch", help="watch an active session live")
+    w.add_argument("path", help="session .jsonl (may not exist yet), or a project directory (newest session)")
+    w.add_argument("--interval", type=float, default=30.0, help="seconds between checks (default: 30)")
+    w.add_argument("--perspective", choices=list(Perspective.NAMES), default="engineering")
+    w.add_argument("--scans", type=int, help="stop after this many scans (default: until Ctrl+C)")
+    w.add_argument("--duration", type=float, help="stop after this many seconds (default: until Ctrl+C)")
+    _baseline_args(w)
+    _policy_args(w)
+    w.set_defaults(func=cmd_watch)
+
+    sp = sub.add_parser("suggest-policy", help="draft a policy from a learned baseline")
+    sp.add_argument("--baseline", help=f"baseline to read (default: {DEFAULT_BASELINE_PATH})")
+    sp.add_argument("-o", "--output", help=f"where to write the draft (default: {DEFAULT_POLICY_PATH})")
+    sp.add_argument("--force", action="store_true", help="overwrite an existing policy file")
+    sp.set_defaults(func=cmd_suggest_policy)
 
     learn = sub.add_parser("learn", help="learn a statistical baseline from past sessions")
     learn.add_argument("paths", nargs="+", help="session .jsonl files and/or directories of sessions")
     learn.add_argument("-o", "--output", help=f"where to save it (default: {DEFAULT_BASELINE_PATH})")
+    learn.add_argument("--include-mcp", action="store_true",
+                       help="include MCP server log calls (use with `scan --include-mcp`)")
     learn.set_defaults(func=cmd_learn)
 
     b = sub.add_parser("blast", help="blast radius of a compromised node")
