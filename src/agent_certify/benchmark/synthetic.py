@@ -13,10 +13,15 @@ an anomaly and a false positive rate measured against it means nothing.
 Variation is by session index, not random, so a benchmark run is reproducible
 and a regression in the numbers is a real change rather than a reseed. Pass
 ``seed`` to :func:`clean_sessions` to jitter the call counts instead.
+
+The jitter is a hash, not a pseudo-random generator: it has to give the same
+sessions on every machine and every Python version, and a benchmark fixture
+must never be mistaken for a source of randomness — so the module imports no
+generator at all.
 """
 from __future__ import annotations
 
-import random
+import hashlib
 from datetime import datetime, timedelta, timezone
 
 from agent_certify.graph import AgentGraph
@@ -30,6 +35,18 @@ AGENT_TYPES = ("Explore", "Plan")
 _EPOCH = datetime(2026, 10, 1, 9, 0, tzinfo=timezone.utc)
 
 
+def jitter(seed: int | None, index: int, slot: int) -> int:
+    """A reproducible offset in -2..+2, or 0 when ``seed`` is None.
+
+    Derived from a digest of ``(seed, index, slot)`` rather than drawn from a
+    generator, so the same arguments give the same offset everywhere, forever.
+    """
+    if seed is None:
+        return 0
+    digest = hashlib.blake2b(f"{seed}:{index}:{slot}".encode(), digest_size=4).digest()
+    return digest[0] % 5 - 2
+
+
 def clean_session(index: int, seed: int | None = None) -> AgentGraph:
     """One synthetic session, shaped by ``index``.
 
@@ -41,10 +58,9 @@ def clean_session(index: int, seed: int | None = None) -> AgentGraph:
     training half never had, and every clean session would be a false positive
     for reasons that are the generator's fault, not the detector's.
 
-    ``seed`` jitters the call counts by up to ±2, for a run that is still
-    reproducible but less regular.
+    ``seed`` jitters the call counts by up to ±2 (see :func:`jitter`), for a run
+    that is still reproducible but less regular.
     """
-    rng = random.Random(f"{seed}:{index}") if seed is not None else None   # a str seed: tuples are not one
     started = _EPOCH + timedelta(hours=index)
     g = AgentGraph(session_id=f"clean-{index:03d}", project="benchmark",
                    started_at=started.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -56,9 +72,7 @@ def clean_session(index: int, seed: int | None = None) -> AgentGraph:
 
     calls = 0
     for i, tool in enumerate(TOOLS):
-        weight = 4 + (index + i) % 8
-        if rng is not None:
-            weight = max(1, weight + rng.randint(-2, 2))
+        weight = max(1, 4 + (index + i) % 8 + jitter(seed, index, i))
         nid = f"tool:{tool}"
         g.add_node(nid, "tool", tool)
         g.add_call("claude", nid, count=weight)
