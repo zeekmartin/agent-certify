@@ -68,7 +68,7 @@ class BlastRadiusAnalyzer:
     def analyze(self, compromised_node: str) -> BlastReport:
         """What happens if this node is compromised?"""
         node = self.graph.resolve(compromised_node)
-        direct = sorted(self._get_neighbors(node))
+        direct = sorted(self.graph.neighbors(node))
         by_hop = self._get_n_hop(node, n=self.hops)
         reachable = sorted(set().union(*by_hop.values())) if by_hop else []
         tools = self._reachable_tools(node)
@@ -103,9 +103,6 @@ class BlastRadiusAnalyzer:
         return {nid: self.analyze(nid) for nid in sorted(self.graph.nodes)}
 
     # ------------------------------------------------------------ internals
-    def _get_neighbors(self, node: str) -> set[str]:
-        return self.graph.neighbors(node)
-
     def _get_n_hop(self, node: str, n: int) -> dict[int, set[str]]:
         """Nodes first reached at each hop distance 1..n (BFS, undirected)."""
         seen, frontier, out = {node}, {node}, {}

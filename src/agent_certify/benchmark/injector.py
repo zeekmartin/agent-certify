@@ -23,6 +23,8 @@ tool``                 (needs :meth:`AnomalyInjector.
                        forbid` on the baseline)
 ``inject_foreign_      a network destination the          ``new_domain``,
 domain``               baseline never saw                 critical
+``inject_shell_        a host named inside a shell        **nothing** — a
+domain``               command argument                    measured blind spot
 =====================  =================================  =====================
 
 The volume spike was a measured blind spot until v0.7.0: no check read how
@@ -31,6 +33,17 @@ often it failed, so a session calling ``Bash`` 500 times instead of 50 passed
 clean. The benchmark reported it as a miss for one release, and
 ``call_volume_spike`` now closes it. The case stays in the suite, which is the
 point of keeping a measured gap rather than an omitted one.
+
+``inject_shell_domain`` is the gap that is still open, and it is injected for
+the same reason. It builds a real tool-call argument object and hands it to the
+production extractor, so what lands in the graph is whatever
+:func:`~agent_certify.domains.extract_call_domains` actually finds — today,
+nothing, because a bare host under a key that does not name a destination is
+not read. Its ``expected_category`` is therefore None: the expected outcome is
+silence, the benchmark reports it as a blind spot rather than as a detection
+failure, and it starts counting as a detection by itself if extraction ever
+reaches shell commands. Nothing about this injection is hard-coded to produce
+silence — that is the whole point of running it.
 
 Injections are deterministic: errors are spread over the edges in a fixed
 order, so the same session always yields the same injected copy and a benchmark
@@ -47,7 +60,7 @@ from dataclasses import dataclass, field
 
 from agent_certify.anomaly import CRITICAL, WARNING
 from agent_certify.baseline import Baseline
-from agent_certify.domains import normalise_pattern
+from agent_certify.domains import extract_call_domains, normalise_pattern
 from agent_certify.graph import AgentGraph
 
 #: Default names for the things injections add. They name the benchmark on
@@ -55,10 +68,18 @@ from agent_certify.graph import AgentGraph
 NEW_TOOL = "bench_unseen_tool"
 NEW_AGENT = "bench_unseen_agent"
 FOREIGN_DOMAIN = "api.unknown.cn"
+SHELL_DOMAIN = "shell.unknown.cn"
 
-#: Every anomaly type the benchmark covers, in report order.
+#: Every anomaly type the benchmark injects, in report order. The last one is a
+#: blind spot: it is injected and expected to go unreported (see the module
+#: docstring).
 ANOMALY_TYPES = ("new_tool", "error_spike", "new_agent", "volume_spike", "forbidden_tool",
-                 "foreign_domain")
+                 "foreign_domain", "shell_domain")
+
+#: Blind spots among :data:`ANOMALY_TYPES`: faults no check covers yet, whose
+#: expected outcome is silence. Kept here so a test can state the list the
+#: release claims rather than re-deriving it from the registry.
+BLIND_SPOTS = ("shell_domain",)
 
 
 @dataclass
@@ -102,10 +123,11 @@ class AnomalyInjector:
     """
 
     def __init__(self, new_tool: str = NEW_TOOL, new_agent: str = NEW_AGENT,
-                 foreign_domain: str = FOREIGN_DOMAIN):
+                 foreign_domain: str = FOREIGN_DOMAIN, shell_domain: str = SHELL_DOMAIN):
         self.new_tool = new_tool
         self.new_agent = new_agent
         self.foreign_domain = foreign_domain
+        self.shell_domain = shell_domain
 
     # ------------------------------------------------------------ injectors
     def inject_new_tool(self, session: AgentGraph, tool_name: str | None = None) -> AgentGraph:
@@ -251,6 +273,41 @@ class AnomalyInjector:
         g.nodes[target].metadata["injected"] = "foreign_domain"
         return g
 
+    def inject_shell_domain(self, session: AgentGraph, domain: str | None = None) -> AgentGraph:
+        """Reach a host from inside a shell command, which extraction does not read.
+
+        This is the benchmark's one **blind spot** injection, and it is built so
+        that it cannot lie in either direction. The fault is a genuine tool-call
+        argument object — ``{"command": "curl -sS <host>/health"}`` — and it is
+        passed to :func:`~agent_certify.domains.extract_call_domains`, the same
+        function the parsers use. Whatever that returns is recorded on the
+        graph.
+
+        Today it returns nothing: ``command`` does not name a destination and
+        the host carries no scheme, so the walk finds no URL and does not treat
+        the value as a host. The injected graph is therefore identical to the
+        clean one apart from a marker, no check has anything to compare, and
+        the expected outcome is silence — which is what
+        ``expected_category=None`` says.
+
+        The day extraction reads shell commands, this same injection will put a
+        host in ``seen_domains``, ``new_domain`` will fire, and the benchmark
+        will report the type as "reported anyway" instead of as a blind spot.
+        No edit here is needed for that to happen.
+        """
+        name = (domain or self.shell_domain).strip().lower()
+        if not name:
+            raise ValueError("domain is required: a shell destination has to be named")
+        g = self._copy(session, "shell_domain")
+        if name in g.seen_domains:
+            raise ValueError(f"{name!r} is already a destination in this session; pick one it does not use")
+        target = self._busiest_tool(g) or self._caller(g)
+        arguments = {"command": f"curl -sS {name}/health", "description": f"probe {name}"}
+        g.record_domains(target, extract_call_domains(arguments))
+        g.nodes[target].metadata["injected"] = "shell_domain"
+        g.nodes[target].metadata["shell_destination"] = name
+        return g
+
     # ------------------------------------------------------------- baseline
     @staticmethod
     def forbid_domain(baseline: Baseline, pattern: str) -> Baseline:
@@ -309,6 +366,11 @@ class AnomalyInjector:
                       baseline=self.forbid(baseline, name))
         self._add(out, "foreign_domain", lambda: self.inject_foreign_domain(session),
                   "new_domain", CRITICAL, f"a tool pointed at {self.foreign_domain}")
+        # A blind spot on purpose: expected_category None means "nothing should
+        # be reported", so it is scored apart from the covered faults.
+        self._add(out, "shell_domain", lambda: self.inject_shell_domain(session),
+                  None, None, f"{self.shell_domain} named inside a shell command argument, "
+                              "which destination extraction does not read")
         return out
 
     @staticmethod

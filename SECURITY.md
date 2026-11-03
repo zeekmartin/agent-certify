@@ -29,15 +29,21 @@ into content it read. The server therefore:
 - never returns a resolved path, file contents or exception text; unexpected
   errors go to stderr with a traceback and reach the client as a correlation id;
 - does not fall back to other projects' sessions when no session is named;
-- bounds each request to 30 seconds and every directory scan in depth (5
+- bounds each tool call to 30 seconds and every directory scan in depth (5
   levels), file count (1,000) and line size (10 MB).
 
 What the server does return is structural metadata of sessions inside those
 roots: tool names (including MCP server and tool names), sub-agent types and
-descriptions, call and error counts, project folder names and session ids.
-Prompts, tool inputs and tool outputs are never extracted. If that metadata is
-sensitive in your setting, do not register the server, or start it from a
-working directory that contains nothing else.
+descriptions, call and error counts, project folder names, session ids and
+**network destinations** — the host names a session's tool calls pointed at
+(see §6).
+
+Prompt text is never extracted. Tool inputs and tool outputs are **read but
+not returned**: they are walked for host names only, and nothing else of them
+leaves the parser — not the argument text, not the result text, not URL
+credentials, ports or paths. If that metadata is sensitive in your setting, do
+not register the server, or start it from a working directory that contains
+nothing else.
 
 ### 2. Certificates and signing keys
 
@@ -78,6 +84,49 @@ ids, project folder names (which encode local paths) and agent descriptions.
 The `.agent-certify/` folder is created with a `.gitignore` that excludes its
 contents; HTML reports are ignored by this repository's `.gitignore`. Do not
 publish these files without reviewing them.
+
+### 6. Network destinations (since v0.7.0)
+
+This is the one place where agent-certify looks *inside* a tool call rather
+than at its shape, so it is spelled out in full.
+
+**What is read.** For every tool call in a session, the call's arguments are
+walked for host names: the host of any full URL (`http`, `https`, `ws`, `wss`,
+`ftp`, `ftps`), and the value of a field that names a destination (`url`,
+`host`, `endpoint`, `base_url`, `webhook_url` … the full set is `NETWORK_KEYS`
+in `agent_certify/domains.py`). A tool call's **result** is walked the same way,
+but only when that call's own arguments already carried a destination — so a
+file read or a search result full of URLs is not treated as egress. The walk is
+bounded (8 levels deep, 2,000 strings, 64 KB per string, 200 hosts per call).
+
+**What is kept.** Only host names, lowercased, with URL credentials, port, path
+and query discarded, and nothing resolved: a name is never turned into an
+address. No argument text, result text, prompt or file content is kept at any
+point. The hosts live on the graph (`seen_domains`) and on the calling node, so
+a report can say which tool reached which host.
+
+**What is stored on disk.** `agent-certify learn` writes every host it saw into
+`known_domains` in `.agent-certify/baseline.json`, alongside the `*.cn`-style
+patterns an operator accepted or rejected. That file is a plain list of host
+names the sessions contacted; treat it like the rest of §5 and review it before
+publishing it. Certificates do **not** carry destinations: `graph_hash()` covers
+node roles, kinds and links only, which is also why certificates issued before
+v0.7.0 still verify.
+
+**What is transmitted.** When a session reaches a host the baseline never saw,
+or one matching a rejected pattern, the host name appears in the anomaly's
+`message`, `value` and `detail` fields. Those fields are returned verbatim to
+the MCP client by the `check_anomalies` tool. They also appear in text,
+Markdown, JSON and HTML reports, and in the `message` attribute of an
+`anomaly.*` OTel span event — which, if you export spans, leaves the machine.
+A host name is therefore the one piece of tool-call *content* that can travel
+out of this tool.
+
+**Review rule.** Any feature that reads a new category of input data — a new
+field, a new part of a record, anything beyond the structural metadata listed
+in §1 — requires a review and an update of this document in the same change.
+Network destinations shipped in v0.7.0 without one, and this section is the
+correction.
 
 ## Supported versions
 

@@ -25,7 +25,8 @@ instructions. So:
 * no response or error message contains a resolved path, a file's contents or
   an exception's text. Unexpected failures are logged with their traceback on
   stderr and reported to the client as a generic message with a correlation id;
-* each request runs under a time limit (30 s by default).
+* each tool call runs under a time limit (30 s by default). ``initialize``,
+  ``ping`` and ``tools/list`` answer directly and are not bounded this way.
 
 stdout carries protocol messages only: anything else the library would print
 goes to stderr while the server runs.

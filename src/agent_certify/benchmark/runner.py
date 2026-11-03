@@ -13,7 +13,11 @@ applies to each session, runs the anomaly checks over the result and counts:
 * **false positive rate** — clean sessions, with nothing injected, that the
   checks flag anyway;
 * **blind spots** — faults no check covers, counted separately so they neither
-  inflate the detection rate nor disappear from the report.
+  inflate the detection rate nor disappear from the report. A blind spot is
+  injected like any other fault and its expected outcome is silence; the day a
+  check starts reporting one, the table says so instead
+  (:data:`~agent_certify.benchmark.injector.BLIND_SPOTS` lists the ones this
+  release ships with).
 
 **The baseline must not have been learned from the sessions being tested.** A
 baseline learned from exactly the sessions it is then run against reports
@@ -150,7 +154,14 @@ class BenchmarkResult:
         lines += ["-" * width, totals]
         if self.blind_spots:
             lines.append("blind spots: " + ", ".join(self.blind_spots)
-                         + " — injected and not reported, because no check covers the fault")
+                         + " — injected and expected to go unreported, no check covers the fault")
+            surprises = [t.kind for t in self.per_type if t.is_blind_spot and t.detected]
+            if surprises:
+                lines.append("  reported anyway, so a check now covers it: " + ", ".join(surprises))
+        notes = [t for t in self.per_type if t.note]
+        if notes:
+            lines += ["-" * width, "what was injected:"]
+            lines += [f"  {t.kind:<16}{t.note}" for t in notes]
         return "\n".join(lines)
 
     def __str__(self) -> str:

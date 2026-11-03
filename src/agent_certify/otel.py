@@ -14,8 +14,10 @@ exporter writes and its ``otlpjsonfile`` receiver reads, so a collector can
 pick the file up and forward it to Jaeger, Grafana Tempo, Datadog, etc.
 Trace and span ids are lowercase hex, as OTLP/JSON requires.
 
-All scans of one session share a trace id (derived from the session id), so a
-``watch`` run shows up as one trace with a span per scan cycle.
+All scans of one session share a trace id derived from the session id, so a
+``watch`` run shows up as one trace with a span per scan cycle. A graph with no
+session id — a Cursor trace that carries none, say — gets a random trace id per
+span instead, so its scans do not group.
 """
 from __future__ import annotations
 
@@ -36,7 +38,8 @@ from agent_certify.scanner import ScanResult
 
 DEFAULT_TRACES_PATH = Path(".agent-certify") / "traces.jsonl"
 SPAN_KIND_INTERNAL = 1
-STATUS_CODES = {"UNSET": 0, "OK": 1, "ERROR": 2}
+#: Only the codes this exporter writes: a span is "OK" unless something failed.
+STATUS_CODES = {"OK": 1, "ERROR": 2}
 
 
 def _now() -> datetime:

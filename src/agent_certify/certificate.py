@@ -127,13 +127,34 @@ def _signing_key(key) -> Ed25519PrivateKey:
     raise TypeError("signing_key must be an Ed25519PrivateKey or its 32-byte seed (bytes or hex string)")
 
 
-def _public_key_hex(public_key: str | bytes) -> str | None:
-    """Normalise a trusted public key to lowercase hex, or None when it is not 32 bytes."""
+def _key32_hex(key: str | bytes) -> str | None:
+    """A 32-byte Ed25519 key as lowercase hex, or None when it is not one.
+
+    An Ed25519 public key and a private seed are both exactly 32 bytes, so one
+    shape check serves both sides of the pair; :func:`_public_key_hex` and
+    :func:`_private_key_hex` name which side a call is validating, because in a
+    key-handling path that is worth saying at the call site.
+    """
     try:
-        raw = bytes(public_key) if isinstance(public_key, (bytes, bytearray)) else bytes.fromhex(str(public_key).strip())
+        raw = bytes(key) if isinstance(key, (bytes, bytearray)) else bytes.fromhex(str(key).strip())
     except (ValueError, TypeError):
         return None
     return raw.hex() if len(raw) == 32 else None
+
+
+def _public_key_hex(public_key: str | bytes) -> str | None:
+    """Normalise a trusted public key to lowercase hex, or None when it is not 32 bytes."""
+    return _key32_hex(public_key)
+
+
+def _private_key_hex(private_key: str | bytes) -> str | None:
+    """Normalise an Ed25519 private seed to lowercase hex, or None when it is not 32 bytes.
+
+    Checked before :func:`_signing_key` gets it, so a file that is not a key
+    produces a message naming what was expected instead of a ``ValueError``
+    traceback out of ``bytes.fromhex``.
+    """
+    return _key32_hex(private_key)
 
 
 # ----------------------------------------------------------------- certificate

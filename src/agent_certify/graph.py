@@ -53,6 +53,15 @@ class AgentEdge:
 class AgentGraph:
     """The complete topology of a multiagent session."""
     nodes: dict[str, AgentNode] = field(default_factory=dict)
+    #: Directed invocations. Append through :meth:`add_call` or replace the
+    #: whole list; the lookup index tracks it by ``(id(edges), len(edges))``,
+    #: so an in-place swap that leaves the length unchanged
+    #: (``edges[0] = other``, or ``pop()`` then ``append()``) leaves the index
+    #: stale. Nothing in the package does that — the four mutation sites are
+    #: ``add_call``, ``merge``, ``remove_node`` and ``from_dict``, and the
+    #: first two maintain the index while the last two replace the list — but
+    #: code outside it should rebuild by assigning a fresh list rather than
+    #: editing this one in place.
     edges: list[AgentEdge] = field(default_factory=list)
     session_id: str | None = None
     project: str | None = None
@@ -321,7 +330,16 @@ class AgentGraph:
                 m.call_count += n.call_count
                 m.error_count += n.error_count
                 for k, v in n.metadata.items():
+                    if k == "domains":
+                        continue        # a set, not a scalar: unioned below
                     m.metadata.setdefault(k, v)
+                # The per-node destinations have to be unioned, not defaulted:
+                # one tool node reached one host in the first session and
+                # another in the second, and setdefault would keep only the
+                # first — leaving a host in seen_domains with no caller, which
+                # is exactly what record_domains keeps the second copy for.
+                if n.metadata.get("domains"):
+                    out.record_domains(n.id, n.metadata["domains"])
             for e in g.edges:
                 f = out.get_edge(e.source, e.target)
                 if f is None:

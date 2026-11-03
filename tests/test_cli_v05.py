@@ -94,6 +94,27 @@ def test_verify_unsigned_with_key_fails(session_dir, tmp_path, issued, capsys):
     assert "Certificate is not signed" in capsys.readouterr().out
 
 
+def test_certify_bad_private_key_file(session_dir, tmp_path):
+    """The symmetric case of test_verify_bad_public_key_file (audit COD-011).
+
+    The content went unchecked all the way into `bytes.fromhex` inside `sign`,
+    so the user got a ValueError traceback instead of a message.
+    """
+    bad = tmp_path / "bad.key"
+    bad.write_text("not a key")
+    with pytest.raises(SystemExit, match="Ed25519 private key"):
+        main(["certify", str(session_dir / "sess-1.jsonl"), "--key", str(bad),
+              "-o", str(tmp_path / "c.json")])
+    # Right length, wrong alphabet: the hex decode is the part that used to raise.
+    (tmp_path / "hex.key").write_text("z" * 64)
+    with pytest.raises(SystemExit, match="Ed25519 private key"):
+        main(["certify", str(session_dir / "sess-1.jsonl"), "--key", str(tmp_path / "hex.key"),
+              "-o", str(tmp_path / "c.json")])
+    with pytest.raises(SystemExit, match="not found"):
+        main(["certify", str(session_dir / "sess-1.jsonl"), "--key", str(tmp_path / "nope.key"),
+              "-o", str(tmp_path / "c.json")])
+
+
 def test_verify_bad_public_key_file(issued, tmp_path):
     bad = tmp_path / "bad.pub"
     bad.write_text("not a key")

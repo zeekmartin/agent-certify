@@ -155,11 +155,6 @@ class FIStructure:
         return (self.fragile - incident_fragile + newly_fragile) / remaining
 
 
-def triangle_counts(graph: AgentGraph) -> dict[frozenset, int]:
-    """tri(e) for every undirected edge: the number of triangles containing it."""
-    return {frozenset(k): t for k, t in FIStructure(graph).tri.items()}
-
-
 def find_bridges(graph: AgentGraph) -> set[frozenset]:
     """Undirected edges whose removal disconnects their component (iterative Tarjan)."""
     adj: dict[str, list[str]] = {nid: [] for nid in graph.nodes}
@@ -342,6 +337,7 @@ class AgentFIScanner:
         self.graph = graph
         self.critical_thr = critical_thr
         self.immune_thr = immune_thr
+        self.structure: FIStructure | None = None   # built by scan(); _compute_fi and _classify_nodes read it
 
     def scan(self) -> ScanResult:
         """Compute FI, classify nodes, identify bridges."""

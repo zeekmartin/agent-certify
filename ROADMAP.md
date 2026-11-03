@@ -76,7 +76,7 @@ Fixes the actionable findings of the 2026-10-27 security audit (45 findings: 3 h
 - MCP server hardened against untrusted (possibly prompt-injected) tool arguments
   - Paths confined to `~/.claude/projects` and the working directory; symlinks and `..` resolved first
   - Environment variables never expanded; no resolved path, file content or exception text in replies
-  - No machine-wide session fallback; 30 s limit per request; failures logged with a correlation id
+  - No machine-wide session fallback; 30 s limit per tool call; failures logged with a correlation id
 - Certificate trust model
   - `verify` requires the issuer's public key; unsigned certificates fail unless `--allow-unsigned`
   - Validity window (`not_before` / `not_after`, 90 days by default) and `--expect-system-id`
@@ -89,48 +89,62 @@ Fixes the actionable findings of the 2026-10-27 security audit (45 findings: 3 h
   graph in under a second), blast radius without per-node scans, indexed edges
 - CI: SHA-pinned actions, pinned tools, pip-audit, ruff security rules, 90% coverage floor,
   Trusted Publishing with attestations (API token fallback)
-- SPDX `BUSL-1.1` everywhere; LICENSE covers all versions; SECURITY.md threat model
+- SPDX `Apache-2.0` everywhere; LICENSE covers all versions; SECURITY.md threat model
+  - (v0.5.0 shipped BSL 1.1 headers; the project moved to Apache 2.0 before any release that
+    distributed them, and `LICENSE`, `pyproject.toml` and every source header now agree)
 - 279 tests, 95% coverage (Ubuntu and Windows, Python 3.10–3.12)
+
+### v0.6.0 — Multi-framework parsers (Nov 2026)
+
+- CrewAI parser: execution logs and event bus → AgentGraph
+- LangGraph parser: node transitions and tool calls → AgentGraph
+- Auto-detection extended to both, `.json` included
+
+### v0.6.1 — Anomaly injection benchmark (Nov 2026)
+
+- Anomaly injection benchmark: detection rate, false positive rate, false negative rate and blind
+  spots, per fault type; `python -m agent_certify.benchmark`
+- Baseline learned from held-out sessions (`learn_holdout`), so the false positive rate means
+  something
+- Measured and published one blind spot rather than hiding it: no check read call *volume*
+
+### v0.7.0 — Call volume and network destinations (Nov 2026)
+
+- Call volume detection, per tool and per link — the blind spot the v0.6.1 benchmark measured and
+  reported for a release
+- Network destination monitoring: `seen_domains`, `accept`/`reject --domain`, `new_domain` and
+  `rejected_domain` checks; `SECURITY.md` §6 states what is read, stored and transmitted
+- Benchmark at seven fault types: 36/36 detected on the six covered ones, no false positives, and
+  one blind spot still measured (`shell_domain`: a host named inside a shell command argument)
+- Fixes the 2026-11-03 audit (33 findings: 3 high, 7 medium, the rest low or info)
 
 ## Planned
 
-### v0.6.0 — Multi-framework parsers
+### v0.8.0 — Fleet & dashboard
 
-- Carried over from v0.3.0 / v0.4.0:
-  - OTel trace parser: import OpenInference/Arize format spans
-  - Alert output: JSON webhook
-  - Kill switch recommendation: "isolate node X, keep the rest running"
+- Fleet mode: scan multiple projects/systems, aggregate results
+- Dashboard: HTML/web view of all monitored systems
+- Alerting integrations: Slack, email, PagerDuty webhooks
+- Baseline drift over time: is the system's topology evolving?
+
+### v0.9.0 — Carried over
+
+- OTel trace parser: import OpenInference/Arize format spans
+- AutoGen parser: message history → AgentGraph
+- Alert output: JSON webhook
+- Kill switch recommendation: "isolate node X, keep the rest running"
+- Cross-session trending: FI over time, tool usage patterns
 - Open items from the v0.5.0 audit:
   - Signed baselines and policies (ARC-001)
   - Encrypted private keys (passphrase, PKCS#8) and a revocation list (SEC-003, SEC-004)
   - Dependency lock / constraints for CI and releases (SCA-001, SCA-002)
   - Incremental `watch` from the last file offset (PRF-004)
   - Fuzz tests for the parsers; secret scanning in CI (TST-003, SCR-001)
-  - Contributor licensing (CLA or DCO) before accepting outside contributions (LIC-001)
-- AutoGen parser: message history → AgentGraph
-- Cross-session trending: FI over time, tool usage patterns
-
-Shipped in v0.6.1:
-
-- CrewAI parser: execution logs and event bus → AgentGraph
-- LangGraph parser: node transitions and tool calls → AgentGraph
-- Auto-detection extended to both, `.json` included
-- Anomaly injection benchmark: detection rate, false positives, blind spots
-
-Shipped in v0.7.0:
-
-- Call volume detection, per tool and per link — the blind spot the v0.6.1
-  benchmark measured and reported for a release
-- Network destination monitoring: `seen_domains`, `accept`/`reject --domain`,
-  `new_domain` and `rejected_domain` checks
-- Benchmark at six fault types, 36/36 detected, no blind spots left
-
-### v0.7.0 — Fleet & dashboard
-
-- Fleet mode: scan multiple projects/systems, aggregate results
-- Dashboard: HTML/web view of all monitored systems
-- Alerting integrations: Slack, email, PagerDuty webhooks
-- Baseline drift over time: is the system's topology evolving?
+- Open items from the 2026-11-03 audit:
+  - Close the `shell_domain` blind spot, or decide the trade is permanent and say so (INV-001)
+  - Extract report formatting out of `cli.py` and `describe` out of `mcp_server.py` (MNT-003)
+  - Version-counter invalidation for the edge index instead of `(id, len)` (COD-012)
+- Dynamic coverage and test-count badges fed by the measurement, not written by hand (DOC-007)
 
 ### v1.0.0 — Production-ready
 

@@ -10,6 +10,7 @@ import pytest
 from agent_certify.anomaly import CRITICAL, WARNING
 from agent_certify.benchmark import (
     ANOMALY_TYPES,
+    BLIND_SPOTS,
     AnomalyInjector,
     BenchmarkRunner,
     clean_session,
@@ -162,10 +163,45 @@ def test_caller_falls_back_to_an_agent(injector):
 # ----------------------------------------- each injection is detected as expected
 def test_injections_cover_every_anomaly_type(injector, session, split):
     _, _, baseline = split
-    kinds = [i.kind for i in injector.injections(session, baseline)]
+    injections = injector.injections(session, baseline)
+    kinds = [i.kind for i in injections]
     assert sorted(kinds) == sorted(ANOMALY_TYPES)
-    assert len(ANOMALY_TYPES) == 6
-    assert not any(i.is_blind_spot for i in injector.injections(session, baseline))
+    assert len(ANOMALY_TYPES) == 7
+    blind = sorted(i.kind for i in injections if i.is_blind_spot)
+    assert blind == sorted(BLIND_SPOTS) == ["shell_domain"]
+    assert [i.expected_category for i in injections if i.is_blind_spot] == [None]
+
+
+def test_the_blind_spot_branch_is_reachable(injector, session, split):
+    """The machinery the report relies on has to be exercised, not merely present.
+
+    The audit of 2026-11-03 found every blind-spot code path unreachable:
+    `_add` was only ever called with a category, so `expected_category` was
+    never None and the branches in `_score`, `covered` and `table()` could not
+    run. This test pins the capability rather than the current result.
+    """
+    _, test, baseline = split
+    injection = next(i for i in injector.injections(session, baseline) if i.is_blind_spot)
+    assert injection.is_blind_spot and injection.min_severity is None
+    result = BenchmarkRunner(test, baseline).run()
+    row = next(t for t in result.per_type if t.kind == injection.kind)
+    assert row.is_blind_spot and row.expected == "(blind spot)"
+    assert row.trials and row not in result.covered         # excluded from the detection rate
+    assert result.blind_spots == ["shell_domain"]
+    assert "not covered by any check" in result.table()
+
+
+def test_the_blind_spot_injection_is_not_rigged_to_be_silent(injector, session):
+    """It runs the production extractor; a graph host would make it report."""
+    graph = injector.inject_shell_domain(session)
+    assert graph.seen_domains == session.seen_domains        # extraction found nothing to record
+    assert graph.nodes[injector._busiest_tool(graph)].metadata["injected"] == "shell_domain"
+    # The same fault with a scheme *is* extracted, which is what makes the gap
+    # specific rather than a claim: this is the shape the day it closes.
+    from agent_certify.domains import extract_call_domains
+    assert extract_call_domains({"url": f"https://{injector.shell_domain}/health"}) == {injector.shell_domain}
+    with pytest.raises(ValueError, match="domain is required"):
+        injector.inject_shell_domain(session, "  ")
 
 
 def test_foreign_domain_injector_guards(injector, session):
@@ -263,9 +299,10 @@ def test_runner_scores_the_full_suite(split):
     result = BenchmarkRunner(test, baseline).run()
     assert {t.kind for t in result.per_type} == set(ANOMALY_TYPES)
     assert result.detection_rate == 1.0 and result.false_negative_rate == 0.0
-    assert result.trials == len(ANOMALY_TYPES) * len(test)    # every type is covered by a check now
+    covered = len(ANOMALY_TYPES) - len(BLIND_SPOTS)
+    assert result.trials == covered * len(test)               # blind spots are not counted in the rate
     assert result.false_positive_rate == 0.0 and result.clean_flagged == 0
-    assert result.blind_spots == []                           # none left as of v0.7.0
+    assert result.blind_spots == list(BLIND_SPOTS)            # measured, not asserted away
     assert result.learned_from == baseline.learned_from
     for t in result.covered:
         assert t.detected == t.trials and t.missed == [] and sum(t.severities.values()) == t.trials
@@ -294,9 +331,12 @@ def test_result_table_and_dict(split):
     assert "Anomaly injection benchmark" in table and "detection rate 100.0%" in table
     for kind in ANOMALY_TYPES:
         assert kind in table
-    assert "blind spots" not in table                     # the line only appears when there are some
+    assert "blind spots: shell_domain" in table           # the line only appears when there are some
+    assert "what was injected:" in table                  # every row's note is rendered
+    assert all(t.note in table for t in result.per_type)
     data = json.loads(json.dumps(result.to_dict()))       # must be JSON-serialisable as it stands
-    assert data["detection_rate"] == 1.0 and data["blind_spots"] == []
+    assert data["detection_rate"] == 1.0 and data["blind_spots"] == list(BLIND_SPOTS)
+    assert [t["kind"] for t in data["per_type"] if t["blind_spot"]] == list(BLIND_SPOTS)
     assert len(data["per_type"]) == len(ANOMALY_TYPES)
 
 
@@ -336,8 +376,8 @@ def test_cli_json(capsys):
     assert main(["--count", "6", "--format", "json"]) == 0
     data = json.loads(capsys.readouterr().out)
     assert data["sessions"] == 6 and data["learned_from"] == 3
-    assert data["detection_rate"] == 1.0 and data["blind_spots"] == []
-    assert len(data["per_type"]) == 6
+    assert data["detection_rate"] == 1.0 and data["blind_spots"] == list(BLIND_SPOTS)
+    assert len(data["per_type"]) == len(ANOMALY_TYPES)
 
 
 def test_cli_on_real_sessions(capsys, session_dir):

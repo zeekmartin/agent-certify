@@ -107,13 +107,23 @@ def domains_in_text(text: str) -> set[str]:
 
 
 #: Final labels that make a dotted word a filename rather than a host. A
-#: network-named field is unlikely to hold one, but "notes.md" and "data.csv"
+#: network-named field is unlikely to hold one, but "notes.txt" and "data.csv"
 #: are valid hostnames by shape, and reporting them as egress would be noise.
+#:
+#: **Every entry here has to be absent from the DNS root**, because a label
+#: that is both a file extension and a delegated TLD makes this filter an
+#: egress hole: ``{"host": "collector.zip"}`` would be silently dropped, and a
+#: detector that stays quiet is worse than one that is noisy. Six labels were
+#: removed for that reason — ``zip`` (a delegated gTLD with open
+#: public registration), ``sh`` (Saint Helena), ``so`` (Somalia), ``md``
+#: (Moldova), ``py`` (Paraguay) and ``rs`` (Serbia) — and the rest of the list
+#: was checked against the root zone. Check any addition the same way: if
+#: ``https://<label>`` could resolve for somebody, it does not belong here.
 NOT_HOSTS = frozenset({
-    "md", "txt", "json", "jsonl", "csv", "tsv", "yml", "yaml", "toml", "ini", "cfg", "conf", "env",
-    "log", "lock", "xml", "html", "htm", "css", "js", "jsx", "ts", "tsx", "py", "pyc", "rb", "go",
-    "rs", "java", "sh", "bat", "ps1", "sql", "db", "sqlite", "png", "jpg", "jpeg", "gif", "svg",
-    "pdf", "zip", "tar", "gz", "whl", "exe", "dll", "so", "bak", "tmp", "cert", "pem", "key",
+    "txt", "json", "jsonl", "csv", "tsv", "yml", "yaml", "toml", "ini", "cfg", "conf", "env",
+    "log", "lock", "xml", "html", "htm", "css", "js", "jsx", "ts", "tsx", "pyc", "rb",
+    "java", "bat", "ps1", "sql", "db", "sqlite", "png", "jpg", "jpeg", "gif", "svg",
+    "pdf", "tar", "gz", "whl", "exe", "dll", "bak", "tmp", "cert", "pem", "key",
 })
 
 
@@ -152,7 +162,11 @@ def _walk(value, network_key: bool, found: set[str], budget: list[int], depth: i
         budget[0] += 1
         hosts = domains_in_text(value)
         if network_key:
-            bare = host_in_value(value)
+            # Truncated like the URL search above: normalise_host strips and
+            # splits the whole value before _HOST rejects it on length, which
+            # on a multi-megabyte value under a network-named key means several
+            # full copies for nothing.
+            bare = host_in_value(value[:MAX_STRING_CHARS])
             if bare:
                 hosts.add(bare)
         for host in sorted(hosts):

@@ -180,6 +180,11 @@ class LangGraphParser(BaseParser):
     ``skipped_records`` (also ``graph.skipped_records``) counts the records that
     could not be read: malformed JSON, or an entry this parser does not
     recognise.
+
+    A failing node whose failure cannot be charged to any incoming transition
+    is counted in the ``unattributed_errors`` metadata of the ``graph`` node
+    and logged at warning level, alongside ``transitions``. The key is absent
+    when there were none.
     """
 
     def __init__(self, include_human: bool = True):
@@ -213,6 +218,14 @@ class LangGraphParser(BaseParser):
         g.total_messages = state.messages
         g.total_tool_calls = state.tool_calls
         g.nodes[GRAPH].metadata["transitions"] = state.transitions
+        if state.unattributed_errors:
+            # A node failure no incoming transition could carry. Reported the
+            # same way transitions are, rather than counted into a field
+            # nothing reads: a silent loss is the one thing this parser must
+            # not produce.
+            g.nodes[GRAPH].metadata["unattributed_errors"] = state.unattributed_errors
+            logger.warning("%s: %d node error(s) could not be attributed to an incoming transition",
+                           p.name, state.unattributed_errors)
         if state.first and state.last:
             g.duration_seconds = (state.last - state.first).total_seconds()
             g.started_at, g.ended_at = iso(state.first), iso(state.last)
@@ -322,7 +335,12 @@ class LangGraphParser(BaseParser):
     @staticmethod
     def _transition(g: AgentGraph, state: _State, src: str, dst: str) -> None:
         if src == dst:
-            return                                  # a node looping on itself is not a link
+            # A node looping on itself is not a link — an edge to itself would
+            # be a self-loop the graph model rejects, and it would change the
+            # topology for a repetition that adds no path. The repeat is real
+            # work all the same, so it shows in the node's call count.
+            g.nodes[dst].call_count += 1
+            return
         if (src, dst) in state.declared:
             state.declared.discard((src, dst))       # already counted where the trace declared it
             return

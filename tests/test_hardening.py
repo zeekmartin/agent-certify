@@ -269,3 +269,26 @@ def test_otel_reports_skipped_records():
     g.skipped_records = 4
     span = OTelExporter().export_scan(g, AgentFIScanner(g).scan())
     assert span.attributes["agent_certify.skipped_records"] == 4
+
+
+def test_render_html_survives_zero_weight_edges():
+    """A graph from `from_dict` may legitimately carry weight 0; log1p(0) would divide by zero (COD-015)."""
+    from agent_certify.graph import AgentGraph
+
+    g = AgentGraph.from_dict({
+        "session_id": "zero",
+        "nodes": [{"id": "claude", "kind": "orchestrator", "name": "claude"},
+                  {"id": "tool:Bash", "kind": "tool", "name": "Bash"}],
+        "edges": [{"source": "claude", "target": "tool:Bash", "weight": 0, "errors": 0}],
+    })
+    html_out = render_html(g, AgentFIScanner(g).scan())
+    assert "tool:Bash" in html_out
+
+
+def test_scanner_structure_is_declared_before_scan():
+    """A direct call to an internal before scan() should not die on AttributeError (COD-016)."""
+    g = session_graph("s", {"Bash": 1})
+    scanner = AgentFIScanner(g)
+    assert scanner.structure is None
+    scanner.scan()
+    assert scanner.structure is not None

@@ -326,7 +326,9 @@ class AnomalyDetector:
             z = (count - mean) / std
             if z <= VOLUME_SIGMA_WARNING:
                 return None
-            severity = CRITICAL if z >= VOLUME_SIGMA_CRITICAL else WARNING
+            # Both bounds are exclusive, as "past 3 sigma" and "past 5" say:
+            # exactly 5.0 sigma is a warning, not a critical.
+            severity = CRITICAL if z > VOLUME_SIGMA_CRITICAL else WARNING
             return severity, z, f"{mean:.0f} ± {std:.0f}"
         if mean <= _EPS or count <= VOLUME_RATIO_WARNING * mean:
             return None
@@ -353,16 +355,20 @@ class AnomalyDetector:
         caller, the two carry identical information and the anomaly is reported
         about the tool.
         """
-        callers: dict[str, set[str]] = {}
+        caller_roles: dict[str, set[str]] = {}
         for e in graph.edges:
-            callers.setdefault(e.target, set()).add(node_role(graph, e.source))
+            caller_roles.setdefault(e.target, set()).add(node_role(graph, e.source))
         out, explained = [], set()
         for key, count in sorted(link_volume(graph).items()):
             stats = self.baseline.volume("link", key)
             if stats is None:
                 continue                       # an unlearned link is new_link's business
             source, target = key.split(" -> ", 1)
-            if target.startswith("tool:") and len(callers.get(target, ())) < 2:
+            # `target` comes from a link_volume key, so it is a *role*, while
+            # caller_roles is keyed by node *id*. The lookup is valid because a
+            # tool's role is its id (see :meth:`AgentGraph.role`), which is also why
+            # this branch only applies to "tool:" targets.
+            if target.startswith("tool:") and len(caller_roles.get(target, ())) < 2:
                 continue                       # one caller: the tool-level anomaly says the same thing
             anomaly = self._volume_anomaly(f"Link {key}", count, stats,
                                            f"{source} alone accounts for this; other callers of "
@@ -377,9 +383,9 @@ class AnomalyDetector:
             stats = self.baseline.volume("tool", node.name)
             if stats is None:
                 continue                       # an unlearned tool is new_tool's business
-            callers = sorted({e.source for e in graph.edges if e.target == node.id})
+            node_callers = sorted({e.source for e in graph.edges if e.target == node.id})
             anomaly = self._volume_anomaly(f"Tool {node.name}", node.call_count, stats,
-                                           f"called by {', '.join(callers) or '-'}")
+                                           f"called by {', '.join(node_callers) or '-'}")
             if anomaly is not None:
                 out.append(anomaly)
         return out
@@ -391,6 +397,14 @@ class AnomalyDetector:
         A rejected pattern wins over everything learned or accepted, exactly as
         a rejected tool does: the point of rejecting a destination is that no
         amount of traffic to it makes it normal.
+
+        The messages say "network destination … in tool call" and not "HTTP
+        call … detected", because that is all that was seen: a host name among
+        a tool call's arguments (or its result, when the arguments already
+        pointed somewhere). No connection is observed, no name is resolved, the
+        scheme need not be HTTP — ``ws://``, ``ftp://`` and a bare
+        ``{"host": …}`` field all land here — and nothing says the call
+        succeeded or was even attempted.
         """
         b = self.baseline
         out = []
@@ -401,7 +415,7 @@ class AnomalyDetector:
             if rejected:
                 unknown = "not in baseline, " if domain not in b.known_domains else ""
                 out.append(Anomaly(CRITICAL, "rejected_domain",
-                                   f"HTTP call to {domain} detected — {unknown}"
+                                   f"Network destination {domain} in tool call — {unknown}"
                                    f"matches rejected pattern {rejected}",
                                    domain, f"rejected pattern {rejected}", None,
                                    detail + " — rejected, so it stays an anomaly across re-learns"))
@@ -409,7 +423,7 @@ class AnomalyDetector:
             if domain in b.known_domains or matching_pattern(domain, b.accepted_domains):
                 continue
             out.append(Anomaly(CRITICAL, "new_domain",
-                               f"HTTP call to {domain} detected — not in baseline",
+                               f"Network destination {domain} in tool call — not in baseline",
                                domain, f"not among {len(b.known_domains)} known destination(s)", None, detail))
         return out
 

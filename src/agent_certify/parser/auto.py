@@ -18,8 +18,10 @@ input                                  parser
 agent/task/tool entries
 ``*.json`` / ``*.jsonl`` with          :class:`LangGraphParser`
 LangGraph node or event records
-other ``*.jsonl`` (incl. empty)        :class:`ClaudeCodeParser`
-anything else                          ``ValueError``
+other ``*.json`` / ``*.jsonl``         :class:`ClaudeCodeParser`
+(including empty)
+a suffix other than ``.jsonl``,        ``ValueError``
+``.json`` or ``.agent-trace``
 =====================================  ===================================
 
 The first :data:`MAX_PROBE` records of a file are examined and the first one

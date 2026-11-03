@@ -29,7 +29,7 @@ answer on its own: not which tools ran, but **where they went**.
   session's tool calls pointed at, and two new checks compare them against the
   baseline — `new_domain` (never seen, not accepted) and `rejected_domain`
   (matches a rejected pattern), both critical:
-  `HTTP call to api.qwen.cn detected — not in baseline, matches rejected pattern *.cn`
+  `Network destination api.qwen.cn in tool call — not in baseline, matches rejected pattern *.cn`
 - `agent-certify baseline accept --domain api.openai.com` and
   `baseline reject --domain "*.cn"`, with `baseline show` listing both and the
   destinations learned. Patterns follow the rules of the other decisions:
@@ -39,9 +39,17 @@ answer on its own: not which tools ran, but **where they went**.
   `.tool_call_volume`, `.link_call_volume` and `.volume(scope, key)`;
   `baseline.link_volume()` and `link_key()`
 - `AnomalyInjector.inject_foreign_domain()` and `.forbid_domain()`, so the
-  benchmark covers six fault types: **36/36 detected, no false positives, no
-  blind spots left**
-- 73 tests for the two features (`tests/test_volume.py`, `tests/test_domains.py`)
+  benchmark covers six fault types: **36/36 detected, no false positives**
+- `AnomalyInjector.inject_shell_domain()`, the benchmark's one **blind spot**
+  injection: a host named inside a shell command argument
+  (`{"command": "curl -sS collector.example.net/x"}`) is read by no check, so
+  the expected outcome is silence and the fault is counted apart from the
+  detection rate. It is injected through the production extractor, so it starts
+  counting as a detection by itself — with no edit to the benchmark — the day
+  extraction reads shell commands
+- `agent_certify.benchmark.BLIND_SPOTS`, the list of fault types this release
+  ships as uncovered, so a test can pin the claim
+- `tests/test_volume.py` and `tests/test_domains.py` for the two features
 
 ### Changed
 - `agent-certify learn` reports the destinations it learned, and the Claude
@@ -54,6 +62,79 @@ answer on its own: not which tools ran, but **where they went**.
 - `extract_domains()` capped its result at `MAX_DOMAINS` across a payload but
   not within a single string, so one argument holding hundreds of URLs could
   return all of them
+
+#### From the 2026-11-03 audit (33 findings: 3 high, 7 medium, the rest low or info)
+
+Three groups mattered, and all three were places where a shipped text claimed
+something the code did not do.
+
+- **`SECURITY.md` described the wrong data perimeter** (DOC-001, high). It said
+  "prompts, tool inputs and tool outputs are never extracted" while v0.7.0
+  reads host names out of both and returns them to MCP clients in anomaly
+  messages. A new §6 now states what is read, what is kept, what reaches
+  `baseline.json` and what is transmitted — plus a review rule: a feature that
+  reads a new category of input data requires a `SECURITY.md` review in the
+  same change
+- **The benchmark's blind-spot machinery was unreachable** (INV-001, high).
+  Every injection carried an expected category, so `expected_category` was
+  never None and the branches that report a blind spot could not run: "no blind
+  spots left" had become a property of the registry rather than a measurement.
+  `inject_shell_domain` arms it again against a real gap, and the tests now pin
+  the capability instead of the result
+- **`benchmark/__init__.py` still said "no check reads call volume"** (INV-002,
+  high), contradicting the shipped check and the same file twelve lines above
+- **Three ways a real network destination was silently dropped** (INV-003
+  cluster, medium) — the detector was not wrong, it was quiet:
+  - `AgentGraph.merge` set the per-node destination list by default instead of
+    unioning it, so when two sessions pointed the same tool at different hosts
+    the second host survived in `seen_domains` with no caller and the anomaly
+    degraded to "no caller recorded". On the path `scan <directory>` takes
+    (INV-004)
+  - `NOT_HOSTS` treated `zip`, `sh`, `so`, `md`, `py` and `rs` as file
+    extensions although all six are delegated TLDs, so `{"host":
+    "collector.zip"}` was dropped. Removed, and the rest of the list checked
+    against the root zone; a test keeps it that way (INV-005)
+  - `MAX_STRING_CHARS` was announced for "any one string" but applied only to
+    the URL search, not to the bare-host branch (INV-006)
+- `new_domain` / `rejected_domain` said "HTTP call to X detected"; nothing is
+  observed, resolved or necessarily HTTP. Now "Network destination X in tool
+  call" (INV-007)
+- LangGraph's `unattributed_errors` was incremented and read nowhere. Now in
+  the `graph` node's metadata and logged, like `transitions` (INV-008)
+- `certify --key` with a file that is not a key raised a bare `ValueError`
+  traceback; it now exits with a message naming what was expected (COD-011)
+- `watch` silenced three parser loggers by name, missing CrewAI and LangGraph;
+  it raises the parent `agent_certify.parser` logger instead, so every parser
+  is covered by inheritance (COD-010)
+- Exactly 5.0σ of call volume was reported critical where all three texts
+  describing the check say warning; both bounds are now exclusive (DOC-017)
+- A LangGraph node looping back to itself now increments its call count, as the
+  README said it did (DOC-005)
+- `baseline accept|reject` did not expand `~` or environment variables in
+  `--baseline`, unlike every other path argument (MNT-001)
+- `render_html` divided by zero on a graph whose edges all have weight 0,
+  reachable through `AgentGraph.from_dict` (COD-015)
+- Dead code removed: `triangle_counts()`, `baseline.normalise_domain()`,
+  `STATUS_CODES["UNSET"]`, `BlastRadiusAnalyzer._get_neighbors()` and
+  `Baseline.version`'s stale `"0.2.0"` default; `TypeResult.note` is now
+  rendered by the benchmark table rather than carried unused (COD-014)
+- `AgentFIScanner.structure` is declared in `__init__` (COD-016)
+- Documentation corrected: the non-existent 5% skipped-record threshold
+  (DOC-002), `BUSL-1.1` in the v0.5.0 roadmap entry (DOC-003), two
+  contradictory v0.7.0 roadmap sections and shipped work filed under "Planned"
+  (DOC-004), the watcher's format list and module title (DOC-006), the coverage
+  badge against the CI floor (DOC-007), a misplaced field comment in `Baseline`
+  (DOC-008), what `learn` records (DOC-009), `NETWORK_KEYS` presented as
+  exhaustive (DOC-010), `node_classifications` labelled "Critical nodes"
+  (DOC-011), the trace id's dependence on a session id (DOC-012), the time
+  limit as per-request rather than per-tool-call (DOC-013), `--perspective
+  classic` and `watch --duration` missing from the usage lines (DOC-014), the
+  format-detection table's final row (DOC-015) and a resolved audit item still
+  listed as open (DOC-016)
+
+Deferred, and recorded in `ROADMAP.md`: `MNT-003` (splitting `cli.py` and
+`mcp_server.py`), `COD-012` (version-counter invalidation for the edge index,
+documented on the attribute in the meantime) and dynamic coverage badges.
 
 ### Notes
 - **Destinations are patterns, never addresses.** Nothing is resolved in either

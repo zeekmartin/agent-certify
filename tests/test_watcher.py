@@ -123,6 +123,41 @@ def test_half_written_line_is_skipped_then_read(session):
     assert "tool:Glob" in w._last_graph.nodes
 
 
+PARSER_MODULES = ["claude_code", "cursor_trace", "mcp_logs", "crewai", "langgraph", "base"]
+
+
+def test_no_parser_can_warn_while_a_file_is_being_written(session, monkeypatch):
+    """Every parser is silenced during a poll, not the three the v0.5 list named.
+
+    The silencing hard-coded three module loggers; crewai and langgraph were
+    added in v0.6.1 and kept warning about the truncated last line that is
+    normal while a session grows (audit COD-010). Raising the parent logger
+    covers base and anything added later, by inheritance — which is what this
+    checks, from inside the parse, where it matters.
+    """
+    import logging
+
+    from agent_certify import watcher as watcher_mod
+
+    seen = {}
+    real = watcher_mod.AutoParser.parse
+
+    def spy(self, path):
+        for m in PARSER_MODULES:
+            seen[m] = logging.getLogger(f"agent_certify.parser.{m}").isEnabledFor(logging.WARNING)
+        return real(self, path)
+
+    monkeypatch.setattr(watcher_mod.AutoParser, "parse", spy)
+    w = _watcher(session.path, [])
+    record = json.dumps(_assistant([("late", "Glob", {})]))
+    session.append(raw=record[:20])                           # writer is mid-line
+    assert w.poll() is True
+    assert seen == dict.fromkeys(PARSER_MODULES, False)       # none of them could warn
+    # The level is restored afterwards, so a real problem is still heard.
+    assert all(logging.getLogger(f"agent_certify.parser.{m}").isEnabledFor(logging.WARNING)
+               for m in PARSER_MODULES)
+
+
 def test_subagent_growth_triggers_rescan(session):
     w = _watcher(session.path, [])
     w.poll()

@@ -56,7 +56,13 @@ from agent_certify.baseline import (
     parse_link,
 )
 from agent_certify.blast import BlastRadiusAnalyzer
-from agent_certify.certificate import DEFAULT_VALIDITY_DAYS, AgentCertificate, _public_key_hex, generate_keypair
+from agent_certify.certificate import (
+    DEFAULT_VALIDITY_DAYS,
+    AgentCertificate,
+    _private_key_hex,
+    _public_key_hex,
+    generate_keypair,
+)
 from agent_certify.domains import domain_matches, normalise_pattern
 from agent_certify.graph import AgentGraph
 from agent_certify.mcp_server import AgentCertifyMCPServer
@@ -558,7 +564,10 @@ def _domain(raw: str) -> str:
 
 def _load_baseline_for_edit(args) -> tuple[Baseline, Path]:
     """The baseline to edit, and where to write it back."""
-    path = Path(args.baseline) if args.baseline else DEFAULT_BASELINE_PATH
+    # Through _path() like every other path argument of the CLI: without it
+    # `--baseline ~/b.json` looked for a literal "~" directory here while it
+    # expanded everywhere else.
+    path = _path(args.baseline) if args.baseline else DEFAULT_BASELINE_PATH
     if not path.exists():
         raise SystemExit(f"agent-certify: no baseline at {path.as_posix()}; "
                          "run `agent-certify learn <sessions>` first or pass --baseline")
@@ -728,12 +737,28 @@ def cmd_keygen(args) -> int:
 
 
 def _read_private_key(path: str) -> str:
+    """The Ed25519 seed in ``path``, or a usage error naming what was expected.
+
+    Validated here rather than left to fail inside ``sign``, which raises a
+    bare ``ValueError`` or ``TypeError`` and reaches the user as a traceback.
+    The public-key path has always checked its input (see ``cmd_verify``);
+    this is the same courtesy on the private side.
+    """
     p = _path(path)
+    if not p.is_file():
+        raise SystemExit(f"agent-certify: private key {p} not found")
     if os.name == "posix":
         mode = p.stat().st_mode
         if mode & (stat.S_IRGRP | stat.S_IROTH | stat.S_IWGRP | stat.S_IWOTH):
             _warn(f"{p} is accessible by other users (mode {stat.S_IMODE(mode):o}); run: chmod 600 {p}")
-    return p.read_text(encoding="utf-8").strip()
+    try:
+        key = p.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        raise SystemExit(f"agent-certify: cannot read private key {p}") from None
+    if _private_key_hex(key) is None:
+        raise SystemExit(f"agent-certify: {p} does not hold an Ed25519 private key "
+                         "(32 bytes as 64 hex chars, as written by `agent-certify keygen`)")
+    return key
 
 
 def cmd_certify(args) -> int:

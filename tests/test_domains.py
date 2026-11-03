@@ -9,7 +9,7 @@ from conftest import session_graph
 
 from agent_certify import AgentFIScanner, AnomalyDetector, BaselineLearner, ClaudeCodeParser
 from agent_certify.anomaly import CRITICAL
-from agent_certify.baseline import carry_overrides, load_baseline, normalise_domain
+from agent_certify.baseline import carry_overrides, load_baseline
 from agent_certify.cli import main
 from agent_certify.domains import (
     domain_matches,
@@ -92,6 +92,94 @@ def test_extraction_is_bounded():
     assert len(extract_domains(wide)) <= 200                  # MAX_DOMAINS
 
 
+# ----------------------------------------------- adversarial: false negatives
+# The suite above measures what extraction finds. These measure what it must
+# not silently drop: a destination present in the logs and never recorded is
+# never compared against a baseline and never reported, and a detector that
+# stays quiet is worse than one that is noisy.
+@pytest.mark.parametrize("payload,expected", [
+    # A final label that is both a file extension and a delegated TLD. Each of
+    # these was dropped by NOT_HOSTS before the v0.7.0 audit.
+    ({"host": "collector.zip"}, {"collector.zip"}),            # .zip: delegated gTLD, open registration
+    ({"endpoint": "data.sh"}, {"data.sh"}),                    # .sh: Saint Helena
+    ({"base_url": "x.so"}, {"x.so"}),                          # .so: Somalia
+    ({"host": "exfil.md"}, {"exfil.md"}),                      # .md: Moldova
+    ({"api_host": "beacon.py"}, {"beacon.py"}),                # .py: Paraguay
+    ({"proxy": "relay.rs"}, {"relay.rs"}),                     # .rs: Serbia
+    # Bare-host form under every shape of network-named key, with no scheme to
+    # anchor the regex.
+    ({"hostname": "db.internal.corp"}, {"db.internal.corp"}),
+    ({"webhook_url": "hooks.unknown.cn"}, {"hooks.unknown.cn"}),
+    ({"api_url": "EU.Example.COM."}, {"eu.example.com"}),
+    ({"hosts": ["a.example.net", "b.example.net"]}, {"a.example.net", "b.example.net"}),
+    ({"endpoint": {"host": "deep.example.org"}}, {"deep.example.org"}),
+])
+def test_a_real_destination_is_never_silently_dropped(payload, expected):
+    assert extract_domains(payload) == expected
+
+
+def test_every_not_hosts_label_is_absent_from_the_dns_root():
+    """A label that is both a file extension and a TLD turns the filter into an egress hole."""
+    from agent_certify.domains import NOT_HOSTS
+
+    # A sample of the root zone, weighted toward labels that also read as file
+    # extensions. The six that used to be on the list come first.
+    delegated = {"zip", "sh", "so", "md", "py", "rs",
+                 "io", "dev", "app", "ai", "co", "tv", "me", "to", "ly", "cc", "in", "it", "is",
+                 "au", "de", "fr", "ch", "cloud", "page", "zone", "link", "build", "run", "how"}
+    assert NOT_HOSTS & delegated == set()
+    assert all(label and label.isalnum() for label in NOT_HOSTS)
+
+
+def test_a_bare_host_is_truncated_like_a_url_search():
+    """MAX_STRING_CHARS is announced for *any* string; the bare-host branch must honour it too."""
+    from agent_certify.domains import MAX_STRING_CHARS
+
+    # A host hidden past the limit is out of scope, as it is for the URL search.
+    assert extract_domains({"host": "x" * (MAX_STRING_CHARS + 10) + " api.openai.com"}) == set()
+    # And a value that long costs bounded work rather than several full copies.
+    assert extract_domains({"host": "a" * (4 * MAX_STRING_CHARS)}) == set()
+
+
+def test_a_host_in_a_shell_command_is_a_known_blind_spot():
+    """Documented and measured by the benchmark's shell_domain injection, not asserted away."""
+    assert extract_call_domains({"command": "curl -sS collector.example.net/health"}) == set()
+    # With a scheme it is found, which is what makes the gap specific.
+    assert extract_call_domains({"command": "curl -sS https://collector.example.net/health"}) == {
+        "collector.example.net"}
+
+
+def test_merge_keeps_every_callers_destinations():
+    """Two sessions, the same tool, different hosts: both must name their caller.
+
+    seen_domains was unioned on merge while the per-node copy was set by
+    default, so the second session's host survived as a destination with no
+    caller — and the anomaly degraded to "no caller recorded" on exactly the
+    path `scan <directory>` takes.
+    """
+    from agent_certify.graph import AgentGraph
+
+    a = session("a", {"api.openai.com"})
+    b = session("b", {"api.unknown.cn"})
+    merged = AgentGraph.merge([a, b], session_id="merged")
+    assert merged.seen_domains == {"api.openai.com", "api.unknown.cn"}
+    assert merged.domain_callers("api.openai.com") == ["tool:WebFetch"]
+    assert merged.domain_callers("api.unknown.cn") == ["tool:WebFetch"]
+    assert merged.nodes["tool:WebFetch"].metadata["domains"] == ["api.openai.com", "api.unknown.cn"]
+
+
+def test_merged_destinations_are_reported_with_their_caller(baseline):
+    """The observable consequence of the merge fix, through the detector."""
+    from agent_certify.graph import AgentGraph
+
+    merged = AgentGraph.merge([session("a", {"api.openai.com"}),
+                               session("b", {"api.unknown.cn"})], session_id="merged")
+    hits = domain_anomalies(merged, baseline)
+    assert [a.value for a in hits] == ["api.unknown.cn"]
+    assert hits[0].detail == "reached by tool:WebFetch"
+    assert "no caller recorded" not in hits[0].detail
+
+
 def test_host_normalisation():
     assert normalise_host("User:pw@API.OpenAI.com:443.") == "api.openai.com"
     assert normalise_host("[::1]:8080") == "[::1]"
@@ -141,7 +229,6 @@ def test_pattern_normalisation():
     assert normalise_pattern("*.Alibaba.COM") == "*.alibaba.com"
     assert normalise_pattern("https://api.openai.com/v1/chat") == "api.openai.com"
     assert normalise_pattern("  api.openai.com.  ") == "api.openai.com"
-    assert normalise_domain("*.cn") == "*.cn"            # re-exported from baseline
 
 
 @pytest.mark.parametrize("bad,message", [
@@ -177,7 +264,7 @@ def test_accepted_domain_passes(baseline):
 def test_new_domain_is_critical(baseline):
     hits = domain_anomalies(session("s", {"api.unknown.cn"}), baseline)
     assert len(hits) == 1 and hits[0].severity == CRITICAL and hits[0].category == "new_domain"
-    assert hits[0].message == "HTTP call to api.unknown.cn detected — not in baseline"
+    assert hits[0].message == "Network destination api.unknown.cn in tool call — not in baseline"
     assert hits[0].value == "api.unknown.cn" and "reached by tool:WebFetch" in hits[0].detail
     assert detect(session("s", {"api.unknown.cn"}), baseline).has_critical
 
@@ -187,7 +274,7 @@ def test_rejected_domain_is_critical_even_when_learned(baseline):
     baseline.rejected_domains.add("api.openai.com")
     hits = domain_anomalies(session("s", {"api.openai.com"}), baseline)
     assert len(hits) == 1 and hits[0].category == "rejected_domain" and hits[0].severity == CRITICAL
-    assert hits[0].message == ("HTTP call to api.openai.com detected — "
+    assert hits[0].message == ("Network destination api.openai.com in tool call — "
                                "matches rejected pattern api.openai.com")
     assert "across re-learns" in hits[0].detail
 
@@ -195,7 +282,7 @@ def test_rejected_domain_is_critical_even_when_learned(baseline):
 def test_rejected_wildcard_names_the_pattern_and_the_absence(baseline):
     baseline.rejected_domains.add("*.cn")
     hits = domain_anomalies(session("s", {"api.unknown.cn"}), baseline)
-    assert hits[0].message == ("HTTP call to api.unknown.cn detected — not in baseline, "
+    assert hits[0].message == ("Network destination api.unknown.cn in tool call — not in baseline, "
                                "matches rejected pattern *.cn")
 
 

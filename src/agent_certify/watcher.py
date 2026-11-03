@@ -1,7 +1,7 @@
 # agent-certify — Structural verification of multiagent systems
 # Copyright 2026 Cognitive Engineering (Switzerland)
 # SPDX-License-Identifier: Apache-2.0
-"""Live monitoring of an active Claude Code session.
+"""Live monitoring of an active agent session.
 
 The transcript is append-only. The watcher polls its size (plus the sizes of
 its sub-agent transcripts) and, when anything grew, re-parses the session,
@@ -18,9 +18,10 @@ waited for; a half-written last line is skipped until it is complete.
 No file-system notification library: plain size polling.
 
 Any format :class:`~agent_certify.parser.AutoParser` reads can be watched: a
-Claude Code transcript, a Cursor ``traces.jsonl`` or an MCP server log.
+Claude Code transcript, a Cursor ``traces.jsonl``, an MCP server log, a CrewAI
+run log or a LangGraph trace.
 
-Known limitation (v0.5): every change triggers a full re-parse and rescan of
+Known limitation: every change triggers a full re-parse and rescan of
 the session, so the cost of each scan grows with the session's length. The
 scan itself is near-linear since v0.5, which keeps this practical for long
 sessions; incremental parsing from the last file offset is planned.
@@ -164,17 +165,18 @@ class SessionWatcher:
 
     def _scan_and_report(self) -> None:
         """Parse, scan, detect anomalies, check policy."""
-        # A half-written last line is normal while the file grows: keep the parsers quiet about it.
-        loggers = [logging.getLogger(f"agent_certify.parser.{m}") for m in ("claude_code", "cursor_trace", "mcp_logs")]
-        levels = [lg.level for lg in loggers]
-        for lg in loggers:
-            lg.setLevel(logging.ERROR)
+        # A half-written last line is normal while the file grows: keep the
+        # parsers quiet about it. The parent logger is raised rather than a
+        # hard-coded list of modules, so every parser — base included, and any
+        # added later — inherits the silence instead of being forgotten here.
+        parsers = logging.getLogger("agent_certify.parser")
+        level = parsers.level
+        parsers.setLevel(logging.ERROR)
         started = datetime.now(timezone.utc)
         try:
             graph = AutoParser().parse(str(self.session_path))
         finally:
-            for lg, level in zip(loggers, levels):
-                lg.setLevel(level)
+            parsers.setLevel(level)
         result = AgentFIScanner(graph, perspective=self.perspective).scan()
 
         fi_str = f"FI: {result.fi:.4f}"

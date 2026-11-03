@@ -56,7 +56,6 @@ from pathlib import Path
 
 import numpy as np
 
-from agent_certify.domains import normalise_pattern
 from agent_certify.graph import AgentGraph
 from agent_certify.paths import ensure_state_dir
 from agent_certify.scanner import AgentFIScanner, ScanResult
@@ -145,8 +144,6 @@ class Baseline:
     error_rate_mean: float               # errors / total_calls
     error_rate_std: float
 
-    # Call volume: tool name / link key -> {"mean", "std", "max", "sessions"}
-    # Defaulted, so a baseline written by <= 0.6.1 still loads.
     # Topology
     known_links: set[tuple[str, str]]    # all (source, target) role links seen
     bridge_count_mean: float
@@ -154,7 +151,7 @@ class Baseline:
 
     # Metadata
     created_at: str
-    version: str = "0.2.0"
+    version: str = "unknown"      # only reached by a baseline file that records none
     # Human decisions, not statistics. Carried across re-learns; see the module
     # docstring. Defaulted, so a baseline written by <= 0.5.1 still loads.
     accepted_tools: set[str] = field(default_factory=set)
@@ -163,6 +160,8 @@ class Baseline:
     fi_min: float = 0.0
     fi_max: float = 0.0
     session_ids: list[str] = field(default_factory=list)
+    # Call volume: tool name / link key -> {"mean", "std", "max", "sessions"}.
+    # Defaulted, so a baseline written by <= 0.6.1 still loads.
     tool_call_volume: dict[str, dict] = field(default_factory=dict)
     link_call_volume: dict[str, dict] = field(default_factory=dict)
     known_domains: set[str] = field(default_factory=set)
@@ -462,11 +461,6 @@ def parse_link(text: str, baseline: Baseline | None = None) -> tuple[str, str]:
             f"link must be \"SOURCE {_ARROW} TARGET\", e.g. "
             f"\"agent:Build {_ARROW} deploy_staging\"; got {text!r}")
     return (normalise_endpoint(parts[0], baseline), normalise_endpoint(parts[1], baseline))
-
-
-def normalise_domain(raw: str) -> str:
-    """An operator's ``--domain`` argument as a stored pattern; see :func:`~agent_certify.domains.normalise_pattern`."""
-    return normalise_pattern(raw)
 
 
 def carry_overrides(new: Baseline, old: Baseline | None) -> Baseline:

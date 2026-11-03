@@ -5,8 +5,7 @@
 [![Python](https://img.shields.io/pypi/pyversions/agent-certify)](https://pypi.org/project/agent-certify/)
 [![Downloads](https://img.shields.io/pypi/dm/agent-certify)](https://pypi.org/project/agent-certify/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
-[![Coverage](https://img.shields.io/badge/coverage-95%25-brightgreen)]()
-[![Tests](https://img.shields.io/badge/tests-504%20passed-brightgreen)]()
+[![Coverage](https://img.shields.io/badge/coverage-%E2%89%A590%25-brightgreen)](https://github.com/zeekmartin/agent-certify/actions/workflows/ci.yml)
 
 Structural verification of multiagent systems.
 
@@ -80,8 +79,8 @@ environment variables, are resolved (symlinks, `..`), and must lie inside
 `~/.claude/projects` or the server's working directory; anything else gets
 "Path not allowed". Responses and errors never contain a resolved path, file
 contents or exception text: unexpected failures are logged with their
-traceback on stderr and reported with a correlation id. Each request is limited
-to 30 seconds.
+traceback on stderr and reported with a correlation id. Each tool call is
+limited to 30 seconds (`initialize`, `ping` and `tools/list` answer directly).
 
 ## Quick start
 
@@ -97,7 +96,7 @@ scanner = AgentFIScanner(graph)
 result = scanner.scan()
 print(f"Fragility Index: {result.fi:.4f}")
 print(f"Bridges: {len(result.bridges)}")
-print(f"Critical nodes: {result.node_classifications}")
+print(f"Critical nodes: {result.critical_nodes}")
 
 # Blast radius if 'bash' tool is compromised
 blast = BlastRadiusAnalyzer(graph)
@@ -112,7 +111,7 @@ print(f"System fragmented: {report.system_fragmented}")
 agent-certify scan ~/.claude/projects/                       # every session, plus a merged graph
 agent-certify scan ~/.claude/projects/<project>/<session>.jsonl
 agent-certify scan <path> --format json|markdown|html [-o FILE]
-agent-certify scan <path> --perspective engineering|risk|compliance|monitoring
+agent-certify scan <path> --perspective engineering|risk|compliance|monitoring|classic
 agent-certify blast ~/.claude/projects/ --node bash
 
 # Baseline and anomaly detection
@@ -218,8 +217,11 @@ result.labels("compliance")        # same result, other vocabulary
   error rate (errors / tool calls), plus FI's range and the most sub-agents seen
 - every tool seen, and the fraction of sessions it appears in
 - every invocation link seen (`source -> target`)
-- the tools and links you have accepted or rejected by hand, which are decisions
-  rather than statistics and so survive a re-learn (see below)
+- call volume per tool and per link (mean ± std, max, and how many sessions it
+  was seen in), which is what `call_volume_spike` compares against
+- every network destination seen (`known_domains`)
+- the tools, links and destinations you have accepted or rejected by hand, which
+  are decisions rather than statistics and so survive a re-learn (see below)
 
 Sub-agent ids are unique per spawn, so links are recorded by role: a sub-agent
 counts as `agent:<type>` (`agent:Explore`, `agent:general-purpose`). Standard
@@ -385,8 +387,10 @@ new_agent       new_link/warn                   6         6   100.0%  6 warning
 volume_spike    call_volume_spike/warn          6         6   100.0%  6 critical
 forbidden_tool  new_tool/crit                   6         6   100.0%  6 critical
 foreign_domain  new_domain/crit                 6         6   100.0%  6 critical
+shell_domain    (blind spot)                    6         0     0.0%  not covered by any check
 --------------------------------------------------------------------------------------------
 detection rate 100.0% (36/36)   false negatives 0.0%   false positives 0.0% (0/6 clean, 0 anomalies)
+blind spots: shell_domain — injected and expected to go unreported, no check covers the fault
 ```
 
 | Injection | Fault | Expected |
@@ -397,8 +401,9 @@ detection rate 100.0% (36/36)   false negatives 0.0%   false positives 0.0% (0/6
 | `inject_volume_spike` | `factor`× the calls to one tool | `call_volume_spike`, warning or worse |
 | `inject_forbidden_tool` | a tool the operator rejected | `new_tool`, critical |
 | `inject_foreign_domain` | a destination the baseline never saw | `new_domain`, critical |
+| `inject_shell_domain` | a host named inside a shell command argument | **nothing** — a measured blind spot |
 
-Two things in that table are worth more than the 100%:
+Three things in that table are worth more than the 100%:
 
 - **The volume spike was a measured miss for a release.** v0.6.1 reported it as
   a blind spot — no check read call volume — and v0.7.0's `call_volume_spike`
@@ -406,6 +411,16 @@ Two things in that table are worth more than the 100%:
   instead of omitting it. The two faults added in v0.7.0 change nothing
   structural at all: the volume spike adds no node, link or failure, and the
   foreign destination leaves the topology byte-for-byte identical.
+- **One blind spot is open, and it is injected rather than asserted.**
+  Extraction reads hosts from URLs and from fields that name a destination, so
+  `{"command": "curl -sS collector.example.net/x"}` reaches no baseline and
+  fires no anomaly. `inject_shell_domain` builds that argument object and hands
+  it to the production extractor; whatever comes back lands in the graph, which
+  today is nothing. It is counted apart from the detection rate so it neither
+  inflates it nor drops out of the report, and it turns into a detection by
+  itself — no edit to the benchmark — the day extraction reads shell commands.
+  "No blind spots left" is a sentence this project will not print unless the
+  measurement says it.
 - **The baseline is learned from sessions that are not the ones tested.**
   `learn_holdout()` holds out every other session; a baseline learned from
   exactly the sessions it is then run against reports nothing on them by
@@ -434,7 +449,7 @@ agent-certify baseline show                               # includes a domains s
 ```
 
 ```
-[CRITICAL] HTTP call to api.qwen.cn detected — not in baseline, matches rejected pattern *.cn
+[CRITICAL] Network destination api.qwen.cn in tool call — not in baseline, matches rejected pattern *.cn
            Baseline: rejected pattern *.cn
            reached by tool:WebFetch — rejected, so it stays an anomaly across re-learns
 ```
@@ -445,8 +460,17 @@ extraction is broad but not indiscriminate:
 - **any full URL** in a tool call's arguments — `https://api.openai.com/v1/chat`
   gives `api.openai.com` (`http`, `https`, `ws`, `wss`, `ftp`, `ftps`);
 - **a bare host**, but only as the value of a field that names one: `url`,
-  `uri`, `endpoint`, `host`, `domain`, `base_url`, `server`, `origin`, `proxy`
-  and their plurals. `{"host": "db.internal"}` counts; an IP literal counts too.
+  `uri`, `endpoint`, `host`, `hostname`, `domain`, `base_url`, `base_uri`,
+  `api_url`, `webhook_url`, `server`, `origin`, `proxy`, their plurals, and a
+  dozen more — `NETWORK_KEYS` in `agent_certify/domains.py` is the full list.
+  `{"host": "db.internal"}` counts; an IP literal counts too.
+
+  One exception, to keep configuration noise out of the report: a value whose
+  last label is a common file extension (`notes.txt`, `data.csv`, `app.log` —
+  `NOT_HOSTS` in the same module) is read as a filename, not a host. Every
+  label on that list is absent from the DNS root, so no reachable name is
+  dropped by it; `collector.zip`, `x.sh`, `y.so`, `z.md`, `a.py` and `b.rs` are
+  destinations and are reported as such.
 
 A domain-looking word *anywhere* is not a destination. That distinction is what
 keeps this usable: a session that reads a file mentioning `example.com`, or
@@ -634,7 +658,7 @@ Each anomaly (critical and warning) and each policy violation is printed once,
 when it first appears, and again only if its severity changes. A session file
 that does not exist yet is waited for; a half-written last line is skipped
 until it is complete. It uses plain size polling, no file-system notification
-library. `--scans N` stops after N scans; in Python, `SessionWatcher(...)`
+library. `--scans N` stops after N scans and `--duration S` after S seconds — the only way to end a watch on a session that has gone quiet; in Python, `SessionWatcher(...)`
 takes `on_anomaly` / `on_policy_violation` callbacks and has `stop()`.
 
 ## MCP server logs
@@ -672,9 +696,10 @@ violation sets the span status to ERROR.
 Spans are OTLP/JSON, one `{"resourceSpans": [...]}` object per line: the
 layout the OpenTelemetry Collector's `file` exporter writes and its
 `otlpjsonfile` receiver reads, so a collector can forward them to Jaeger,
-Grafana Tempo, Datadog and so on. All scans of one session share a trace id,
-so a `watch` run appears as one trace with a span per cycle. No OpenTelemetry
-SDK is needed.
+Grafana Tempo, Datadog and so on. All scans of one session share a trace id
+derived from the session id, so a `watch` run appears as one trace with a span
+per cycle; a graph with no session id (a Cursor trace that does not carry one)
+gets a random trace id per span instead. No OpenTelemetry SDK is needed.
 
 ## Cursor Agent Trace
 
@@ -760,7 +785,8 @@ stable across runs. A node and the tools it calls stay separate: the `tools`
 node of a ReAct graph is `agent:tools`, the tool it ran is `tool:search`.
 `__start__` is the orchestrator, `__end__` is dropped (a sentinel, not a
 participant), and a node that loops back to itself adds no edge — the repeat
-shows in its call count.
+shows in its call count. Consecutive records *about* the same node are one
+activation, not a loop, so they move neither count.
 
 Transitions come from `langgraph_triggers`/`triggers`, then from an explicit
 `next`/`to`, and otherwise from the order the nodes ran in. That last fallback
@@ -785,9 +811,10 @@ Claude Code transcripts and MCP logs are read line by line; a Cursor
 document), larger ones line by line. Lines that cannot be read — malformed,
 nested too deeply, or longer than 10 MB — are skipped and counted: the count
 appears in the scan report, in JSON (`skipped_records`), in OTel spans and in
-certificates, with a warning when more than 5% of a session's records were
-skipped. A directory scan reads at most 1,000 session files and walks at most
-5 folder levels.
+certificates. A warning is printed as soon as one record is skipped — on a
+verification tool, an incomplete graph is worth saying out loud however small
+the fraction — and the scan report gives that fraction. A directory scan reads
+at most 1,000 session files and walks at most 5 folder levels.
 
 A session without sub-agents is a star (one orchestrator, many tools) and has
 FI = 1 by construction. Structure becomes informative once sub-agents share

@@ -86,7 +86,7 @@ def test_five_sigma_spike_is_critical(baseline):
     count = int(stats["mean"] + VOLUME_SIGMA_CRITICAL * stats["std"]) + 2
     hits = volume_anomalies(session_graph("spike", {"Bash": count, "Read": 10}), baseline)
     assert [a.severity for a in hits] == [CRITICAL]
-    assert hits[0].z_score >= VOLUME_SIGMA_CRITICAL
+    assert hits[0].z_score > VOLUME_SIGMA_CRITICAL
 
 
 def test_exactly_at_three_sigma_is_not_flagged():
@@ -96,6 +96,22 @@ def test_exactly_at_three_sigma_is_not_flagged():
     assert b.volume("tool", "Bash")["mean"] == 52.0 and b.volume("tool", "Bash")["std"] == 2.0
     assert volume_anomalies(session_graph("at", {"Bash": 58}), b) == []      # z == 3.0 exactly
     assert len(volume_anomalies(session_graph("past", {"Bash": 59}), b)) == 1
+
+
+def test_exactly_at_five_sigma_is_a_warning_not_a_critical():
+    """Both bounds are exclusive, as "warning past 3 sigma; critical past 5" says.
+
+    The critical bound used `z >= 5` while the warning bound used `z > 3`, so a
+    deviation of exactly 5.0 sigma came back critical where all three texts
+    describing the check put it at warning (audit DOC-017).
+    """
+    two = [session_graph("a", {"Bash": 50}), session_graph("b", {"Bash": 54})]
+    b = BaselineLearner().learn_graphs(two)                 # mean 52, std 2
+    at = volume_anomalies(session_graph("at", {"Bash": 62}), b)
+    assert [a.z_score for a in at] == [VOLUME_SIGMA_CRITICAL]        # z == 5.0 exactly
+    assert [a.severity for a in at] == [WARNING]
+    past = volume_anomalies(session_graph("past", {"Bash": 63}), b)
+    assert [a.severity for a in past] == [CRITICAL] and past[0].z_score > VOLUME_SIGMA_CRITICAL
 
 
 def test_a_quiet_session_is_never_an_anomaly(baseline):

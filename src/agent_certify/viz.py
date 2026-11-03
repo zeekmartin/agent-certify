@@ -109,7 +109,7 @@ def render_html(graph: AgentGraph, result: ScanResult | None = None, title: str 
     blasts = BlastRadiusAnalyzer(graph).analyze_all()
     pos = layout(graph)
     bridge_keys = {e.key for e in result.bridges}
-    max_w = max((e.weight for e in graph.edges), default=1)
+    max_w = max((e.weight for e in graph.edges), default=1) or 1   # edges all at weight 0: log1p(0) would divide by zero
     max_calls = max((n.call_count for n in graph.nodes.values()), default=1) or 1
     title = title or f"agent-certify · {graph.session_id or 'agent graph'}"
 

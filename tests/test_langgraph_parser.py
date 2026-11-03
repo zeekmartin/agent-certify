@@ -125,12 +125,37 @@ def test_end_sentinel_is_not_a_node(plain):
     assert not any("__end__" in n for n in plain.nodes)
 
 
-def test_self_transition_adds_no_edge(tmp_path):
+def test_self_transition_adds_no_edge_but_shows_in_the_call_count(tmp_path):
+    """The README's claim, now implemented: no edge, and the repeat is counted."""
     records = [{"node": "agent", "next": "agent", "step": 1},
                {"node": "agent", "next": "tools", "step": 2}]
     g = LangGraphParser().parse(str(write(tmp_path / "loop.jsonl", records)))
     assert g.get_edge("agent:agent", "agent:agent") is None
     assert edge(g, "agent:agent", "agent:tools") == (1, 0)
+    # one call from the entry transition into the node, plus one for the loop
+    assert g.nodes["agent:agent"].call_count == 2
+
+
+def test_unattributed_node_errors_are_reported_not_swallowed(tmp_path):
+    """A node failure no incoming transition can carry has to leave a trace.
+
+    The counter existed and was incremented but read nowhere, which looked
+    like traceability and was not (audit INV-008).
+    """
+    # One incoming transition, three failures: the first is charged to it, the
+    # other two have nothing left to be charged to.
+    records = [{"event": "on_chain_error", "name": "orphan",
+                "metadata": {"langgraph_node": "orphan"}, "error": "boom"},
+               {"event": "on_chain_error", "name": "orphan",
+                "metadata": {"langgraph_node": "orphan"}, "error": "boom"},
+               {"event": "on_chain_error", "name": "orphan",
+                "metadata": {"langgraph_node": "orphan"}, "error": "boom"}]
+    g = LangGraphParser().parse(str(write(tmp_path / "orphan.jsonl", records)))
+    assert g.nodes["graph"].metadata.get("unattributed_errors") == 2
+    # Absent, not zero, when nothing was lost.
+    clean = LangGraphParser().parse(str(write(tmp_path / "clean.jsonl",
+                                              [{"node": "a", "next": "b"}])))
+    assert "unattributed_errors" not in clean.nodes["graph"].metadata
 
 
 def test_repeated_records_for_one_node_do_not_inflate_transitions(tmp_path):
