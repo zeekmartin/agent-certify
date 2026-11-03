@@ -1,0 +1,12 @@
+{"event": "on_chain_start", "name": "ReActAgent", "run_id": "root", "timestamp": "2026-11-03T10:00:00Z", "data": {"input": {"messages": [{"role": "user", "content": "how fragile is this graph?"}]}}}
+{"event": "on_chain_start", "name": "agent", "run_id": "r1", "timestamp": "2026-11-03T10:00:01Z", "metadata": {"langgraph_node": "agent", "langgraph_step": 1, "langgraph_triggers": ["start:agent"]}}
+{"event": "on_chain_end", "name": "agent", "run_id": "r1", "timestamp": "2026-11-03T10:00:04Z", "metadata": {"langgraph_node": "agent", "langgraph_step": 1}}
+{"event": "on_tool_start", "name": "search", "run_id": "t1", "timestamp": "2026-11-03T10:00:05Z", "metadata": {"langgraph_node": "tools", "langgraph_step": 2, "langgraph_triggers": ["branch:agent:should_continue:tools"]}, "data": {"input": {"query": "fragility index"}}}
+{"event": "on_tool_end", "name": "search", "run_id": "t1", "timestamp": "2026-11-03T10:00:08Z", "metadata": {"langgraph_node": "tools", "langgraph_step": 2}}
+{"event": "on_tool_start", "name": "calculator", "run_id": "t2", "timestamp": "2026-11-03T10:00:09Z", "metadata": {"langgraph_node": "tools", "langgraph_step": 2}}
+{"event": "on_tool_error", "name": "calculator", "run_id": "t2", "timestamp": "2026-11-03T10:00:10Z", "metadata": {"langgraph_node": "tools", "langgraph_step": 2}, "data": {"error": "ZeroDivisionError"}}
+{"event": "on_chain_start", "name": "agent", "run_id": "r2", "timestamp": "2026-11-03T10:00:11Z", "metadata": {"langgraph_node": "agent", "langgraph_step": 3, "langgraph_triggers": ["tools"]}}
+{"event": "on_tool_start", "name": "search", "run_id": "t3", "timestamp": "2026-11-03T10:00:13Z", "metadata": {"langgraph_node": "tools", "langgraph_step": 4, "langgraph_triggers": ["branch:agent:should_continue:tools"]}}
+{"event": "on_tool_end", "name": "search", "run_id": "t3", "timestamp": "2026-11-03T10:00:15Z", "metadata": {"langgraph_node": "tools", "langgraph_step": 4}}
+{"event": "on_chain_start", "name": "respond", "run_id": "r3", "timestamp": "2026-11-03T10:00:16Z", "metadata": {"langgraph_node": "respond", "langgraph_step": 5, "langgraph_triggers": ["branch:agent:should_continue:respond"]}}
+{"event": "on_chain_end", "name": "ReActAgent", "run_id": "root", "timestamp": "2026-11-03T10:00:18Z", "data": {"output": {"messages": ["done"]}}}

@@ -20,8 +20,9 @@ pip install agent-certify
 ```
 
 The only dependencies are `numpy` and `cryptography`. The MCP server, the
-OpenTelemetry export and the Cursor parser need nothing else (the `[mcp]`,
-`[otel]`, `[cursor]` and `[all]` extras exist but are empty).
+OpenTelemetry export and the Cursor, CrewAI and LangGraph parsers need nothing
+else — no framework is imported to read its logs (the `[mcp]`, `[otel]`,
+`[cursor]` and `[all]` extras exist but are empty).
 
 ## Let your agent scan itself (MCP server)
 
@@ -146,6 +147,9 @@ agent-certify watch ... --otel                               # one span per scan
 
 # Other formats are detected from the content
 agent-certify scan path/to/repo/.agent-trace/                # Cursor Agent Trace
+agent-certify scan examples/crewai_run.json                  # CrewAI execution log
+agent-certify scan examples/langgraph_trace.jsonl            # LangGraph trace
+agent-certify learn logs/crew-runs/                          # a folder of crew runs
 
 # Structural baseline and drift detection
 agent-certify keygen ~/keys/signing.key                      # mode 600; keep it outside the repository
@@ -309,6 +313,56 @@ is reported with no z-score at the lower severity.
 
 For a directory, `scan` lists the anomaly count of each session in the
 session table.
+
+## How well does detection work?
+
+The checks above are measured, not asserted. `agent_certify.benchmark` injects
+faults whose answer is known into clean sessions and scores what comes back:
+
+```bash
+python scripts/benchmark.py                      # synthetic sessions, no logs needed
+python scripts/benchmark.py --sessions ~/.claude/projects/C--dev-myproject
+python scripts/benchmark.py --format json        # for CI
+```
+
+```
+Anomaly injection benchmark — 6 clean session(s) against a baseline of 6
+======================================================================================
+anomaly type    expected             trials  detected     rate  severity
+--------------------------------------------------------------------------------------
+new_tool        new_tool/crit             6         6   100.0%  6 critical
+error_spike     error_rate/warn           6         6   100.0%  6 critical
+new_agent       new_link/warn             6         6   100.0%  6 warning
+forbidden_tool  new_tool/crit             6         6   100.0%  6 critical
+volume_spike    (blind spot)              6         0     0.0%  not covered by any check
+--------------------------------------------------------------------------------------
+detection rate 100.0% (24/24)   false negatives 0.0%   false positives 0.0% (0/6 clean, 0 anomalies)
+blind spots: volume_spike — injected and not reported, because no check covers the fault
+```
+
+| Injection | Fault | Expected |
+|---|---|---|
+| `inject_new_tool` | a tool the baseline never saw | `new_tool`, critical |
+| `inject_error_spike` | existing calls failed until the error rate reaches `rate` | `error_rate`, warning or worse |
+| `inject_new_agent` | an agent of an unseen type calling a known tool | `new_link`, warning or worse |
+| `inject_volume_spike` | `factor`× the calls to one tool | **nothing** — a blind spot |
+| `inject_forbidden_tool` | a tool the operator rejected | `new_tool`, critical |
+
+Two things in that table are worth more than the 100%:
+
+- **The volume spike is a real blind spot.** No check reads call volume — only
+  whether a tool is known, who called it and how often it failed — so a session
+  that calls `Bash` 500 times instead of 50 passes clean. It is in the suite so
+  the gap is measured and visible rather than absent and flattering.
+- **The baseline is learned from sessions that are not the ones tested.**
+  `learn_holdout()` holds out every other session; a baseline learned from
+  exactly the sessions it is then run against reports nothing on them by
+  construction, and its false positive rate would mean nothing. A baseline that
+  does not fit does produce false positives, and the benchmark says so.
+
+The headline numbers come from synthetic sessions
+(`agent_certify.benchmark.synthetic`), which are deliberately regular. Run
+`--sessions` against your own logs for numbers that describe your system.
 
 ## Example workflow
 
@@ -526,9 +580,78 @@ detection (a new model, new files touched).
 
 Formats are detected from the content, not only the extension:
 `.agent-trace/traces.jsonl` is routed to the Cursor parser although it ends in
-`.jsonl`. A directory is scanned for every supported format: Claude Code
-sessions, `.agent-trace/` folders and `*.agent-trace` files (MCP server logs are
-left out; they enrich sessions via `--include-mcp`).
+`.jsonl`, and a CrewAI log is recognised whether it is `.json` or `.jsonl`. The
+first 20 records of a file are probed and the first one a parser claims decides;
+a file nothing claims is read as a Claude Code transcript, as before. A
+directory is scanned for every supported format: Claude Code sessions,
+`.agent-trace/` folders, `*.agent-trace` files, and CrewAI or LangGraph logs
+(MCP server logs are left out; they enrich sessions via `--include-mcp`). A
+`.json` file that holds no records of any format — `package.json`, say — is
+ignored.
+
+## CrewAI
+
+A [CrewAI](https://crewai.com) crew writes its execution log as JSON
+(`Crew(output_log_file="run.json")`), and its event bus is commonly dumped to
+JSONL; both are read, as is a single object wrapping the entries
+(`{"events": [...]}`). Records are matched on content, since the layout differs
+between CrewAI versions: an entry is read when it names an agent
+(`agent`, `agent_role`, `agent_name`, `role`, `agent_key`) and at least one of a
+task, a tool, a crew or a status.
+
+| Log content | Graph |
+|---|---|
+| the crew | `crew` (orchestrator) |
+| `inputs` on a kickoff | `human` → `crew` |
+| each agent role | `agent:<role>` |
+| a task assigned to an agent | `crew` → `agent:<role>`, weight = distinct tasks |
+| a tool call | `agent:<role>` → `tool:<name>` |
+| `Delegate work to coworker` / `Ask question to coworker` | `agent:<from>` → `agent:<coworker>`, besides the tool edge |
+| an `error`, or `status: failed` | error count on that edge |
+
+Node ids are the roles themselves (`agent:Researcher`), so an agent is the same
+node across runs and a baseline can be learned over a crew's history. A call is
+counted once whether the log holds its start, its completion, or both (paired by
+`tool_call_id`/`id`/`run_id`, or by agent + tool + task). Delegation is what
+gives these graphs structure: `crew → Writer`, `crew → Researcher` and
+`Writer → Researcher` close a triangle, so FI falls below 1 and the delegation
+links have a backup path while the tool calls do not.
+
+## LangGraph
+
+[LangGraph](https://langchain-ai.github.io/langgraph/) runs a state machine of
+named nodes. Three trace shapes are read, from `.json` or `.jsonl`:
+
+1. **Event stream** — `graph.astream_events(..., version="v2")`:
+   `metadata.langgraph_node` says which node a record belongs to and
+   `metadata.langgraph_triggers` which node handed control to it.
+2. **Debug stream** — `stream_mode="debug"`: `{"type": "task", "payload": {...}}`
+   and its `task_result`.
+3. **Plain transition records** — what a hand-rolled logger writes:
+   `{"node": "agent", "next": "tools", "tool_calls": [...]}`.
+
+| Trace content | Graph |
+|---|---|
+| the compiled graph | `graph` (orchestrator) |
+| the input it was invoked with | `human` → `graph` |
+| each node that ran | `agent:<node>` |
+| a state transition | `agent:<from>` → `agent:<to>`, weight = times control took that path |
+| `__start__` as the source | `graph` → `agent:<node>` |
+| a tool invocation | `agent:<node>` → `tool:<name>` |
+| `on_tool_error`, or an `error` field | error count on that edge |
+
+A node is modelled as an agent whose type is its name, so `agent:tools` is
+stable across runs. A node and the tools it calls stay separate: the `tools`
+node of a ReAct graph is `agent:tools`, the tool it ran is `tool:search`.
+`__start__` is the orchestrator, `__end__` is dropped (a sentinel, not a
+participant), and a node that loops back to itself adds no edge — the repeat
+shows in its call count.
+
+Transitions come from `langgraph_triggers`/`triggers`, then from an explicit
+`next`/`to`, and otherwise from the order the nodes ran in. That last fallback
+is a guess: parallel branches interleave, so a trace without triggers can show a
+transition the graph definition does not have. Traces from `astream_events` or
+`stream_mode="debug"` carry triggers and do not rely on it.
 
 ## How Claude Code sessions map to graphs
 
@@ -560,8 +683,8 @@ tools: each shared tool closes a triangle with the orchestrator.
 - [x] Claude Code (JSONL logs from ~/.claude/)
 - [x] Claude Code MCP server logs (`--include-mcp`)
 - [x] Cursor Agent Trace (code provenance; `.agent-trace/`)
-- [ ] CrewAI (planned)
-- [ ] LangGraph (planned)
+- [x] CrewAI (execution logs and event bus; `.json` / `.jsonl`)
+- [x] LangGraph (event stream, debug stream or plain transition records)
 - [ ] AutoGen (planned)
 - [ ] OTel traces (planned)
 

@@ -373,9 +373,21 @@ class AgentFIScanner:
         return self.structure.fi
 
     def _find_bridges(self) -> list[AgentEdge]:
-        """Edges whose removal disconnects the graph."""
+        """Edges whose removal disconnects the graph, one per undirected link.
+
+        A bridge is a property of the undirected link, so two nodes that invoke
+        each other (a LangGraph node and the node it loops back to) contribute
+        one bridge, not one per direction — otherwise the bridge count could
+        exceed the link count.
+        """
         keys = find_bridges(self.graph)
-        return [e for e in self.graph.edges if e.key in keys]
+        seen: set[frozenset] = set()
+        out = []
+        for e in self.graph.edges:
+            if e.key in keys and e.key not in seen:
+                seen.add(e.key)
+                out.append(e)
+        return out
 
     def _classify_nodes(self, base_fi: float) -> tuple[dict[str, str], dict[str, float], set[str]]:
         """Assign each node a structural level: high, medium or low.

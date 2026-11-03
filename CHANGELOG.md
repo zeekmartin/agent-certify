@@ -6,6 +6,71 @@ project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-03
+
+Two frameworks more, and the first measurement of what the anomaly checks
+actually catch — including one thing they do not.
+
+### Added
+- **CrewAI parser** (`agent_certify.parser.CrewAIParser`): execution logs
+  (`Crew(output_log_file=...)`) and event-bus dumps, as a JSON array, JSONL, or
+  one object wrapping the entries. Agents become `agent:<role>`, tasks become
+  `crew → agent:<role>` invocations, tool calls `agent:<role> → tool:<name>`,
+  and delegation (`Delegate work to coworker`, `Ask question to coworker`)
+  becomes an `agent → agent` link — which is what gives a crew's graph
+  triangles, and so an FI below 1
+- **LangGraph parser** (`agent_certify.parser.LangGraphParser`): three trace
+  shapes — the `astream_events` stream, `stream_mode="debug"`, and plain
+  `{"node": ..., "next": ...}` records. Each node becomes `agent:<node>`, state
+  transitions become `agent → agent` links (from `langgraph_triggers` when the
+  trace has them, then `next`/`to`, then the order the nodes ran in),
+  `__start__` is the orchestrator and `__end__` is dropped
+- **Anomaly injection benchmark** (`agent_certify.benchmark`):
+  `AnomalyInjector` (`inject_new_tool`, `inject_error_spike`,
+  `inject_new_agent`, `inject_volume_spike`, `inject_forbidden_tool`),
+  `BenchmarkRunner` reporting detection rate, false positive rate, false
+  negative rate and blind spots per anomaly type, varied synthetic sessions to
+  run it on, and `learn_holdout()` for the train/test split
+- `python -m agent_certify.benchmark` and `scripts/benchmark.py`
+  (`--sessions PATH` to benchmark real logs, `--format json` for CI)
+- `examples/crewai_run.json` and `examples/langgraph_trace.jsonl`: scannable
+  samples of both formats
+- `agent_certify.parser.base.read_records()` and `to_datetime()`: a JSON
+  document or JSONL file as one stream of records, and the timestamp spellings
+  the frameworks write (ISO 8601, a space separator, epoch seconds or
+  milliseconds)
+
+### Changed
+- auto-detection covers the new formats and accepts `.json` as well as
+  `.jsonl`. The first 20 records of a file are probed and the first one a
+  parser claims decides the format; a file nothing claims is still read as a
+  Claude Code transcript. A directory scan picks up CrewAI and LangGraph logs
+  by content, so a `.json` that holds no records (`package.json`) is ignored
+- `agent-certify scan`, `learn`, `watch` and `certify` take the new formats
+  through the same auto-detection, with no new flag. `watch` still finds the
+  *newest* session in a folder by `*.jsonl` only; point it at a CrewAI or
+  LangGraph file directly (a crew log is written once at the end of a run, so
+  there is nothing to tail)
+
+### Fixed
+- a bridge between two nodes that invoke each other was counted twice, once per
+  direction, so the bridge count could exceed the link count. Claude Code and
+  Cursor graphs have no reciprocal edges, which is why this never showed;
+  LangGraph loops (`agent → tools → agent`) produce them in every trace
+- a CrewAI record holding nothing but an agent name is no longer claimed by the
+  CrewAI parser (an empty join of its event fields read as truthy)
+
+### Notes
+- **Measured blind spot**: no check reads call *volume*, so a session that calls
+  one tool ten times as often as the baseline ever saw is reported as clean.
+  The benchmark injects that case and counts it as a blind spot rather than
+  leaving it out of the suite. Volume-aware detection is a v0.7.0 candidate
+- The benchmark's headline numbers (100% detection, 0% false positives over the
+  four covered types) come from synthetic sessions that are deliberately
+  regular; `--sessions` against real logs is what describes a real system
+- Neither new parser imports the framework it reads: both work on logs alone,
+  on any machine, with `numpy` and `cryptography` as the only dependencies
+
 ## [0.6.0] - 2026-11-03
 
 Feedback from Reddit and LinkedIn: a baseline that can only be re-learned is a

@@ -102,3 +102,13 @@ def test_bridges_on_long_path_no_recursion_limit():
 def test_star_sizes():
     for k in (1, 2, 7):
         assert AgentFIScanner(star(k)).scan().fi == 1.0
+
+
+def test_reciprocal_edges_count_as_one_bridge():
+    """Two nodes that invoke each other share one undirected link, so one bridge."""
+    g = _graph([("a", "b"), ("b", "a"), ("b", "c")])
+    result = AgentFIScanner(g).scan()
+    assert len(g.edges) == 3 and result.edge_count == 2        # three invocations, two links
+    assert len(find_bridges(g)) == 2
+    assert len(result.bridges) == 2 <= result.edge_count
+    assert {tuple(sorted((e.source, e.target))) for e in result.bridges} == {("a", "b"), ("b", "c")}

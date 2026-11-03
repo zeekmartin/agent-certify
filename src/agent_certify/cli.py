@@ -84,8 +84,8 @@ def load(path: str, include_mcp: bool = False) -> tuple[list[AgentGraph], AgentG
     """(per-session graphs, merged graph) for a session file or a directory.
 
     The format is detected from the content (Claude Code transcript, Cursor
-    Agent Trace, MCP server log). ``include_mcp`` adds each session's calls from
-    the MCP server logs.
+    Agent Trace, MCP server log, CrewAI execution log, LangGraph trace).
+    ``include_mcp`` adds each session's calls from the MCP server logs.
     """
     p = _path(path)
     parser = AutoParser()
@@ -95,7 +95,7 @@ def load(path: str, include_mcp: bool = False) -> tuple[list[AgentGraph], AgentG
         elif p.is_dir():
             graphs = parser.parse_directory(str(p))
             if not graphs:
-                raise SystemExit(f"agent-certify: no sessions (.jsonl, .agent-trace) found under {p}")
+                raise SystemExit(f"agent-certify: no sessions (.jsonl, .json, .agent-trace) found under {p}")
         else:
             raise SystemExit(f"agent-certify: {p} does not exist")
     except ValueError as exc:

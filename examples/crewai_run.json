@@ -1,0 +1,101 @@
+[
+  {
+    "timestamp": "2026-11-03 10:00:00",
+    "event": "crew_kickoff_started",
+    "crew": "ResearchCrew",
+    "inputs": {
+      "topic": "structural fragility of agent systems"
+    }
+  },
+  {
+    "timestamp": "2026-11-03 10:00:01",
+    "agent": "Researcher",
+    "task": "Find the 2026 numbers",
+    "status": "started"
+  },
+  {
+    "timestamp": "2026-11-03 10:00:04",
+    "agent_role": "Researcher",
+    "tool_name": "search_web",
+    "tool_args": {
+      "q": "agent fragility index 2026"
+    },
+    "status": "started",
+    "tool_call_id": "c1"
+  },
+  {
+    "timestamp": "2026-11-03 10:00:07",
+    "agent_role": "Researcher",
+    "tool_name": "search_web",
+    "status": "completed",
+    "tool_call_id": "c1"
+  },
+  {
+    "timestamp": "2026-11-03 10:00:09",
+    "event": "tool_usage_error",
+    "agent_role": "Researcher",
+    "tool_name": "search_web",
+    "error": "HTTP 503 from the search backend",
+    "tool_call_id": "c2"
+  },
+  {
+    "timestamp": "2026-11-03 10:00:12",
+    "agent_role": "Researcher",
+    "tool_name": "read_file",
+    "tool_args": {
+      "path": "notes.md"
+    },
+    "status": "completed"
+  },
+  {
+    "timestamp": "2026-11-03 10:00:20",
+    "agent": "Researcher",
+    "task": "Find the 2026 numbers",
+    "status": "completed"
+  },
+  {
+    "timestamp": "2026-11-03 10:00:21",
+    "agent": "Writer",
+    "task": "Write the summary",
+    "status": "started"
+  },
+  {
+    "timestamp": "2026-11-03 10:00:25",
+    "agent": "Writer",
+    "tool": "Delegate work to coworker",
+    "tool_args": {
+      "coworker": "Researcher",
+      "task": "check the figures"
+    },
+    "status": "completed"
+  },
+  {
+    "timestamp": "2026-11-03 10:00:33",
+    "agent": "Writer",
+    "tool_name": "read_file",
+    "tool_args": {
+      "path": "notes.md"
+    },
+    "status": "completed"
+  },
+  {
+    "timestamp": "2026-11-03 10:00:40",
+    "agent": "Writer",
+    "tool_name": "file_write",
+    "tool_args": {
+      "path": "summary.md"
+    },
+    "status": "completed"
+  },
+  {
+    "timestamp": "2026-11-03 10:00:41",
+    "agent": "Writer",
+    "task": "Write the summary",
+    "status": "completed"
+  },
+  {
+    "timestamp": "2026-11-03 10:00:42",
+    "event": "crew_kickoff_completed",
+    "crew": "ResearchCrew"
+  }
+]

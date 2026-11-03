@@ -107,11 +107,17 @@ Fixes the actionable findings of the 2026-10-27 security audit (45 findings: 3 h
   - Incremental `watch` from the last file offset (PRF-004)
   - Fuzz tests for the parsers; secret scanning in CI (TST-003, SCR-001)
   - Contributor licensing (CLA or DCO) before accepting outside contributions (LIC-001)
-- CrewAI parser: task execution logs → AgentGraph
-- LangGraph parser: graph state transitions → AgentGraph
 - AutoGen parser: message history → AgentGraph
-- Extend auto-detection to the new parsers
 - Cross-session trending: FI over time, tool usage patterns
+- Volume-aware anomaly detection: the v0.6.1 benchmark measures this as the one
+  blind spot in the current checks (a tool called 10x as often is not reported)
+
+Shipped in v0.6.1:
+
+- CrewAI parser: execution logs and event bus → AgentGraph
+- LangGraph parser: node transitions and tool calls → AgentGraph
+- Auto-detection extended to both, `.json` included
+- Anomaly injection benchmark: detection rate, false positives, blind spots
 
 ### v0.7.0 — Fleet & dashboard
 
