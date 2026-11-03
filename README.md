@@ -6,7 +6,7 @@
 [![Downloads](https://img.shields.io/pypi/dm/agent-certify)](https://pypi.org/project/agent-certify/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![Coverage](https://img.shields.io/badge/coverage-95%25-brightgreen)]()
-[![Tests](https://img.shields.io/badge/tests-306%20passed-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-504%20passed-brightgreen)]()
 
 Structural verification of multiagent systems.
 
@@ -126,6 +126,8 @@ agent-certify scan session.jsonl --no-baseline
 agent-certify baseline accept --tool Bash                    # stop flagging it
 agent-certify baseline reject --tool deploy_production       # keep flagging it, forever
 agent-certify baseline accept --link "agent:Build -> deploy_staging"   # that agent only
+agent-certify baseline accept --domain api.openai.com        # a destination you allow
+agent-certify baseline reject --domain "*.cn"                # a destination you never allow
 agent-certify baseline show                                  # what is on record
 
 # Policy: explicit rules, drafted from the baseline, edited by a human
@@ -259,6 +261,10 @@ agent-certify baseline reject --tool deploy_production
 # same tool still fires.
 agent-certify baseline accept --link "agent:Build -> deploy_staging"
 
+# A network destination, as a host or a wildcard over its subdomains.
+agent-certify baseline accept --domain api.openai.com
+agent-certify baseline reject --domain "*.cn"
+
 agent-certify baseline show            # or --format json
 ```
 
@@ -291,6 +297,9 @@ Rejection is deliberately asymmetric: there is no `reject --link`. A link you
 never want is a policy FORBIDDEN rule, which `scan --policy` enforces with a
 message you write yourself.
 
+`--domain` records the same kind of decision about a network destination, with
+the same precedence; see [Network destinations](#network-destinations).
+
 ## Anomaly detection
 
 | Check | Flags | Severity |
@@ -301,6 +310,9 @@ message you write yourself.
 | `error_rate` | error rate more than 2σ *above* the mean | warning; critical past 3σ |
 | `sub_agents` | more sub-agents than ever seen, or 2σ above the mean | warning; critical when above the max *and* past 3σ |
 | `node_count` | node count more than 2σ from the mean | info; warning past 3σ |
+| `call_volume_spike` | a tool, or one link to it, called more than 3σ above the mean | warning; critical past 5σ |
+| `new_domain` | a network destination never seen, and not accepted | critical |
+| `rejected_domain` | a destination matching a rejected pattern | critical |
 
 - **critical**: something structurally new or a large move toward fragility. Look now.
 - **warning**: a structural change worth a look; often explained by the task.
@@ -310,6 +322,43 @@ A falling FI means added redundancy (usually sub-agents sharing tools). That is
 a structural change, not a risk in itself, so it never goes past warning. When
 the baseline never varied on a metric (std 0), z is undefined: any difference
 is reported with no z-score at the lower severity.
+
+### Call volume
+
+`call_volume_spike` answers a question the other checks do not: not *whether* a
+tool was used but *how much*. A tool whose calls jump from 50 to 500 is known,
+reaches no new path and may fail no more often than usual — until v0.7.0 it
+passed every check, and the injection benchmark measured that as a blind spot
+for a release before this closed it.
+
+```
+[CRITICAL] Tool Bash called 487 times (baseline: 50 ± 1, 391.3σ)
+           called by claude
+```
+
+Volume is learned per tool **and per link**, and a link spike replaces the
+tool-level one when it adds something:
+
+```
+[CRITICAL] Link agent:Explore -> tool:Bash called 401 times (baseline: 1 ± 0, …)
+           agent:Explore alone accounts for this; other callers of tool:Bash
+           are compared separately
+```
+
+- a tool with one caller is reported as the tool: the link would say the same thing;
+- a tool with several callers is reported as the link that spiked, so the message
+  names who is responsible and the other callers are judged against their own
+  links. An agent calling a busy tool its usual number of times is not flagged
+  because somebody else hammered it.
+- a tool or link the baseline never saw has no volume to deviate from; that it is
+  new is `new_tool` / `new_link`'s business.
+- only increases are reported. A quiet session is not a risk.
+
+Per-tool statistics count only the sessions where the tool actually appeared —
+a tool used rarely but heavily would otherwise have a mean near zero and fire
+every time it ran at all. With no deviation to compare against (one session, or
+a count that never varied) twice the mean stands in for 3σ, reported at warning
+with no z-score.
 
 For a directory, `scan` lists the anomaly count of each session in the
 session table.
@@ -327,17 +376,17 @@ python scripts/benchmark.py --format json        # for CI
 
 ```
 Anomaly injection benchmark — 6 clean session(s) against a baseline of 6
-======================================================================================
-anomaly type    expected             trials  detected     rate  severity
---------------------------------------------------------------------------------------
-new_tool        new_tool/crit             6         6   100.0%  6 critical
-error_spike     error_rate/warn           6         6   100.0%  6 critical
-new_agent       new_link/warn             6         6   100.0%  6 warning
-forbidden_tool  new_tool/crit             6         6   100.0%  6 critical
-volume_spike    (blind spot)              6         0     0.0%  not covered by any check
---------------------------------------------------------------------------------------
-detection rate 100.0% (24/24)   false negatives 0.0%   false positives 0.0% (0/6 clean, 0 anomalies)
-blind spots: volume_spike — injected and not reported, because no check covers the fault
+============================================================================================
+anomaly type    expected                   trials  detected     rate  severity
+--------------------------------------------------------------------------------------------
+new_tool        new_tool/crit                   6         6   100.0%  6 critical
+error_spike     error_rate/warn                 6         6   100.0%  6 critical
+new_agent       new_link/warn                   6         6   100.0%  6 warning
+volume_spike    call_volume_spike/warn          6         6   100.0%  6 critical
+forbidden_tool  new_tool/crit                   6         6   100.0%  6 critical
+foreign_domain  new_domain/crit                 6         6   100.0%  6 critical
+--------------------------------------------------------------------------------------------
+detection rate 100.0% (36/36)   false negatives 0.0%   false positives 0.0% (0/6 clean, 0 anomalies)
 ```
 
 | Injection | Fault | Expected |
@@ -345,15 +394,18 @@ blind spots: volume_spike — injected and not reported, because no check covers
 | `inject_new_tool` | a tool the baseline never saw | `new_tool`, critical |
 | `inject_error_spike` | existing calls failed until the error rate reaches `rate` | `error_rate`, warning or worse |
 | `inject_new_agent` | an agent of an unseen type calling a known tool | `new_link`, warning or worse |
-| `inject_volume_spike` | `factor`× the calls to one tool | **nothing** — a blind spot |
+| `inject_volume_spike` | `factor`× the calls to one tool | `call_volume_spike`, warning or worse |
 | `inject_forbidden_tool` | a tool the operator rejected | `new_tool`, critical |
+| `inject_foreign_domain` | a destination the baseline never saw | `new_domain`, critical |
 
 Two things in that table are worth more than the 100%:
 
-- **The volume spike is a real blind spot.** No check reads call volume — only
-  whether a tool is known, who called it and how often it failed — so a session
-  that calls `Bash` 500 times instead of 50 passes clean. It is in the suite so
-  the gap is measured and visible rather than absent and flattering.
+- **The volume spike was a measured miss for a release.** v0.6.1 reported it as
+  a blind spot — no check read call volume — and v0.7.0's `call_volume_spike`
+  closed it. The case stays in the suite, which is the point of measuring a gap
+  instead of omitting it. The two faults added in v0.7.0 change nothing
+  structural at all: the volume spike adds no node, link or failure, and the
+  foreign destination leaves the topology byte-for-byte identical.
 - **The baseline is learned from sessions that are not the ones tested.**
   `learn_holdout()` holds out every other session; a baseline learned from
   exactly the sessions it is then run against reports nothing on them by
@@ -363,6 +415,69 @@ Two things in that table are worth more than the 100%:
 The headline numbers come from synthetic sessions
 (`agent_certify.benchmark.synthetic`), which are deliberately regular. Run
 `--sessions` against your own logs for numbers that describe your system.
+
+## Network destinations
+
+An agent graph says which tools ran. It does not say **where they went** — and
+if you have to answer where your data is processed, that is the question. An MCP
+server or HTTP tool repointed at another host changes the answer without
+changing the topology at all: same nodes, same links, same counts.
+
+So destinations are read from the session's own logs and compared against what
+the baseline learned:
+
+```bash
+agent-certify baseline accept --domain api.openai.com     # or "*.openai.com" for subdomains
+agent-certify baseline reject --domain "*.cn"
+agent-certify baseline reject --domain "*.alibaba.com"
+agent-certify baseline show                               # includes a domains section
+```
+
+```
+[CRITICAL] HTTP call to api.qwen.cn detected — not in baseline, matches rejected pattern *.cn
+           Baseline: rejected pattern *.cn
+           reached by tool:WebFetch — rejected, so it stays an anomaly across re-learns
+```
+
+**What counts as a destination.** Logs have no agreed field for this, so
+extraction is broad but not indiscriminate:
+
+- **any full URL** in a tool call's arguments — `https://api.openai.com/v1/chat`
+  gives `api.openai.com` (`http`, `https`, `ws`, `wss`, `ftp`, `ftps`);
+- **a bare host**, but only as the value of a field that names one: `url`,
+  `uri`, `endpoint`, `host`, `domain`, `base_url`, `server`, `origin`, `proxy`
+  and their plurals. `{"host": "db.internal"}` counts; an IP literal counts too.
+
+A domain-looking word *anywhere* is not a destination. That distinction is what
+keeps this usable: a session that reads a file mentioning `example.com`, or
+greps for `alibaba.com`, has contacted nobody, and reporting it as egress would
+bury the real finding. For the same reason a tool **result** is read only when
+that call's own arguments carried a URL — so a `WebFetch` records its redirects,
+while a `Read` of a document full of links records nothing.
+
+**Patterns, not addresses.** Nothing is resolved, in either direction. A
+pattern is matched against the name the agent used, which is the thing you made
+a decision about:
+
+| Pattern | Matches | Does not match |
+|---|---|---|
+| `api.openai.com` | that host only | `other.openai.com` |
+| `*.cn` | `api.unknown.cn`, `deep.sub.unknown.cn` | `cn`, `notcn` |
+| `*.alibaba.com` | `x.alibaba.com`, `x.y.alibaba.com` | `alibaba.com`, `evil-alibaba.com` |
+
+A wildcard covers subdomains only: the bare domain is a destination of its own
+and deserves its own decision. `.cn` is accepted as a spelling of `*.cn`, and a
+whole URL is accepted and reduced to its host. There is no `*` pattern — a host
+that is not in the baseline already fires as `new_domain`, so deny-by-default is
+the behaviour you get without asking for it.
+
+Decisions follow the same rules as tools: stored in `baseline.json`, carried
+forward by `learn`, last write wins, and **reject beats accept** — a rejected
+pattern fires for a host the baseline learned in every session.
+
+Destinations are read by the Claude Code, CrewAI, LangGraph and MCP-log parsers,
+appear in `scan --format json` as `seen_domains`, and are listed by
+`agent-certify learn` and `baseline show`.
 
 ## Example workflow
 

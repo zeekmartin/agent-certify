@@ -24,8 +24,21 @@ that:
                      *even after a re-learn that saw it in every session*, and
                      it is never promoted to a ``required_tool`` policy rule.
 ``accepted_links``   a (source role, target role) pair. Scoped: approving
-                     ``agent:Build -> tool:deploy_staging`` leaves
-                     ``agent:Test -> tool:deploy_staging`` firing.
+                     ``agent:Build -> deploy_staging`` leaves
+                     ``agent:Test -> deploy_staging`` firing.
+``accepted_domains`` a network destination that is allowed. Patterns, so
+                     ``*.openai.com`` covers the subdomains.
+``rejected_domains`` a destination that must never become normal, with the
+                     same precedence as a rejected tool: it fires even after a
+                     re-learn that saw it in every session.
+
+**Call volume.** A baseline also records how *much* each tool and each link is
+used: ``tool_call_volume`` and ``link_call_volume`` hold the mean, deviation
+and maximum of the per-session call counts. Only the sessions where a tool
+actually appeared count towards its statistics — a tool used heavily but
+rarely would otherwise have a mean near zero and fire every time it is used at
+all. ``sessions`` records how many that was, so a check can say what the
+numbers rest on.
 
 The sets are stored in the baseline file and copied forward by
 :func:`carry_overrides`, which ``agent-certify learn`` calls. A later
@@ -43,6 +56,7 @@ from pathlib import Path
 
 import numpy as np
 
+from agent_certify.domains import normalise_pattern
 from agent_certify.graph import AgentGraph
 from agent_certify.paths import ensure_state_dir
 from agent_certify.scanner import AgentFIScanner, ScanResult
@@ -53,6 +67,21 @@ DEFAULT_BASELINE_PATH = Path(".agent-certify") / "baseline.json"
 def node_role(graph: AgentGraph, node_id: str) -> str:
     """Stable identity of a node across sessions (agents by type); see :meth:`AgentGraph.role`."""
     return graph.role(node_id)
+
+
+#: Separator in a stored link key: ``"claude -> tool:Bash"``.
+LINK_ARROW = " -> "
+
+
+def link_key(source: str, target: str) -> str:
+    """A (source, target) link as the string a baseline file stores."""
+    return f"{source}{LINK_ARROW}{target}"
+
+
+def split_link_key(key: str) -> tuple[str, str]:
+    """``"claude -> tool:Bash"`` back into its two ends."""
+    source, _, target = key.partition(LINK_ARROW)
+    return source.strip(), target.strip()
 
 
 def session_features(graph: AgentGraph, scan: ScanResult | None = None) -> dict:
@@ -68,7 +97,24 @@ def session_features(graph: AgentGraph, scan: ScanResult | None = None) -> dict:
         "sub_agents": sum(1 for n in graph.nodes.values() if n.kind == "agent"),
         "error_rate": errors / graph.total_tool_calls if graph.total_tool_calls else None,
         "links": {(node_role(graph, e.source), node_role(graph, e.target)) for e in graph.edges},
+        "tool_volume": {n.name: n.call_count for n in graph.nodes.values() if n.kind == "tool"},
+        "link_volume": link_volume(graph),
+        "domains": set(graph.seen_domains),
     }
+
+
+def link_volume(graph: AgentGraph) -> dict[str, int]:
+    """Calls per link in one session, keyed by role, so it compares across sessions.
+
+    Links are keyed by role, like ``known_links``, so two sub-agents of the
+    same type calling the same tool count as one link used twice — which is
+    what makes the number comparable from session to session.
+    """
+    out: dict[str, int] = {}
+    for e in graph.edges:
+        key = link_key(node_role(graph, e.source), node_role(graph, e.target))
+        out[key] = out.get(key, 0) + e.weight
+    return out
 
 
 @dataclass
@@ -99,6 +145,8 @@ class Baseline:
     error_rate_mean: float               # errors / total_calls
     error_rate_std: float
 
+    # Call volume: tool name / link key -> {"mean", "std", "max", "sessions"}
+    # Defaulted, so a baseline written by <= 0.6.1 still loads.
     # Topology
     known_links: set[tuple[str, str]]    # all (source, target) role links seen
     bridge_count_mean: float
@@ -115,10 +163,27 @@ class Baseline:
     fi_min: float = 0.0
     fi_max: float = 0.0
     session_ids: list[str] = field(default_factory=list)
+    tool_call_volume: dict[str, dict] = field(default_factory=dict)
+    link_call_volume: dict[str, dict] = field(default_factory=dict)
+    known_domains: set[str] = field(default_factory=set)
+    accepted_domains: set[str] = field(default_factory=set)
+    rejected_domains: set[str] = field(default_factory=set)
 
     @property
     def has_overrides(self) -> bool:
-        return bool(self.accepted_tools or self.rejected_tools or self.accepted_links)
+        return bool(self.accepted_tools or self.rejected_tools or self.accepted_links
+                    or self.accepted_domains or self.rejected_domains)
+
+    def volume(self, scope: str, key: str) -> dict | None:
+        """Learned call volume for a tool name or a link key, or None when it was never seen.
+
+        ``scope`` is ``"tool"`` or ``"link"``. A key with no entry has no
+        baseline to deviate from: that it is new is the business of
+        ``new_tool`` / ``new_link``, not of a volume check.
+        """
+        source = self.tool_call_volume if scope == "tool" else self.link_call_volume
+        stats = source.get(key)
+        return stats if isinstance(stats, dict) else None
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -127,6 +192,11 @@ class Baseline:
         d["accepted_tools"] = sorted(self.accepted_tools)
         d["rejected_tools"] = sorted(self.rejected_tools)
         d["accepted_links"] = sorted(list(link) for link in self.accepted_links)
+        d["known_domains"] = sorted(self.known_domains)
+        d["accepted_domains"] = sorted(self.accepted_domains)
+        d["rejected_domains"] = sorted(self.rejected_domains)
+        d["tool_call_volume"] = dict(sorted(self.tool_call_volume.items()))
+        d["link_call_volume"] = dict(sorted(self.link_call_volume.items()))
         d["tool_frequency"] = dict(sorted(self.tool_frequency.items(), key=lambda kv: (-kv[1], kv[0])))
         return d
 
@@ -159,9 +229,17 @@ class Baseline:
             _check(isinstance(data["known_links"], list)
                    and all(isinstance(link, list) and len(link) == 2 and all(isinstance(x, str) for x in link)
                            for link in data["known_links"]))
-            for key in ("accepted_tools", "rejected_tools"):
+            for key in ("accepted_tools", "rejected_tools", "known_domains",
+                        "accepted_domains", "rejected_domains"):
                 if key in data:
                     _check(isinstance(data[key], list) and all(isinstance(t, str) for t in data[key]))
+            for key in ("tool_call_volume", "link_call_volume"):
+                if key in data:
+                    _check(isinstance(data[key], dict))
+                    for name, stats in data[key].items():
+                        _check(isinstance(name, str) and isinstance(stats, dict))
+                        _check(set(stats) <= set(_VOLUME_FIELDS))
+                        _check(all(_is_number(stats[f]) and stats[f] >= 0 for f in stats))
             if "accepted_links" in data:
                 _check(isinstance(data["accepted_links"], list)
                        and all(isinstance(link, list) and len(link) == 2
@@ -172,7 +250,8 @@ class Baseline:
             data = dict(data)
             data["known_tools"] = set(data["known_tools"])
             data["known_links"] = {tuple(link) for link in data["known_links"]}
-            for key in ("accepted_tools", "rejected_tools"):
+            for key in ("accepted_tools", "rejected_tools", "known_domains",
+                        "accepted_domains", "rejected_domains"):
                 if key in data:
                     data[key] = set(data[key])
             if "accepted_links" in data:
@@ -180,6 +259,30 @@ class Baseline:
             return cls(**data)
         except (TypeError, KeyError, AttributeError):
             raise ValueError("Invalid baseline format") from None
+
+
+_VOLUME_FIELDS = ("mean", "std", "max", "sessions")
+
+
+def volume_stats(counts: list[float]) -> dict:
+    """Mean, population deviation, maximum and session count of one key's per-session calls."""
+    mean, std = _mean_std(counts)
+    return {"mean": mean, "std": std, "max": float(max(counts)) if counts else 0.0,
+            "sessions": float(len(counts))}
+
+
+def _collect_volume(feats: list[dict], key: str) -> dict[str, dict]:
+    """Per-session counts for every tool (or link), as statistics.
+
+    A session that did not use a tool contributes nothing rather than a zero;
+    see the module docstring for why.
+    """
+    seen: dict[str, list[float]] = {}
+    for f in feats:
+        for name, count in f[key].items():
+            if count > 0:
+                seen.setdefault(name, []).append(float(count))
+    return {name: volume_stats(counts) for name, counts in sorted(seen.items())}
 
 
 def _mean_std(values: list[float]) -> tuple[float, float]:
@@ -260,6 +363,9 @@ class BaselineLearner:
             bridge_count_mean=bridges_mean, bridge_count_std=bridges_std,
             created_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             version=__version__,
+            tool_call_volume=_collect_volume(feats, "tool_volume"),
+            link_call_volume=_collect_volume(feats, "link_volume"),
+            known_domains=set().union(*(f["domains"] for f in feats)),
             fi_min=min(f["fi"] for f in feats),
             fi_max=max(f["fi"] for f in feats),
             session_ids=[g.session_id or "" for g in graphs],
@@ -358,6 +464,11 @@ def parse_link(text: str, baseline: Baseline | None = None) -> tuple[str, str]:
     return (normalise_endpoint(parts[0], baseline), normalise_endpoint(parts[1], baseline))
 
 
+def normalise_domain(raw: str) -> str:
+    """An operator's ``--domain`` argument as a stored pattern; see :func:`~agent_certify.domains.normalise_pattern`."""
+    return normalise_pattern(raw)
+
+
 def carry_overrides(new: Baseline, old: Baseline | None) -> Baseline:
     """Copy ``old``'s human decisions onto a freshly learned ``new`` baseline.
 
@@ -371,4 +482,6 @@ def carry_overrides(new: Baseline, old: Baseline | None) -> Baseline:
     new.accepted_tools = set(old.accepted_tools)
     new.rejected_tools = set(old.rejected_tools)
     new.accepted_links = set(old.accepted_links)
+    new.accepted_domains = set(old.accepted_domains)
+    new.rejected_domains = set(old.rejected_domains)
     return new

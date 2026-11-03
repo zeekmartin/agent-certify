@@ -32,6 +32,10 @@ TOOLS = ("Bash", "Read", "Edit", "Grep", "Write")
 #: Sub-agent types the baseline gets to learn.
 AGENT_TYPES = ("Explore", "Plan")
 
+#: The network destination every session reaches, so a baseline has one to
+#: learn and an injected foreign host is genuinely new.
+HOME_DOMAIN = "api.internal.example"
+
 _EPOCH = datetime(2026, 10, 1, 9, 0, tzinfo=timezone.utc)
 
 
@@ -87,6 +91,7 @@ def clean_session(index: int, seed: int | None = None) -> AgentGraph:
         g.add_call(aid, shared, count=2)
         calls += 3
 
+    g.record_domains(f"tool:{TOOLS[0]}", {HOME_DOMAIN})   # the one destination this system calls
     g.total_tool_calls = calls
     g.total_messages = calls + 2
     for e in range(index % 3):                        # 0, 1 or 2 failed calls: the baseline needs a spread

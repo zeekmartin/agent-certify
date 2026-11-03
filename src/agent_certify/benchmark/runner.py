@@ -127,11 +127,11 @@ class BenchmarkResult:
 
     def table(self) -> str:
         """The run as a summary table, for a terminal or a CI log."""
-        width = 86
+        width = 92
         head = (f"Anomaly injection benchmark — {self.clean_sessions} clean session(s) "
                 f"against a baseline of {self.learned_from}")
         lines = [head, "=" * width,
-                 f"{'anomaly type':<16}{'expected':<20}{'trials':>7}{'detected':>10}{'rate':>9}  severity",
+                 f"{'anomaly type':<16}{'expected':<26}{'trials':>7}{'detected':>10}{'rate':>9}  severity",
                  "-" * width]
         for t in self.per_type:
             if t.is_blind_spot:
@@ -139,7 +139,7 @@ class BenchmarkResult:
             else:
                 severity = ", ".join(f"{n} {s}" for s, n in sorted(t.severities.items(), key=lambda kv: SEVERITY_ORDER[kv[0]]))
                 severity = severity or "-"
-            lines.append(f"{t.kind:<16}{t.expected:<20}{t.trials:>7}{t.detected:>10}"
+            lines.append(f"{t.kind:<16}{t.expected:<26}{t.trials:>7}{t.detected:>10}"
                          f"{_pct(t.detection_rate):>9}  {severity}")
         plural = "y" if self.clean_anomalies == 1 else "ies"
         totals = (f"detection rate {_pct(self.detection_rate).strip()} ({self.detected}/{self.trials})   "

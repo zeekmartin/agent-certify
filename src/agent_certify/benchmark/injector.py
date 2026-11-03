@@ -16,18 +16,21 @@ injector               fault                              should be reported as
                        the error rate reaches ``rate``    warning or worse
 ``inject_new_agent``   an agent of an unseen type, with   ``new_link``, warning
                        a link to a known tool             or worse
-``inject_volume_spike````factor`` times as many calls to  *nothing* — no check
-                       one tool                           looks at call volume
+``inject_volume_spike````factor`` times as many calls to  ``call_volume_spike``,
+                       one tool                           warning or worse
 ``inject_forbidden_    a tool the operator rejected       ``new_tool``, critical
 tool``                 (needs :meth:`AnomalyInjector.
                        forbid` on the baseline)
+``inject_foreign_      a network destination the          ``new_domain``,
+domain``               baseline never saw                 critical
 =====================  =================================  =====================
 
-The volume spike is in the set deliberately. No check in
-:mod:`agent_certify.anomaly` looks at how *often* a tool is called — only at
-whether it is known, who called it, and how often it failed — so a session that
-calls ``Bash`` 500 times instead of 50 passes. The benchmark reports that as a
-measured blind spot rather than leaving it out and reporting a better number.
+The volume spike was a measured blind spot until v0.7.0: no check read how
+*often* a tool was called, only whether it was known, who called it and how
+often it failed, so a session calling ``Bash`` 500 times instead of 50 passed
+clean. The benchmark reported it as a miss for one release, and
+``call_volume_spike`` now closes it. The case stays in the suite, which is the
+point of keeping a measured gap rather than an omitted one.
 
 Injections are deterministic: errors are spread over the edges in a fixed
 order, so the same session always yields the same injected copy and a benchmark
@@ -44,15 +47,18 @@ from dataclasses import dataclass, field
 
 from agent_certify.anomaly import CRITICAL, WARNING
 from agent_certify.baseline import Baseline
+from agent_certify.domains import normalise_pattern
 from agent_certify.graph import AgentGraph
 
 #: Default names for the things injections add. They name the benchmark on
 #: purpose: if one shows up in a report of real traffic, it came from here.
 NEW_TOOL = "bench_unseen_tool"
 NEW_AGENT = "bench_unseen_agent"
+FOREIGN_DOMAIN = "api.unknown.cn"
 
 #: Every anomaly type the benchmark covers, in report order.
-ANOMALY_TYPES = ("new_tool", "error_spike", "new_agent", "volume_spike", "forbidden_tool")
+ANOMALY_TYPES = ("new_tool", "error_spike", "new_agent", "volume_spike", "forbidden_tool",
+                 "foreign_domain")
 
 
 @dataclass
@@ -95,9 +101,11 @@ class AnomalyInjector:
     so an injected graph is never mistaken for a real one.
     """
 
-    def __init__(self, new_tool: str = NEW_TOOL, new_agent: str = NEW_AGENT):
+    def __init__(self, new_tool: str = NEW_TOOL, new_agent: str = NEW_AGENT,
+                 foreign_domain: str = FOREIGN_DOMAIN):
         self.new_tool = new_tool
         self.new_agent = new_agent
+        self.foreign_domain = foreign_domain
 
     # ------------------------------------------------------------ injectors
     def inject_new_tool(self, session: AgentGraph, tool_name: str | None = None) -> AgentGraph:
@@ -175,8 +183,9 @@ class AnomalyInjector:
         """Multiply the calls to one tool by ``factor``, changing nothing else.
 
         ``tool`` is a node id or a display name (``"tool:Bash"`` or ``"Bash"``).
-        No check in :mod:`agent_certify.anomaly` reads call volume, so this is
-        expected to go unreported; the benchmark counts it as a blind spot.
+        Nothing else moves: no new node, no new link, no extra failure — the
+        only thing out of place is how much the tool is used, which is what
+        ``call_volume_spike`` reads.
         """
         if factor <= 1:
             raise ValueError(f"factor must be greater than 1, got {factor!r}")
@@ -223,7 +232,43 @@ class AnomalyInjector:
         g.nodes[nid].metadata["injected"] = "forbidden_tool"
         return g
 
+    def inject_foreign_domain(self, session: AgentGraph, domain: str | None = None) -> AgentGraph:
+        """Point an existing tool at a network destination the baseline never saw.
+
+        Nothing structural changes — the same tools, the same links, the same
+        call counts — which is the case for it: a tool reconfigured to talk to
+        another host looks identical in the topology, and only the recorded
+        destination gives it away.
+        """
+        name = (domain or self.foreign_domain).strip().lower()
+        if not name:
+            raise ValueError("domain is required: a foreign destination has to be named")
+        g = self._copy(session, "foreign_domain")
+        if name in g.seen_domains:
+            raise ValueError(f"{name!r} is already a destination in this session; pick one it does not use")
+        target = self._busiest_tool(g) or self._caller(g)
+        g.record_domains(target, {name})
+        g.nodes[target].metadata["injected"] = "foreign_domain"
+        return g
+
     # ------------------------------------------------------------- baseline
+    @staticmethod
+    def forbid_domain(baseline: Baseline, pattern: str) -> Baseline:
+        """A copy of ``baseline`` in which ``pattern`` is a rejected destination.
+
+        The destination is also marked known, for the same reason
+        :meth:`forbid` marks a rejected tool known: otherwise the anomaly
+        measured would be ``new_domain``, and the operator's decision would
+        never be exercised.
+        """
+        b = copy.deepcopy(baseline)
+        stored = normalise_pattern(pattern)
+        b.rejected_domains = set(b.rejected_domains) | {stored}
+        b.accepted_domains = set(b.accepted_domains) - {stored}
+        if not stored.startswith("*."):
+            b.known_domains = set(b.known_domains) | {stored}
+        return b
+
     @staticmethod
     def forbid(baseline: Baseline, tool_name: str) -> Baseline:
         """A copy of ``baseline`` in which ``tool_name`` is rejected *and* known.
@@ -256,12 +301,14 @@ class AnomalyInjector:
                   f"an agent of unseen type {self.new_agent!r} calling a known tool")
         busiest = self._busiest_tool(session)
         if busiest:
-            self._add(out, "volume_spike", lambda: self.inject_volume_spike(session, busiest, factor=10),
-                      None, None, f"10x the calls to {session.nodes[busiest].name!r} — no check reads call volume")
             name = session.nodes[busiest].name
+            self._add(out, "volume_spike", lambda: self.inject_volume_spike(session, busiest, factor=10),
+                      "call_volume_spike", WARNING, f"10x the calls to {name!r}")
             self._add(out, "forbidden_tool", lambda: self.inject_forbidden_tool(session, name),
                       "new_tool", CRITICAL, f"{name!r} rejected by the operator",
                       baseline=self.forbid(baseline, name))
+        self._add(out, "foreign_domain", lambda: self.inject_foreign_domain(session),
+                  "new_domain", CRITICAL, f"a tool pointed at {self.foreign_domain}")
         return out
 
     @staticmethod

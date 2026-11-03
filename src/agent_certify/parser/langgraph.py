@@ -71,6 +71,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
+from agent_certify.domains import extract_call_domains
 from agent_certify.graph import AgentGraph
 from agent_certify.parser.base import BaseParser, iso, read_records, to_datetime
 from agent_certify.paths import MAX_FILES
@@ -88,6 +89,7 @@ _TARGET_KEYS = ("next", "to", "next_node", "goto")
 _TRIGGER_KEYS = ("langgraph_triggers", "triggers")
 _ID_KEYS = ("run_id", "tool_call_id", "call_id", "id")
 _INPUT_KEYS = ("input", "inputs")
+_OUTPUT_KEYS = ("output", "outputs", "result", "error")
 
 _TOOL_EVENTS = ("on_tool_start", "on_tool_end", "on_tool_error", "on_tool_stream")
 _END_EVENTS = ("on_tool_end", "on_chain_end", "on_llm_end", "on_chat_model_end")
@@ -336,6 +338,7 @@ class LangGraphParser(BaseParser):
             self._tool_call(g, state, caller, name, _first(rec, _ID_KEYS),
                             self._failed(rec, _dict(rec.get("payload")), event),
                             finished=event in _END_EVENTS or _text(rec.get("status")) in ("end", "finished"))
+            self._destinations(g, rec, f"tool:{name}")
         for call in _as_list(rec.get("tool_calls")):
             entry = _dict(call)
             tool = _text(entry.get("name")) or _first(entry, _TOOL_KEYS)
@@ -343,6 +346,18 @@ class LangGraphParser(BaseParser):
                 state.tool_pending = True
                 self._tool_call(g, state, caller, tool, _first(entry, _ID_KEYS),
                                 bool(entry.get("error")), finished=False)
+                self._destinations(g, entry, f"tool:{tool}")
+
+    @staticmethod
+    def _destinations(g: AgentGraph, rec: dict, target: str) -> None:
+        """Network destinations of one tool record: its input, and its output when the input had one."""
+        data = _dict(rec.get("data"))
+        payload = {k: v for k, v in rec.items() if k != "data"}
+        arguments = [payload] + [data[k] for k in _INPUT_KEYS if k in data]
+        result = [data[k] for k in _OUTPUT_KEYS if k in data] or None
+        found = extract_call_domains(arguments, result)
+        if found:
+            g.record_domains(target, found)
 
     @staticmethod
     def _tool_call(g: AgentGraph, state: _State, caller: str, name: str, call_id: str,

@@ -6,6 +6,80 @@ project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-03
+
+The v0.6.1 benchmark measured one blind spot and reported it for a release
+rather than hiding it. This closes it, and adds the question a topology cannot
+answer on its own: not which tools ran, but **where they went**.
+
+### Added
+- **Call volume detection** (`call_volume_spike`): a baseline now learns how
+  *much* each tool and each link is used — mean, deviation, maximum and the
+  number of sessions behind them — and a session is compared against it.
+  Warning past 3σ above the mean, critical past 5σ:
+  `Tool Bash called 487 times (baseline: 50 ± 1, 391.3σ)`
+- Volume is learned **per link** as well as per tool, keyed by role like
+  `known_links`. A link spike replaces the tool-level one when it adds
+  something: a tool with several callers is reported as the link that spiked,
+  so the message names who is responsible, and an agent calling that tool its
+  usual number of times is not flagged because somebody else hammered it. A
+  tool with a single caller is reported as the tool, where the link would say
+  the same thing
+- **Network destination monitoring**: `agent_certify.domains` reads the hosts a
+  session's tool calls pointed at, and two new checks compare them against the
+  baseline — `new_domain` (never seen, not accepted) and `rejected_domain`
+  (matches a rejected pattern), both critical:
+  `HTTP call to api.qwen.cn detected — not in baseline, matches rejected pattern *.cn`
+- `agent-certify baseline accept --domain api.openai.com` and
+  `baseline reject --domain "*.cn"`, with `baseline show` listing both and the
+  destinations learned. Patterns follow the rules of the other decisions:
+  carried across re-learns, last write wins, and reject beats accept
+- `AgentGraph.seen_domains`, `.record_domains()` and `.domain_callers()`;
+  `Baseline.known_domains`, `.accepted_domains`, `.rejected_domains`,
+  `.tool_call_volume`, `.link_call_volume` and `.volume(scope, key)`;
+  `baseline.link_volume()` and `link_key()`
+- `AnomalyInjector.inject_foreign_domain()` and `.forbid_domain()`, so the
+  benchmark covers six fault types: **36/36 detected, no false positives, no
+  blind spots left**
+- 73 tests for the two features (`tests/test_volume.py`, `tests/test_domains.py`)
+
+### Changed
+- `agent-certify learn` reports the destinations it learned, and the Claude
+  Code, CrewAI, LangGraph and MCP-log parsers record them. `scan --format json`
+  carries them as `seen_domains`
+- the injection benchmark's `volume_spike` is now an expected *detection*
+  rather than an expected miss; the row stays in the table
+
+### Fixed
+- `extract_domains()` capped its result at `MAX_DOMAINS` across a payload but
+  not within a single string, so one argument holding hundreds of URLs could
+  return all of them
+
+### Notes
+- **Destinations are patterns, never addresses.** Nothing is resolved in either
+  direction: a hostname is never turned into an IP, and a pattern is matched
+  against the name the agent used, which is the thing the operator decided
+  about. An IP literal the agent itself used is kept as the destination it is
+- **A mention is not a destination.** A full URL counts wherever it appears in
+  a call's arguments; a bare host counts only as the value of a field that
+  names one (`url`, `endpoint`, `host`, `base_url`, …). A domain-looking word
+  anywhere else does not, and a tool's *result* is read only when that call's
+  own arguments carried a URL. So a `WebFetch` records its redirects while a
+  `Read` of a document full of links records nothing — without that
+  distinction, every grep for a domain would read as egress and bury the real
+  finding. The deliberate consequence: a destination that appears **only** in a
+  result of a non-network tool is not reported
+- Per-tool volume counts only the sessions where a tool appeared. Including the
+  sessions it was absent from would put its mean near zero and fire every time
+  it ran at all
+- Adding `seen_domains` to the graph does not change `graph_hash()`, which
+  covers node roles, kinds and links: **certificates issued before v0.7.0 still
+  verify**. Baselines and graphs written by 0.6.x load unchanged, with no
+  destinations and no volume statistics — until the next `learn`
+- There is no `*` domain pattern. A host that is not in the baseline already
+  fires as `new_domain`, so deny-by-default needs no pattern; `*` would also
+  outrank every `accept`, since reject wins
+
 ## [0.6.1] - 2026-11-03
 
 Two frameworks more, and the first measurement of what the anomaly checks

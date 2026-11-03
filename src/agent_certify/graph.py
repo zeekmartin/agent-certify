@@ -63,6 +63,7 @@ class AgentGraph:
     ended_at: str | None = None
     skipped_records: int = 0             # malformed / oversized records the parser could not read
     total_records: int = 0               # records the parser attempted (read or skipped)
+    seen_domains: set[str] = field(default_factory=set)   # network destinations the tool calls pointed at
     source: str | None = field(default=None, compare=False, repr=False)   # file it came from; not serialised
 
     _edge_index: dict = field(default=None, init=False, repr=False, compare=False)
@@ -129,6 +130,27 @@ class AgentGraph:
             edge.errors += 1
             self.nodes[target].error_count += 1
         return edge
+
+    def record_domains(self, node_id: str, domains) -> None:
+        """Note the network destinations one node's calls pointed at.
+
+        They are kept twice on purpose: on the graph as
+        :attr:`seen_domains`, which is what a baseline learns and an anomaly
+        check compares, and on the node, so a report can say *who* called a
+        host. Nothing is resolved; see :mod:`agent_certify.domains`.
+        """
+        domains = {d for d in domains if d}
+        if not domains:
+            return
+        if node_id not in self.nodes:
+            raise KeyError(f"unknown node {node_id!r}; add it with add_node() first")
+        self.seen_domains |= domains
+        seen = self.nodes[node_id].metadata.setdefault("domains", [])
+        seen[:] = sorted(set(seen) | domains)
+
+    def domain_callers(self, domain: str) -> list[str]:
+        """Ids of the nodes whose calls pointed at ``domain``."""
+        return sorted(nid for nid, n in self.nodes.items() if domain in (n.metadata.get("domains") or ()))
 
     def record_error(self, source: str, target: str) -> None:
         """Mark one already-recorded invocation of ``target`` by ``source`` as failed."""
@@ -247,6 +269,7 @@ class AgentGraph:
             "ended_at": self.ended_at,
             "skipped_records": self.skipped_records,
             "total_records": self.total_records,
+            "seen_domains": sorted(self.seen_domains),
             "nodes": [asdict(n) for n in self.nodes.values()],
             "edges": [asdict(e) for e in self.edges],
         }
@@ -264,10 +287,13 @@ class AgentGraph:
             _check(duration is None or (_is_number(duration) and duration >= 0))
             nodes, edges = data.get("nodes", []), data.get("edges", [])
             _check(isinstance(nodes, list) and isinstance(edges, list))
+            domains = data.get("seen_domains", [])          # absent in graphs written before v0.7
+            _check(isinstance(domains, list) and all(isinstance(d, str) for d in domains))
             g = cls(session_id=data.get("session_id"), project=data.get("project"),
                     total_messages=data.get("total_messages", 0), total_tool_calls=data.get("total_tool_calls", 0),
                     duration_seconds=duration, started_at=data.get("started_at"), ended_at=data.get("ended_at"),
-                    skipped_records=data.get("skipped_records", 0), total_records=data.get("total_records", 0))
+                    skipped_records=data.get("skipped_records", 0), total_records=data.get("total_records", 0),
+                    seen_domains=set(domains))
             for n in nodes:
                 _check(isinstance(n, dict) and set(n) <= set(AgentNode.__dataclass_fields__))
                 _check(isinstance(n.get("id"), str) and n.get("kind") in NODE_KINDS and isinstance(n.get("name"), str))
@@ -305,6 +331,7 @@ class AgentGraph:
                 else:
                     f.weight += e.weight
                     f.errors += e.errors
+            out.seen_domains |= g.seen_domains
             out.total_messages += g.total_messages
             out.total_tool_calls += g.total_tool_calls
             out.skipped_records += g.skipped_records

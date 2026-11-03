@@ -61,6 +61,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
+from agent_certify.domains import extract_call_domains
 from agent_certify.graph import AgentGraph
 from agent_certify.parser.base import BaseParser, iso, read_records, to_datetime
 from agent_certify.paths import MAX_FILES
@@ -77,6 +78,7 @@ _CREW_KEYS = ("crew", "crew_name")
 _ID_KEYS = ("tool_call_id", "call_id", "id", "run_id", "task_id")
 _EVENT_KEYS = ("event", "event_type", "type", "status")
 _ARG_KEYS = ("tool_args", "args", "arguments", "input", "tool_input")
+_RESULT_KEYS = ("output", "result", "observation", "response", "content", "tool_output")
 _COWORKER_KEYS = ("coworker", "co_worker", "agent")
 
 #: Tool names through which a CrewAI agent hands work to another agent.
@@ -270,6 +272,9 @@ class CrewAIParser(BaseParser):
             state.tool_calls += 1
             if status == "started":
                 state.open[key] = True
+        destinations = extract_call_domains(_call_payload(rec), _call_result(rec))
+        if destinations:
+            g.record_domains(target, destinations)
         self._delegation(g, rec, caller, tool)
 
     def _delegation(self, g: AgentGraph, rec: dict, caller: str, tool: str) -> None:
@@ -301,6 +306,17 @@ class CrewAIParser(BaseParser):
         tasks = g.nodes[agent].metadata.setdefault("tasks", [])
         if task not in tasks:
             tasks.append(task)
+
+
+def _call_payload(rec: dict) -> dict:
+    """A tool record without what the tool returned: the call, as the agent made it."""
+    return {k: v for k, v in rec.items() if k not in _RESULT_KEYS}
+
+
+def _call_result(rec: dict) -> dict | None:
+    """What the tool returned, if the record carries it."""
+    out = {k: rec[k] for k in _RESULT_KEYS if k in rec}
+    return out or None
 
 
 class _State:

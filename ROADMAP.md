@@ -109,8 +109,6 @@ Fixes the actionable findings of the 2026-10-27 security audit (45 findings: 3 h
   - Contributor licensing (CLA or DCO) before accepting outside contributions (LIC-001)
 - AutoGen parser: message history → AgentGraph
 - Cross-session trending: FI over time, tool usage patterns
-- Volume-aware anomaly detection: the v0.6.1 benchmark measures this as the one
-  blind spot in the current checks (a tool called 10x as often is not reported)
 
 Shipped in v0.6.1:
 
@@ -118,6 +116,14 @@ Shipped in v0.6.1:
 - LangGraph parser: node transitions and tool calls → AgentGraph
 - Auto-detection extended to both, `.json` included
 - Anomaly injection benchmark: detection rate, false positives, blind spots
+
+Shipped in v0.7.0:
+
+- Call volume detection, per tool and per link — the blind spot the v0.6.1
+  benchmark measured and reported for a release
+- Network destination monitoring: `seen_domains`, `accept`/`reject --domain`,
+  `new_domain` and `rejected_domain` checks
+- Benchmark at six fault types, 36/36 detected, no blind spots left
 
 ### v0.7.0 — Fleet & dashboard
 

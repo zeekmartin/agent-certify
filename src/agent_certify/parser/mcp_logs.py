@@ -34,6 +34,7 @@ from collections import defaultdict
 from collections.abc import Iterator
 from pathlib import Path
 
+from agent_certify.domains import domains_in_text
 from agent_certify.graph import AgentGraph
 from agent_certify.parser.base import BaseParser, decode_json
 from agent_certify.parser.claude_code import ORCHESTRATOR, tool_id
@@ -133,6 +134,8 @@ class MCPLogsParser(BaseParser):
                 g.total_tool_calls += 1
             elif g.get_edge(ORCHESTRATOR, nid):
                 g.record_error(ORCHESTRATOR, nid)
+            if ev.get("domains"):
+                g.record_domains(nid, ev["domains"])
         sessions.discard(None)
         g.skipped_records = self.skipped_lines
         g.total_records = self.records_seen
@@ -242,5 +245,6 @@ class MCPLogsParser(BaseParser):
             if not m:
                 m, kind = _FAIL.match(msg), "error"
             if m:
+                # A server's own log line may name the endpoint it talked to.
                 yield {"kind": kind, "tool": m.group("tool"), "session": rec.get("sessionId"),
-                       "ts": rec.get("timestamp")}
+                       "ts": rec.get("timestamp"), "domains": domains_in_text(msg)}

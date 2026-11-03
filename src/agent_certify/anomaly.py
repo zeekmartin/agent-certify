@@ -18,7 +18,31 @@ error_rate      error rate more than 2 sigma *above*       warning; critical pas
 sub_agents      more sub-agents than ever seen, or 2 sigma  warning; critical when
                 above the mean                             above max *and* 3 sigma
 node_count      node count more than 2 sigma from mean     info; warning past 3
+call_volume_    a tool, or one link to it, called more      warning past 3 sigma;
+spike           often than 3 sigma above the mean          critical past 5
+new_domain      a network destination never seen, and not   critical
+                accepted
+rejected_domain a destination matching a rejected pattern  critical
 ==============  =========================================  ======================
+
+**Call volume** answers a question the other checks do not: not *whether* a
+tool was used but *how much*. A tool whose calls jump from 50 to 500 is known,
+reaches no new path and may fail no more often than usual, so until v0.7 it
+passed every check — the injection benchmark measured that blind spot before
+this check closed it.
+
+Volume is compared per link first and per tool second, and a tool is not
+reported when a link to it already is: if one agent is responsible, the
+message should name that agent rather than the tool everyone shares. A tool or
+link the baseline never saw has no volume to deviate from, and is the business
+of ``new_tool`` / ``new_link`` instead. Only increases are reported — a quiet
+session is not a risk.
+
+**Network destinations** come from the session's own logs (see
+:mod:`agent_certify.domains`). ``accepted_domains`` and ``rejected_domains``
+are patterns, with the precedence that applies to tools: a rejected pattern
+fires even for a host the baseline has learned, and even if a pattern accepts
+it too.
 
 Three baseline overrides change what ``new_tool`` and ``new_link`` consider
 normal, and they are decisions rather than statistics, so they win over what was
@@ -38,14 +62,25 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
-from agent_certify.baseline import Baseline, node_role
+from agent_certify.baseline import Baseline, link_volume, node_role
+from agent_certify.domains import matching_pattern
 from agent_certify.graph import AgentGraph
 from agent_certify.scanner import ScanResult
 
 CRITICAL, WARNING, INFO = "critical", "warning", "info"
 _ORDER = {CRITICAL: 0, WARNING: 1, INFO: 2}
-_CATEGORICAL = {"new_tool", "new_link"}
+_CATEGORICAL = {"new_tool", "new_link", "new_domain", "rejected_domain"}
 _EPS = 1e-9
+
+#: Call volume past this many deviations above the mean is a warning, and past
+#: :data:`VOLUME_SIGMA_CRITICAL` a critical.
+VOLUME_SIGMA_WARNING = 3.0
+VOLUME_SIGMA_CRITICAL = 5.0
+
+#: When a baseline never varied on a key (one session, or always the same
+#: count), there is no sigma to compare against. A multiple of the mean stands
+#: in for it: the same fallback the other checks make at the lower severity.
+VOLUME_RATIO_WARNING = 2.0
 
 
 @dataclass
@@ -136,6 +171,8 @@ class AnomalyDetector:
         anomalies += self._check_error_rate(graph)
         anomalies += self._check_sub_agents(graph)
         anomalies += self._check_node_count(graph)
+        anomalies += self._check_call_volume(graph)
+        anomalies += self._check_domains(graph)
         anomalies.sort(key=lambda a: _ORDER[a.severity])
         return AnomalyReport(session_id=graph.session_id or "", anomalies=anomalies,
                              baseline_source=self.source, learned_from=self.baseline.learned_from)
@@ -272,6 +309,109 @@ class AnomalyDetector:
                         f"max seen {b.max_sub_agents_seen})",
                         count, f"{_pm(b.sub_agent_count_mean, b.sub_agent_count_std)}, max {b.max_sub_agents_seen}",
                         z, f"Types: {', '.join(types)}")]
+
+    # ------------------------------------------------------------ volume
+    def _volume_verdict(self, count: int, stats: dict) -> tuple[str, float | None, str] | None:
+        """(severity, z, how the baseline reads) for a count, or None when it is normal.
+
+        Past :data:`VOLUME_SIGMA_WARNING` deviations above the mean it is a
+        warning, past :data:`VOLUME_SIGMA_CRITICAL` a critical. With no
+        deviation to compare against, :data:`VOLUME_RATIO_WARNING` times the
+        mean stands in, reported at warning with no z-score — the same thing
+        the other checks do when the baseline never varied.
+        """
+        mean, std = float(stats.get("mean", 0.0)), float(stats.get("std", 0.0))
+        sessions = int(stats.get("sessions", 0) or 0)
+        if std > _EPS:
+            z = (count - mean) / std
+            if z <= VOLUME_SIGMA_WARNING:
+                return None
+            severity = CRITICAL if z >= VOLUME_SIGMA_CRITICAL else WARNING
+            return severity, z, f"{mean:.0f} ± {std:.0f}"
+        if mean <= _EPS or count <= VOLUME_RATIO_WARNING * mean:
+            return None
+        return WARNING, None, (f"{mean:.0f} in {sessions} session(s), no variation to compare against; "
+                               f"flagged past {VOLUME_RATIO_WARNING:g}x")
+
+    def _volume_anomaly(self, subject: str, count: int, stats: dict, detail: str) -> Anomaly | None:
+        verdict = self._volume_verdict(count, stats)
+        if verdict is None:
+            return None
+        severity, z, reference = verdict
+        sigma = f", {z:.1f}σ" if z is not None else ""
+        return Anomaly(severity, "call_volume_spike",
+                       f"{subject} called {count} times (baseline: {reference}{sigma})",
+                       count, reference, z, detail)
+
+    def _check_call_volume(self, graph: AgentGraph) -> list[Anomaly]:
+        """Flag tools and links used far more than the baseline ever saw.
+
+        Links are checked first, and a link spike replaces the tool-level one
+        only when it adds something: if a tool has several callers, naming the
+        one responsible is the useful message, and the innocent callers are
+        still compared against their own links. When a tool has a single
+        caller, the two carry identical information and the anomaly is reported
+        about the tool.
+        """
+        callers: dict[str, set[str]] = {}
+        for e in graph.edges:
+            callers.setdefault(e.target, set()).add(node_role(graph, e.source))
+        out, explained = [], set()
+        for key, count in sorted(link_volume(graph).items()):
+            stats = self.baseline.volume("link", key)
+            if stats is None:
+                continue                       # an unlearned link is new_link's business
+            source, target = key.split(" -> ", 1)
+            if target.startswith("tool:") and len(callers.get(target, ())) < 2:
+                continue                       # one caller: the tool-level anomaly says the same thing
+            anomaly = self._volume_anomaly(f"Link {key}", count, stats,
+                                           f"{source} alone accounts for this; other callers of "
+                                           f"{target} are compared separately")
+            if anomaly is not None:
+                out.append(anomaly)
+                if target.startswith("tool:"):
+                    explained.add(target[len("tool:"):])
+        for node in sorted(graph.nodes.values(), key=lambda n: n.id):
+            if node.kind != "tool" or node.name in explained:
+                continue
+            stats = self.baseline.volume("tool", node.name)
+            if stats is None:
+                continue                       # an unlearned tool is new_tool's business
+            callers = sorted({e.source for e in graph.edges if e.target == node.id})
+            anomaly = self._volume_anomaly(f"Tool {node.name}", node.call_count, stats,
+                                           f"called by {', '.join(callers) or '-'}")
+            if anomaly is not None:
+                out.append(anomaly)
+        return out
+
+    # ------------------------------------------------------------ domains
+    def _check_domains(self, graph: AgentGraph) -> list[Anomaly]:
+        """Flag network destinations that are new, or that an operator rejected.
+
+        A rejected pattern wins over everything learned or accepted, exactly as
+        a rejected tool does: the point of rejecting a destination is that no
+        amount of traffic to it makes it normal.
+        """
+        b = self.baseline
+        out = []
+        for domain in sorted(graph.seen_domains):
+            callers = graph.domain_callers(domain)
+            detail = f"reached by {', '.join(callers)}" if callers else "no caller recorded"
+            rejected = matching_pattern(domain, b.rejected_domains)
+            if rejected:
+                unknown = "not in baseline, " if domain not in b.known_domains else ""
+                out.append(Anomaly(CRITICAL, "rejected_domain",
+                                   f"HTTP call to {domain} detected — {unknown}"
+                                   f"matches rejected pattern {rejected}",
+                                   domain, f"rejected pattern {rejected}", None,
+                                   detail + " — rejected, so it stays an anomaly across re-learns"))
+                continue
+            if domain in b.known_domains or matching_pattern(domain, b.accepted_domains):
+                continue
+            out.append(Anomaly(CRITICAL, "new_domain",
+                               f"HTTP call to {domain} detected — not in baseline",
+                               domain, f"not among {len(b.known_domains)} known destination(s)", None, detail))
+        return out
 
     def _check_node_count(self, graph: AgentGraph) -> list[Anomaly]:
         """Flag if total node count deviates > 2 std. Info past 2 sigma, warning past 3."""

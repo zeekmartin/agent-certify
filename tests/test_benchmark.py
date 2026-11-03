@@ -164,13 +164,27 @@ def test_injections_cover_every_anomaly_type(injector, session, split):
     _, _, baseline = split
     kinds = [i.kind for i in injector.injections(session, baseline)]
     assert sorted(kinds) == sorted(ANOMALY_TYPES)
+    assert len(ANOMALY_TYPES) == 6
+    assert not any(i.is_blind_spot for i in injector.injections(session, baseline))
+
+
+def test_foreign_domain_injector_guards(injector, session):
+    graph = injector.inject_foreign_domain(session, "API.Unknown.CN")
+    assert "api.unknown.cn" in graph.seen_domains
+    assert session.seen_domains == {"api.internal.example"}      # the clean session is untouched
+    with pytest.raises(ValueError, match="already a destination"):
+        injector.inject_foreign_domain(graph, "api.unknown.cn")
+    with pytest.raises(ValueError, match="domain is required"):
+        injector.inject_foreign_domain(session, "  ")
 
 
 @pytest.mark.parametrize("kind,category,severity", [
     ("new_tool", "new_tool", CRITICAL),
     ("error_spike", "error_rate", WARNING),
     ("new_agent", "new_link", WARNING),
+    ("volume_spike", "call_volume_spike", WARNING),
     ("forbidden_tool", "new_tool", CRITICAL),
+    ("foreign_domain", "new_domain", CRITICAL),
 ])
 def test_injection_produces_the_expected_anomaly_and_severity(split, injector, kind, category, severity):
     """The point of the benchmark: a known fault comes back as the anomaly it should."""
@@ -198,14 +212,49 @@ def test_forbidden_tool_is_reported_as_rejected_not_as_new(split, injector):
     assert not BenchmarkRunner(test, baseline).detect(injection.graph, baseline).anomalies
 
 
-def test_volume_spike_is_a_measured_blind_spot(split, injector):
-    """No check reads call volume, so 10x the traffic is reported as nothing. Documented, not hidden."""
+def test_volume_spike_was_the_blind_spot_and_is_now_caught(split, injector):
+    """The fault v0.6.1 measured as a miss. It is now reported, and nothing else about it moved."""
     _, test, baseline = split
     runner = BenchmarkRunner(test, baseline)
     for session in test:
         injection = next(i for i in injector.injections(session, baseline) if i.kind == "volume_spike")
-        assert injection.is_blind_spot and injection.expected_category is None
-        assert runner.detect(injection.graph, baseline).anomalies == []
+        assert not injection.is_blind_spot
+        report = runner.detect(injection.graph, baseline)
+        hit = next(a for a in report.anomalies if a.category == "call_volume_spike")
+        assert hit.severity == CRITICAL and hit.z_score > 5        # 10x is far past 5 sigma
+        assert "called" in hit.message and "times" in hit.message
+        # The injection adds no node, no link and no failure: volume is the only thing out of place.
+        assert sorted(injection.graph.nodes) == sorted(session.nodes)
+        assert {a.category for a in report.anomalies} == {"call_volume_spike"}
+
+
+def test_foreign_domain_is_detected_without_any_structural_change(split, injector):
+    """A tool pointed at another host looks identical in the topology."""
+    _, test, baseline = split
+    runner = BenchmarkRunner(test, baseline)
+    for session in test:
+        injection = next(i for i in injector.injections(session, baseline) if i.kind == "foreign_domain")
+        graph = injection.graph
+        assert sorted(graph.nodes) == sorted(session.nodes)
+        assert {(e.source, e.target, e.weight) for e in graph.edges} == \
+               {(e.source, e.target, e.weight) for e in session.edges}
+        report = runner.detect(graph, baseline)
+        hit = next(a for a in report.anomalies if a.category == "new_domain")
+        assert hit.severity == CRITICAL and "api.unknown.cn" in hit.message
+        assert {a.category for a in report.anomalies} == {"new_domain"}
+
+
+def test_forbidden_domain_fires_for_a_learned_host(split, injector):
+    """forbid_domain() exercises the operator's decision, not new_domain."""
+    _, test, baseline = split
+    from agent_certify.benchmark.synthetic import HOME_DOMAIN
+
+    rejected = injector.forbid_domain(baseline, HOME_DOMAIN)
+    report = BenchmarkRunner(test, baseline).detect(test[0], rejected)
+    hit = next(a for a in report.anomalies if a.category == "rejected_domain")
+    assert hit.severity == CRITICAL and HOME_DOMAIN in hit.message
+    assert HOME_DOMAIN not in baseline.rejected_domains       # the original baseline is untouched
+    assert not BenchmarkRunner(test, baseline).detect(test[0], baseline).anomalies
 
 
 # ------------------------------------------------------------------- runner
@@ -214,9 +263,9 @@ def test_runner_scores_the_full_suite(split):
     result = BenchmarkRunner(test, baseline).run()
     assert {t.kind for t in result.per_type} == set(ANOMALY_TYPES)
     assert result.detection_rate == 1.0 and result.false_negative_rate == 0.0
-    assert result.trials == 4 * len(test)                 # four covered types per session
+    assert result.trials == len(ANOMALY_TYPES) * len(test)    # every type is covered by a check now
     assert result.false_positive_rate == 0.0 and result.clean_flagged == 0
-    assert result.blind_spots == ["volume_spike"]
+    assert result.blind_spots == []                           # none left as of v0.7.0
     assert result.learned_from == baseline.learned_from
     for t in result.covered:
         assert t.detected == t.trials and t.missed == [] and sum(t.severities.values()) == t.trials
@@ -245,9 +294,9 @@ def test_result_table_and_dict(split):
     assert "Anomaly injection benchmark" in table and "detection rate 100.0%" in table
     for kind in ANOMALY_TYPES:
         assert kind in table
-    assert "blind spots: volume_spike" in table
+    assert "blind spots" not in table                     # the line only appears when there are some
     data = json.loads(json.dumps(result.to_dict()))       # must be JSON-serialisable as it stands
-    assert data["detection_rate"] == 1.0 and data["blind_spots"] == ["volume_spike"]
+    assert data["detection_rate"] == 1.0 and data["blind_spots"] == []
     assert len(data["per_type"]) == len(ANOMALY_TYPES)
 
 
@@ -280,13 +329,15 @@ def test_cli_table(capsys):
     assert main([]) == 0
     out = capsys.readouterr().out
     assert "Anomaly injection benchmark" in out and "volume_spike" in out
+    assert "foreign_domain" in out
 
 
 def test_cli_json(capsys):
     assert main(["--count", "6", "--format", "json"]) == 0
     data = json.loads(capsys.readouterr().out)
     assert data["sessions"] == 6 and data["learned_from"] == 3
-    assert data["detection_rate"] == 1.0 and data["blind_spots"] == ["volume_spike"]
+    assert data["detection_rate"] == 1.0 and data["blind_spots"] == []
+    assert len(data["per_type"]) == 6
 
 
 def test_cli_on_real_sessions(capsys, session_dir):

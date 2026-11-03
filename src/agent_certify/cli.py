@@ -11,8 +11,8 @@
                         [--baseline FILE | --no-baseline] [--policy FILE | --no-policy] [--perspective P]
     agent-certify learn <session.jsonl | dir>... [-o FILE]
     agent-certify suggest-policy [--baseline FILE] [-o FILE] [--force]
-    agent-certify baseline accept (--tool NAME | --link "SRC -> DST") [--baseline FILE]
-    agent-certify baseline reject --tool NAME [--baseline FILE]
+    agent-certify baseline accept (--tool NAME | --link "SRC -> DST" | --domain HOST) [--baseline FILE]
+    agent-certify baseline reject (--tool NAME | --domain "*.cn") [--baseline FILE]
     agent-certify baseline show [--baseline FILE]
     agent-certify mcp                     # MCP server on stdio
     (scan and watch take --otel / --otel-stdout to emit OpenTelemetry spans)
@@ -57,6 +57,7 @@ from agent_certify.baseline import (
 )
 from agent_certify.blast import BlastRadiusAnalyzer
 from agent_certify.certificate import DEFAULT_VALIDITY_DAYS, AgentCertificate, _public_key_hex, generate_keypair
+from agent_certify.domains import domain_matches, normalise_pattern
 from agent_certify.graph import AgentGraph
 from agent_certify.mcp_server import AgentCertifyMCPServer
 from agent_certify.otel import DEFAULT_TRACES_PATH, OTelExporter
@@ -257,6 +258,13 @@ def _fmt_period(start: str, end: str) -> str:
     return f"{day(a)}, {a.year} — {day(b)}, {b.year}"
 
 
+def _fmt_domains(domains: set[str], limit: int = 6) -> str:
+    """The destinations a baseline learned, a few of them at most."""
+    shown = sorted(domains)[:limit]
+    more = len(domains) - len(shown)
+    return ", ".join(shown) + (f", +{more} more" if more > 0 else "")
+
+
 def _learn_report(b: Baseline, saved: Path) -> str:
     tools = sorted(b.tool_frequency.items(), key=lambda kv: (-kv[1], kv[0].lower()))
     tool_text = textwrap.fill(", ".join(f"{t} ({f:.0%})" for t, f in tools), width=88,
@@ -278,6 +286,8 @@ def _learn_report(b: Baseline, saved: Path) -> str:
          f"(max seen: {b.max_sub_agents_seen})"),
         f"Error rate:    {b.error_rate_mean:.1%} ± {b.error_rate_std:.1%}",
         f"Known links:   {len(b.known_links)}",
+        *([f"Destinations:  {len(b.known_domains)}  ({_fmt_domains(b.known_domains)})"]
+          if b.known_domains else []),
         "",
         f"Saved to {saved.as_posix()}",
     ])
@@ -531,8 +541,19 @@ def cmd_learn(args) -> int:
 
 # --------------------------------------------------------------- baseline edits
 def _override_counts(b: Baseline) -> str:
-    return (f"{len(b.accepted_tools)} accepted tool(s), {len(b.rejected_tools)} rejected, "
-            f"{len(b.accepted_links)} accepted link(s)")
+    counts = [f"{len(b.accepted_tools)} accepted tool(s)", f"{len(b.rejected_tools)} rejected",
+              f"{len(b.accepted_links)} accepted link(s)"]
+    if b.accepted_domains or b.rejected_domains:
+        counts.append(f"{len(b.accepted_domains)} accepted domain(s), {len(b.rejected_domains)} rejected")
+    return ", ".join(counts)
+
+
+def _domain(raw: str) -> str:
+    """One ``--domain`` argument as a stored pattern, or a usage error."""
+    try:
+        return normalise_pattern(raw)
+    except ValueError as exc:
+        raise SystemExit(f"agent-certify: {exc}") from None
 
 
 def _load_baseline_for_edit(args) -> tuple[Baseline, Path]:
@@ -553,9 +574,9 @@ def _save_baseline(baseline: Baseline, path: Path) -> None:
 
 def cmd_baseline_accept(args) -> int:
     """Whitelist a tool, or one scoped invocation link, without re-learning."""
-    if not (args.tool or args.link):
-        raise SystemExit('agent-certify: nothing to accept; pass --tool NAME or '
-                         '--link "SRC -> DST"')
+    if not (args.tool or args.link or args.domain):
+        raise SystemExit('agent-certify: nothing to accept; pass --tool NAME, '
+                         '--link "SRC -> DST" or --domain HOST')
     baseline, path = _load_baseline_for_edit(args)
     lines = []
     for raw in args.tool or []:
@@ -576,6 +597,13 @@ def cmd_baseline_accept(args) -> int:
         baseline.accepted_links.add(link)
         lines.append(f"  accepted link: {link[0]} -> {link[1]}"
                      "  (scoped: other callers of that target still fire)")
+    for raw in args.domain or []:
+        pattern = _domain(raw)
+        was_rejected = pattern in baseline.rejected_domains
+        baseline.rejected_domains.discard(pattern)
+        baseline.accepted_domains.add(pattern)
+        lines.append(f"  accepted domain: {pattern}"
+                     + ("  (was rejected; the newer decision wins)" if was_rejected else ""))
     _save_baseline(baseline, path)
     print(f"Updated {path.as_posix()}")
     print("\n".join(lines))
@@ -584,7 +612,9 @@ def cmd_baseline_accept(args) -> int:
 
 
 def cmd_baseline_reject(args) -> int:
-    """Permanently exclude a tool from becoming normal, across re-learns."""
+    """Permanently exclude a tool or a destination from becoming normal, across re-learns."""
+    if not (args.tool or args.domain):
+        raise SystemExit('agent-certify: nothing to reject; pass --tool NAME or --domain "*.cn"')
     baseline, path = _load_baseline_for_edit(args)
     lines = []
     for raw in args.tool or []:
@@ -599,6 +629,14 @@ def cmd_baseline_reject(args) -> int:
         if name in baseline.known_tools:
             note += "  (already learned as normal — it will now fire anyway)"
         lines.append(f"  rejected tool: {name}{note}")
+    for raw in args.domain or []:
+        pattern = _domain(raw)
+        note = "  (was accepted; the newer decision wins)" if pattern in baseline.accepted_domains else ""
+        baseline.accepted_domains.discard(pattern)
+        baseline.rejected_domains.add(pattern)
+        if any(domain_matches(d, pattern) for d in baseline.known_domains):
+            note += "  (already learned as normal — it will now fire anyway)"
+        lines.append(f"  rejected domain: {pattern}{note}")
     _save_baseline(baseline, path)
     print(f"Updated {path.as_posix()}")
     print("\n".join(lines))
@@ -613,7 +651,10 @@ def cmd_baseline_show(args) -> int:
         _emit(json.dumps({"baseline": path.as_posix(),
                           "accepted_tools": sorted(baseline.accepted_tools),
                           "rejected_tools": sorted(baseline.rejected_tools),
-                          "accepted_links": sorted(list(x) for x in baseline.accepted_links)},
+                          "accepted_links": sorted(list(x) for x in baseline.accepted_links),
+                          "accepted_domains": sorted(baseline.accepted_domains),
+                          "rejected_domains": sorted(baseline.rejected_domains),
+                          "known_domains": sorted(baseline.known_domains)},
                          indent=2), args.output)
         return 0
     lines = [f"Baseline: {path.as_posix()}  ({baseline.learned_from} session(s))", ""]
@@ -628,6 +669,16 @@ def cmd_baseline_show(args) -> int:
         links = sorted(baseline.accepted_links)
         lines.append(f"Accepted links ({len(links)}):")
         lines += [f"  {a} -> {b}" for a, b in links] or ["  —"]
+        lines.append("")
+        for title, items in (("Accepted domains", sorted(baseline.accepted_domains)),
+                             ("Rejected domains", sorted(baseline.rejected_domains))):
+            lines.append(f"{title} ({len(items)}):")
+            lines += [f"  {x}" for x in items] or ["  —"]
+            lines.append("")
+    if baseline.known_domains:
+        lines.append("")
+        lines.append(f"Destinations learned ({len(baseline.known_domains)}):")
+        lines += [f"  {d}" for d in sorted(baseline.known_domains)]
     _emit("\n".join(lines).rstrip(), args.output)
     return 0
 
@@ -832,12 +883,19 @@ def build_parser() -> argparse.ArgumentParser:
                      help='invocation link to whitelist, e.g. "agent:Build -> deploy_staging". '
                           "Scoped: a different source calling the same target still fires. "
                           "(repeatable)")
+    acc.add_argument("--domain", action="append", metavar="HOST",
+                     help="network destination to whitelist, e.g. api.openai.com or "
+                          '"*.openai.com" for its subdomains (repeatable)')
     acc.add_argument("--baseline", help=f"baseline to edit (default: {DEFAULT_BASELINE_PATH})")
     acc.set_defaults(func=cmd_baseline_accept)
 
-    rej = blsub.add_parser("reject", help="permanently exclude a tool from becoming normal")
-    rej.add_argument("--tool", action="append", metavar="NAME", required=True,
+    rej = blsub.add_parser("reject", help="permanently exclude a tool or destination from becoming normal")
+    rej.add_argument("--tool", action="append", metavar="NAME",
                      help="tool that must keep firing, even after a re-learn (repeatable)")
+    rej.add_argument("--domain", action="append", metavar="HOST",
+                     help='destination that must keep firing, e.g. "*.cn" or api.example.com. '
+                          "A wildcard covers subdomains only: \"*.alibaba.com\" does not match "
+                          "alibaba.com itself (repeatable)")
     rej.add_argument("--baseline", help=f"baseline to edit (default: {DEFAULT_BASELINE_PATH})")
     rej.set_defaults(func=cmd_baseline_reject)
 
