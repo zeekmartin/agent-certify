@@ -11,6 +11,9 @@
                         [--baseline FILE | --no-baseline] [--policy FILE | --no-policy] [--perspective P]
     agent-certify learn <session.jsonl | dir>... [-o FILE]
     agent-certify suggest-policy [--baseline FILE] [-o FILE] [--force]
+    agent-certify baseline accept (--tool NAME | --link "SRC -> DST") [--baseline FILE]
+    agent-certify baseline reject --tool NAME [--baseline FILE]
+    agent-certify baseline show [--baseline FILE]
     agent-certify mcp                     # MCP server on stdio
     (scan and watch take --otel / --otel-stdout to emit OpenTelemetry spans)
     agent-certify blast <path> --node bash
@@ -43,7 +46,15 @@ from pathlib import Path
 
 from agent_certify import __version__
 from agent_certify.anomaly import AnomalyDetector, AnomalyReport
-from agent_certify.baseline import DEFAULT_BASELINE_PATH, Baseline, BaselineLearner, load_baseline
+from agent_certify.baseline import (
+    DEFAULT_BASELINE_PATH,
+    Baseline,
+    BaselineLearner,
+    carry_overrides,
+    load_baseline,
+    normalise_tool,
+    parse_link,
+)
 from agent_certify.blast import BlastRadiusAnalyzer
 from agent_certify.certificate import DEFAULT_VALIDITY_DAYS, AgentCertificate, _public_key_hex, generate_keypair
 from agent_certify.graph import AgentGraph
@@ -501,8 +512,123 @@ def cmd_learn(args) -> int:
         raise SystemExit(f"agent-certify: {exc.args[0]} does not exist") from None
     except ValueError as exc:
         raise SystemExit(f"agent-certify: {exc}") from None
+    target = Path(args.output) if args.output else DEFAULT_BASELINE_PATH
+    previous = None
+    if not getattr(args, "forget_overrides", False) and target.exists():
+        try:
+            previous = load_baseline(target)
+        except ValueError:
+            previous = None     # an unreadable old file is not a reason to refuse to learn
+    carry_overrides(baseline, previous)
     saved = learner.save(baseline, args.output)
     print(_learn_report(baseline, saved))
+    if previous is not None and previous.has_overrides:
+        print()
+        print(f"Carried forward from {target.as_posix()}: " + _override_counts(baseline))
+        print("  (re-learning recomputes the statistics; it does not undo accept/reject)")
+    return 0
+
+
+# --------------------------------------------------------------- baseline edits
+def _override_counts(b: Baseline) -> str:
+    return (f"{len(b.accepted_tools)} accepted tool(s), {len(b.rejected_tools)} rejected, "
+            f"{len(b.accepted_links)} accepted link(s)")
+
+
+def _load_baseline_for_edit(args) -> tuple[Baseline, Path]:
+    """The baseline to edit, and where to write it back."""
+    path = Path(args.baseline) if args.baseline else DEFAULT_BASELINE_PATH
+    if not path.exists():
+        raise SystemExit(f"agent-certify: no baseline at {path.as_posix()}; "
+                         "run `agent-certify learn <sessions>` first or pass --baseline")
+    try:
+        return load_baseline(path), path
+    except ValueError as exc:
+        raise SystemExit(f"agent-certify: {exc}") from None
+
+
+def _save_baseline(baseline: Baseline, path: Path) -> None:
+    BaselineLearner().save(baseline, path)
+
+
+def cmd_baseline_accept(args) -> int:
+    """Whitelist a tool, or one scoped invocation link, without re-learning."""
+    if not (args.tool or args.link):
+        raise SystemExit('agent-certify: nothing to accept; pass --tool NAME or '
+                         '--link "SRC -> DST"')
+    baseline, path = _load_baseline_for_edit(args)
+    lines = []
+    for raw in args.tool or []:
+        try:
+            name = normalise_tool(raw)
+        except ValueError as exc:
+            raise SystemExit(f"agent-certify: {exc}") from None
+        was_rejected = name in baseline.rejected_tools
+        baseline.rejected_tools.discard(name)
+        baseline.accepted_tools.add(name)
+        lines.append(f"  accepted tool: {name}"
+                     + ("  (was rejected; the newer decision wins)" if was_rejected else ""))
+    for raw in args.link or []:
+        try:
+            link = parse_link(raw, baseline)
+        except ValueError as exc:
+            raise SystemExit(f"agent-certify: {exc}") from None
+        baseline.accepted_links.add(link)
+        lines.append(f"  accepted link: {link[0]} -> {link[1]}"
+                     "  (scoped: other callers of that target still fire)")
+    _save_baseline(baseline, path)
+    print(f"Updated {path.as_posix()}")
+    print("\n".join(lines))
+    print(f"\nNow: {_override_counts(baseline)}")
+    return 0
+
+
+def cmd_baseline_reject(args) -> int:
+    """Permanently exclude a tool from becoming normal, across re-learns."""
+    baseline, path = _load_baseline_for_edit(args)
+    lines = []
+    for raw in args.tool or []:
+        try:
+            name = normalise_tool(raw)
+        except ValueError as exc:
+            raise SystemExit(f"agent-certify: {exc}") from None
+        was_accepted = name in baseline.accepted_tools
+        baseline.accepted_tools.discard(name)
+        baseline.rejected_tools.add(name)
+        note = "  (was accepted; the newer decision wins)" if was_accepted else ""
+        if name in baseline.known_tools:
+            note += "  (already learned as normal — it will now fire anyway)"
+        lines.append(f"  rejected tool: {name}{note}")
+    _save_baseline(baseline, path)
+    print(f"Updated {path.as_posix()}")
+    print("\n".join(lines))
+    print(f"\nNow: {_override_counts(baseline)}")
+    return 0
+
+
+def cmd_baseline_show(args) -> int:
+    """Print the operator decisions stored in a baseline."""
+    baseline, path = _load_baseline_for_edit(args)
+    if args.format == "json":
+        _emit(json.dumps({"baseline": path.as_posix(),
+                          "accepted_tools": sorted(baseline.accepted_tools),
+                          "rejected_tools": sorted(baseline.rejected_tools),
+                          "accepted_links": sorted(list(x) for x in baseline.accepted_links)},
+                         indent=2), args.output)
+        return 0
+    lines = [f"Baseline: {path.as_posix()}  ({baseline.learned_from} session(s))", ""]
+    if not baseline.has_overrides:
+        lines.append("No operator decisions recorded. Everything comes from what was learned.")
+    else:
+        for title, items in (("Accepted tools", sorted(baseline.accepted_tools)),
+                             ("Rejected tools", sorted(baseline.rejected_tools))):
+            lines.append(f"{title} ({len(items)}):")
+            lines += [f"  {x}" for x in items] or ["  —"]
+            lines.append("")
+        links = sorted(baseline.accepted_links)
+        lines.append(f"Accepted links ({len(links)}):")
+        lines += [f"  {a} -> {b}" for a, b in links] or ["  —"]
+    _emit("\n".join(lines).rstrip(), args.output)
     return 0
 
 
@@ -692,7 +818,34 @@ def build_parser() -> argparse.ArgumentParser:
     learn.add_argument("-o", "--output", help=f"where to save it (default: {DEFAULT_BASELINE_PATH})")
     learn.add_argument("--include-mcp", action="store_true",
                        help="include MCP server log calls (use with `scan --include-mcp`)")
+    learn.add_argument("--forget-overrides", action="store_true",
+                       help="discard accept/reject decisions instead of carrying them forward")
     learn.set_defaults(func=cmd_learn)
+
+    bl = sub.add_parser("baseline", help="edit the operator decisions stored in a baseline")
+    blsub = bl.add_subparsers(dest="baseline_command", required=True)
+
+    acc = blsub.add_parser("accept", help="whitelist a tool, or one scoped invocation link")
+    acc.add_argument("--tool", action="append", metavar="NAME",
+                     help="tool to whitelist, e.g. Bash or tool:Bash (repeatable)")
+    acc.add_argument("--link", action="append", metavar="SRC->DST",
+                     help='invocation link to whitelist, e.g. "agent:Build -> deploy_staging". '
+                          "Scoped: a different source calling the same target still fires. "
+                          "(repeatable)")
+    acc.add_argument("--baseline", help=f"baseline to edit (default: {DEFAULT_BASELINE_PATH})")
+    acc.set_defaults(func=cmd_baseline_accept)
+
+    rej = blsub.add_parser("reject", help="permanently exclude a tool from becoming normal")
+    rej.add_argument("--tool", action="append", metavar="NAME", required=True,
+                     help="tool that must keep firing, even after a re-learn (repeatable)")
+    rej.add_argument("--baseline", help=f"baseline to edit (default: {DEFAULT_BASELINE_PATH})")
+    rej.set_defaults(func=cmd_baseline_reject)
+
+    shw = blsub.add_parser("show", help="print the decisions stored in a baseline")
+    shw.add_argument("--baseline", help=f"baseline to read (default: {DEFAULT_BASELINE_PATH})")
+    shw.add_argument("--format", choices=["text", "json"], default="text")
+    shw.add_argument("-o", "--output")
+    shw.set_defaults(func=cmd_baseline_show)
 
     b = sub.add_parser("blast", help="blast radius of a compromised node")
     b.add_argument("path", nargs="?", default=DEFAULT_PATH)

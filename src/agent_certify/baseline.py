@@ -12,6 +12,25 @@ Sub-agent ids are unique per spawn, so links are recorded by *role*: an agent
 node becomes ``agent:<type>`` (``agent:Explore``, ``agent:general-purpose``).
 Tools and the orchestrator keep their ids. Standard deviations are population
 deviations, so a baseline learned from one session has std 0.
+
+**Overrides.** What a baseline learned is a statistic; what a human decided
+about it is not, and re-learning must not erase the decision. Three sets carry
+that:
+
+``accepted_tools``   a tool the operator has blessed. It stops being a
+                     ``new_tool`` anomaly without being averaged into any
+                     statistic.
+``rejected_tools``   a tool that must never become normal. It fires every time,
+                     *even after a re-learn that saw it in every session*, and
+                     it is never promoted to a ``required_tool`` policy rule.
+``accepted_links``   a (source role, target role) pair. Scoped: approving
+                     ``agent:Build -> tool:deploy_staging`` leaves
+                     ``agent:Test -> tool:deploy_staging`` firing.
+
+The sets are stored in the baseline file and copied forward by
+:func:`carry_overrides`, which ``agent-certify learn`` calls. A later
+``accept``/``reject`` overrides an earlier one on the same tool: "permanent"
+means it survives re-learning, not that it cannot be revised deliberately.
 """
 from __future__ import annotations
 
@@ -88,14 +107,26 @@ class Baseline:
     # Metadata
     created_at: str
     version: str = "0.2.0"
+    # Human decisions, not statistics. Carried across re-learns; see the module
+    # docstring. Defaulted, so a baseline written by <= 0.5.1 still loads.
+    accepted_tools: set[str] = field(default_factory=set)
+    rejected_tools: set[str] = field(default_factory=set)
+    accepted_links: set[tuple[str, str]] = field(default_factory=set)
     fi_min: float = 0.0
     fi_max: float = 0.0
     session_ids: list[str] = field(default_factory=list)
+
+    @property
+    def has_overrides(self) -> bool:
+        return bool(self.accepted_tools or self.rejected_tools or self.accepted_links)
 
     def to_dict(self) -> dict:
         d = asdict(self)
         d["known_tools"] = sorted(self.known_tools)
         d["known_links"] = sorted(list(link) for link in self.known_links)
+        d["accepted_tools"] = sorted(self.accepted_tools)
+        d["rejected_tools"] = sorted(self.rejected_tools)
+        d["accepted_links"] = sorted(list(link) for link in self.accepted_links)
         d["tool_frequency"] = dict(sorted(self.tool_frequency.items(), key=lambda kv: (-kv[1], kv[0])))
         return d
 
@@ -128,11 +159,24 @@ class Baseline:
             _check(isinstance(data["known_links"], list)
                    and all(isinstance(link, list) and len(link) == 2 and all(isinstance(x, str) for x in link)
                            for link in data["known_links"]))
+            for key in ("accepted_tools", "rejected_tools"):
+                if key in data:
+                    _check(isinstance(data[key], list) and all(isinstance(t, str) for t in data[key]))
+            if "accepted_links" in data:
+                _check(isinstance(data["accepted_links"], list)
+                       and all(isinstance(link, list) and len(link) == 2
+                               and all(isinstance(x, str) for x in link)
+                               for link in data["accepted_links"]))
             ids = data.get("session_ids", [])
             _check(isinstance(ids, list) and all(isinstance(x, str) for x in ids))
             data = dict(data)
             data["known_tools"] = set(data["known_tools"])
             data["known_links"] = {tuple(link) for link in data["known_links"]}
+            for key in ("accepted_tools", "rejected_tools"):
+                if key in data:
+                    data[key] = set(data[key])
+            if "accepted_links" in data:
+                data["accepted_links"] = {tuple(link) for link in data["accepted_links"]}
             return cls(**data)
         except (TypeError, KeyError, AttributeError):
             raise ValueError("Invalid baseline format") from None
@@ -257,3 +301,74 @@ def _is_count(v) -> bool:
 
 def _is_number(v) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+# ------------------------------------------------------------------ overrides
+_ARROW = "->"
+
+
+def normalise_tool(name: str) -> str:
+    """A tool as ``known_tools`` spells it: the display name, no ``tool:`` prefix.
+
+    ``known_tools`` holds ``node.name``, while link endpoints hold ``node_id``
+    (``tool:Bash``). Both spellings reach the CLI, so both are accepted here and
+    the display name wins.
+    """
+    name = name.strip()
+    if not name:
+        raise ValueError("tool name is empty")
+    return name[len("tool:"):].strip() if name.lower().startswith("tool:") else name
+
+
+def normalise_endpoint(endpoint: str, baseline: Baseline | None = None) -> str:
+    """One end of a link, as ``known_links`` spells it.
+
+    An endpoint carrying a ``kind:`` prefix is already a role
+    (``tool:Bash``, ``agent:Explore``) and is kept. A bare word is ambiguous:
+    the orchestrator's node id is a bare word (``claude``) and so is a tool
+    display name (``deploy_staging``). It is resolved against what the baseline
+    has seen, and falls back to a tool -- which is the common case, since the
+    reason to scope a link is usually a tool that is new.
+    """
+    endpoint = endpoint.strip()
+    if not endpoint:
+        raise ValueError("link endpoint is empty")
+    if ":" in endpoint:
+        return endpoint
+    if baseline is not None:
+        if endpoint in baseline.known_tools:
+            return f"tool:{endpoint}"
+        seen = {s for s, _ in baseline.known_links} | {t for _, t in baseline.known_links}
+        if endpoint in seen:
+            return endpoint
+    return f"tool:{endpoint}"
+
+
+def parse_link(text: str, baseline: Baseline | None = None) -> tuple[str, str]:
+    """``"agent:Build -> deploy_staging"`` -> ``("agent:Build", "tool:deploy_staging")``.
+
+    Raises ``ValueError`` naming what was expected; a link the operator cannot
+    spell is worse than one they are told how to spell.
+    """
+    parts = str(text).split(_ARROW)
+    if len(parts) != 2:
+        raise ValueError(
+            f"link must be \"SOURCE {_ARROW} TARGET\", e.g. "
+            f"\"agent:Build {_ARROW} deploy_staging\"; got {text!r}")
+    return (normalise_endpoint(parts[0], baseline), normalise_endpoint(parts[1], baseline))
+
+
+def carry_overrides(new: Baseline, old: Baseline | None) -> Baseline:
+    """Copy ``old``'s human decisions onto a freshly learned ``new`` baseline.
+
+    Re-learning recomputes every statistic, which is the point; it must not
+    silently undo an ``accept`` or a ``reject``, which would turn a rejected
+    tool normal the moment it appeared often enough. Returns ``new`` mutated in
+    place for the caller's convenience.
+    """
+    if old is None:
+        return new
+    new.accepted_tools = set(old.accepted_tools)
+    new.rejected_tools = set(old.rejected_tools)
+    new.accepted_links = set(old.accepted_links)
+    return new

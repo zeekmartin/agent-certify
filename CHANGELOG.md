@@ -6,6 +6,44 @@ project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-03
+
+Feedback from Reddit and LinkedIn: a baseline that can only be re-learned is a
+baseline you cannot correct. Three decisions are now recorded in it, and
+`learn` carries them forward instead of overwriting them.
+
+### Added
+- `agent-certify baseline accept --tool NAME` — whitelist a tool without
+  re-learning. It stops being a `new_tool` anomaly and no statistic moves
+- `agent-certify baseline reject --tool NAME` — a tool that must never become
+  normal. It fires **even after a re-learn that saw it in every session**, and
+  `suggest-policy` no longer drafts it as a `required_tool` rule
+- `agent-certify baseline accept --link "agent:Build -> deploy_staging"` —
+  scoped acceptance: one caller, one target. A different agent calling the same
+  tool still fires, and the message names the callers no accepted link covers
+  (thanks to Rohan Ahmed on LinkedIn for the case)
+- `agent-certify baseline show [--format json]` — the decisions on record
+- `agent-certify learn --forget-overrides` — drop them deliberately
+- `Baseline.accepted_tools`, `.rejected_tools`, `.accepted_links`,
+  `.has_overrides`, and `carry_overrides()`, `parse_link()`, `normalise_tool()`,
+  `normalise_endpoint()` in `agent_certify.baseline`
+
+### Changed
+- `agent-certify learn` reads the baseline it is about to overwrite and carries
+  its accept/reject decisions onto the new one. A corrupt previous file loses
+  the decisions but does not block learning
+- `--tool` and `--link` are repeatable; `--tool` takes `Bash` or `tool:Bash`
+- accept and reject are last-write-wins on the same tool: "permanent" means it
+  survives a re-learn, not that it cannot be revised. Rejection beats a scoped
+  accepted link
+
+### Notes
+- Baselines written by 0.5.1 and earlier load unchanged — the three fields are
+  defaulted and a pre-0.6 file simply has no decisions on record
+- There is no `reject --link`: a link you never want is a policy FORBIDDEN rule,
+  where you write the message
+
+
 ## [0.5.1] - 2026-10-27
 
 ### Fixed

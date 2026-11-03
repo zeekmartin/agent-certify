@@ -192,11 +192,15 @@ class PolicyGenerator:
     def suggest(self, baseline: Baseline) -> Policy:
         """Generate conservative policy rules from baseline statistics.
 
-        - tools seen in every session -> REQUIRED (warning)
+        - tools seen in every session -> REQUIRED (warning), unless rejected
         - sub-agents: more than baseline max + 1 -> warning, max + 3 -> critical
         """
         rules = []
         for tool, freq in sorted(baseline.tool_frequency.items()):
+            # A rejected tool must never become normal, and a REQUIRED rule is
+            # the strongest possible statement that it is.
+            if tool in baseline.rejected_tools:
+                continue
             if freq >= 1.0:
                 rules.append(PolicyRule(
                     kind="required_tool", target=tool, severity="warning",

@@ -121,6 +121,12 @@ agent-certify scan session.jsonl                             # compares against 
 agent-certify scan session.jsonl --baseline path/to/baseline.json
 agent-certify scan session.jsonl --no-baseline
 
+# Tell the baseline what you have decided (survives a re-learn)
+agent-certify baseline accept --tool Bash                    # stop flagging it
+agent-certify baseline reject --tool deploy_production       # keep flagging it, forever
+agent-certify baseline accept --link "agent:Build -> deploy_staging"   # that agent only
+agent-certify baseline show                                  # what is on record
+
 # Policy: explicit rules, drafted from the baseline, edited by a human
 agent-certify suggest-policy                                 # writes .agent-certify/policy.json
 agent-certify scan session.jsonl                             # also checks ./.agent-certify/policy.json if present
@@ -206,6 +212,8 @@ result.labels("compliance")        # same result, other vocabulary
   error rate (errors / tool calls), plus FI's range and the most sub-agents seen
 - every tool seen, and the fraction of sessions it appears in
 - every invocation link seen (`source -> target`)
+- the tools and links you have accepted or rejected by hand, which are decisions
+  rather than statistics and so survive a re-learn (see below)
 
 Sub-agent ids are unique per spawn, so links are recorded by role: a sub-agent
 counts as `agent:<type>` (`agent:Explore`, `agent:general-purpose`). Standard
@@ -229,12 +237,62 @@ report.has_critical
 print(report)
 ```
 
+### Deciding what counts as normal
+
+Learning is a statistic. Whether you *accept* what it learned is a decision, and
+a decision must not be erased by the next `learn`. Three commands record one:
+
+```bash
+# A tool you know about. Stops being an anomaly, without re-learning anything.
+agent-certify baseline accept --tool Bash
+
+# A tool that must never become normal. It keeps firing even after a re-learn
+# that saw it in every single session, and `suggest-policy` will never draft it
+# as a REQUIRED tool.
+agent-certify baseline reject --tool deploy_production
+
+# Scoped acceptance: this agent may call this tool. Another agent calling the
+# same tool still fires.
+agent-certify baseline accept --link "agent:Build -> deploy_staging"
+
+agent-certify baseline show            # or --format json
+```
+
+All three are stored in `baseline.json` and **carried forward by
+`agent-certify learn`**, which recomputes every statistic and leaves the
+decisions standing. `learn --forget-overrides` drops them on purpose.
+
+Scoped acceptance is what makes `--link` worth having. Approving
+`agent:Build -> deploy_staging` does not approve `deploy_staging`: if another
+caller appears, the tool is flagged again and the message names the callers that
+no accepted link covers.
+
+```
+[CRITICAL]  New tool never seen: deploy_staging
+            Baseline: not in 14 known tools
+            2 call(s) by agent:Test:0 — not covered by an accepted link: agent:Test
+```
+
+A tool can be accepted and then rejected, or the reverse: the newer decision
+wins. "Permanent" means it survives re-learning, not that you cannot change your
+mind. Rejection beats a scoped link, so a rejected tool fires whoever calls it.
+
+A link endpoint written with a `kind:` prefix (`tool:Bash`, `agent:Explore`) is
+taken as it stands. A bare word is resolved against the baseline — the
+orchestrator's id is a bare word (`claude`) and so is a tool name — and falls
+back to a tool, which is the usual case, since the reason to scope a link is
+normally a tool that is new.
+
+Rejection is deliberately asymmetric: there is no `reject --link`. A link you
+never want is a policy FORBIDDEN rule, which `scan --policy` enforces with a
+message you write yourself.
+
 ## Anomaly detection
 
 | Check | Flags | Severity |
 |---|---|---|
-| `new_tool` | a tool never seen in the baseline | critical |
-| `new_link` | an invocation path never seen (links to a new tool are not repeated) | warning |
+| `new_tool` | a tool never seen in the baseline, or one you rejected | critical |
+| `new_link` | an invocation path never seen or accepted (links to a flagged tool are not repeated) | warning |
 | `fi_deviation` | FI more than 2σ from the mean | warning; critical past 3σ when FI *rose* |
 | `error_rate` | error rate more than 2σ *above* the mean | warning; critical past 3σ |
 | `sub_agents` | more sub-agents than ever seen, or 2σ above the mean | warning; critical when above the max *and* past 3σ |

@@ -8,7 +8,8 @@ Each check compares one aspect of a session with the :class:`Baseline`:
 ==============  =========================================  ======================
 check           flags                                      severity
 ==============  =========================================  ======================
-new_tool        a tool never seen in the baseline          critical
+new_tool        a tool never seen in the baseline, or one   critical
+                the operator rejected
 new_link        an invocation path never seen (by role)    warning
 fi_deviation    FI more than 2 sigma from the mean         warning; critical past
                                                            3 sigma when FI *rose*
@@ -18,6 +19,14 @@ sub_agents      more sub-agents than ever seen, or 2 sigma  warning; critical wh
                 above the mean                             above max *and* 3 sigma
 node_count      node count more than 2 sigma from mean     info; warning past 3
 ==============  =========================================  ======================
+
+Three baseline overrides change what ``new_tool`` and ``new_link`` consider
+normal, and they are decisions rather than statistics, so they win over what was
+learned: ``accepted_tools`` silences a tool, ``rejected_tools`` makes one fire
+however often it has been seen, and ``accepted_links`` silences one
+(source role, target role) pair. Acceptance of a link is **scoped** — if a tool
+is new and only some of its callers are covered by an accepted link, the
+``new_tool`` anomaly still fires and names the callers that are not.
 
 A falling FI means added redundancy (usually sub-agents sharing tools), a
 structural change worth knowing about but not a risk in itself, so it never
@@ -132,30 +141,64 @@ class AnomalyDetector:
                              baseline_source=self.source, learned_from=self.baseline.learned_from)
 
     # --------------------------------------------------------------- checks
+    def _uncovered_callers(self, graph: AgentGraph, tool_id: str) -> list[str]:
+        """Caller roles of ``tool_id`` that no accepted link covers.
+
+        This is what makes ``baseline accept --link`` scoped: approving
+        ``agent:Build -> tool:deploy_staging`` leaves every other caller of that
+        tool uncovered, so the tool still gets flagged and the message says who
+        is responsible.
+        """
+        accepted = self.baseline.accepted_links
+        callers = {node_role(graph, e.source) for e in graph.edges if e.target == tool_id}
+        return sorted(c for c in callers if (c, tool_id) not in accepted)
+
     def _new_tool_names(self, graph: AgentGraph) -> set[str]:
-        return {n.name for n in graph.nodes.values() if n.kind == "tool"} - self.baseline.known_tools
+        """Tools that should be flagged, after the operator's decisions are applied.
+
+        A rejected tool is returned even when the baseline has learned it, which
+        is the whole point of rejecting: a re-learn that saw it in every session
+        must not make it normal.
+        """
+        b = self.baseline
+        present = {n.name for n in graph.nodes.values() if n.kind == "tool"}
+        return (present - b.known_tools - b.accepted_tools) | (present & b.rejected_tools)
 
     def _check_new_tools(self, graph: AgentGraph) -> list[Anomaly]:
-        """Flag any tool not in baseline.known_tools. Severity: critical."""
+        """Flag any tool the baseline does not vouch for. Severity: critical."""
         out = []
         for name in sorted(self._new_tool_names(graph)):
             nid = next(i for i, n in graph.nodes.items() if n.kind == "tool" and n.name == name)
+            rejected = name in self.baseline.rejected_tools
+            uncovered = self._uncovered_callers(graph, nid)
+            if not rejected and not uncovered:
+                continue        # every caller is covered by an accepted link
             callers = sorted({e.source for e in graph.edges if e.target == nid})
-            out.append(Anomaly(
-                CRITICAL, "new_tool", f"New tool never seen: {name}", name,
-                f"not in {len(self.baseline.known_tools)} known tools", None,
-                f"{graph.nodes[nid].call_count} call(s) by {', '.join(callers) or '-'}"))
+            detail = f"{graph.nodes[nid].call_count} call(s) by {', '.join(callers) or '-'}"
+            if rejected:
+                message = f"Rejected tool used: {name}"
+                reference = "explicitly rejected by the operator"
+                detail += " — rejected, so it stays an anomaly across re-learns"
+            else:
+                message = f"New tool never seen: {name}"
+                reference = f"not in {len(self.baseline.known_tools)} known tools"
+                if self.baseline.accepted_links:
+                    detail += f" — not covered by an accepted link: {', '.join(uncovered)}"
+            out.append(Anomaly(CRITICAL, "new_tool", message, name, reference, None, detail))
         return out
 
     def _check_new_links(self, graph: AgentGraph) -> list[Anomaly]:
-        """Flag any (source, target) link not in baseline.known_links. Severity: warning.
+        """Flag any (source, target) link the baseline does not allow. Severity: warning.
 
-        Links to a new tool are covered by the new_tool anomaly and not repeated.
+        Allowed means learned (``known_links``) or accepted (``accepted_links``).
+        Links to a flagged tool are covered by the new_tool anomaly and not
+        repeated.
         """
         new_tools = {f"tool:{t}" for t in self._new_tool_names(graph)}
         links = {(node_role(graph, e.source), node_role(graph, e.target)) for e in graph.edges}
+        allowed = self.baseline.known_links | self.baseline.accepted_links
         out = []
-        for s, t in sorted(links - self.baseline.known_links):
+        for s, t in sorted(links - allowed):
             if s in new_tools or t in new_tools:
                 continue
             out.append(Anomaly(WARNING, "new_link", f"New communication path: {s} -> {t}", f"{s} -> {t}",
