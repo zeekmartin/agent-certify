@@ -11,7 +11,7 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [
-    {name = "David Martin Venti", email = "david.martin@cognitive-engineering.dev"}
+    {name = "Cognitive Engineering", email = "david.martin@cognitive-engineering.dev"}
 ]
 keywords = ["multiagent", "agent", "structural-analysis", "fragility", "graph-theory", "ai-safety"]
 classifiers = [
