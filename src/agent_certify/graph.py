@@ -73,6 +73,19 @@ class AgentGraph:
     skipped_records: int = 0             # malformed / oversized records the parser could not read
     total_records: int = 0               # records the parser attempted (read or skipped)
     seen_domains: set[str] = field(default_factory=set)   # network destinations the tool calls pointed at
+    #: Outbound bytes and calls per destination: the size of the arguments of
+    #: every call that named that host, plus the literal payloads on its
+    #: command lines. Numbers only, never content; see
+    #: :func:`agent_certify.domains.measure_call`.
+    egress_bytes: dict[str, int] = field(default_factory=dict)
+    egress_calls: dict[str, int] = field(default_factory=dict)
+    #: Calls whose destination scan hit a limit, so a host after it would not
+    #: have been seen. Counted like ``skipped_records`` rather than dropped in
+    #: silence, because a bound that hides a destination is an evasion:
+    #: ``destination_scan_truncated`` reports them.
+    truncated_scans: int = 0
+    truncated_network_scans: int = 0     # of those, the ones that did name a destination
+    truncation_reasons: set[str] = field(default_factory=set)
     source: str | None = field(default=None, compare=False, repr=False)   # file it came from; not serialised
 
     _edge_index: dict = field(default=None, init=False, repr=False, compare=False)
@@ -156,6 +169,53 @@ class AgentGraph:
         self.seen_domains |= domains
         seen = self.nodes[node_id].metadata.setdefault("domains", [])
         seen[:] = sorted(set(seen) | domains)
+
+    def record_egress(self, node_id: str, domains, outbound_bytes: int = 0, calls: int = 1) -> None:
+        """Note one tool call's destinations, and the bytes it sent to each.
+
+        The size is attributed in full to every destination of the call, for
+        the reason :class:`~agent_certify.domains.CallEgress` gives: a log does
+        not say how one call's bytes divided between two hosts.
+
+        Kept twice like the destinations themselves — on the graph, which is
+        what a baseline learns and ``egress_volume_spike`` compares, and on the
+        calling node, so a report can say who sent them.
+        """
+        domains = {d for d in domains if d}
+        if not domains:
+            return
+        self.record_domains(node_id, domains)
+        size, calls = max(0, int(outbound_bytes)), max(0, int(calls))
+        per_node = self.nodes[node_id].metadata.setdefault("egress", {})
+        for domain in sorted(domains):
+            self.egress_bytes[domain] = self.egress_bytes.get(domain, 0) + size
+            self.egress_calls[domain] = self.egress_calls.get(domain, 0) + calls
+            entry = per_node.setdefault(domain, {"bytes": 0, "calls": 0})
+            entry["bytes"] += size
+            entry["calls"] += calls
+
+    def note_scan_truncation(self, node_id: str | None, reasons, network: bool = False) -> None:
+        """Record that a limit stopped one call's destination scan.
+
+        ``network`` says the call did name a destination, which is what makes
+        the anomaly critical rather than a warning: the call reached somewhere,
+        and something after the limit was not read.
+        """
+        reasons = {r for r in reasons if r}
+        if not reasons:
+            return
+        self.truncated_scans += 1
+        self.truncation_reasons |= reasons
+        if network:
+            self.truncated_network_scans += 1
+        if node_id and node_id in self.nodes:
+            meta = self.nodes[node_id].metadata
+            meta["scan_truncated"] = meta.get("scan_truncated", 0) + 1
+            meta["scan_truncated_reasons"] = sorted(set(meta.get("scan_truncated_reasons", [])) | reasons)
+
+    def egress_total(self) -> int:
+        """Outbound bytes over every destination of the session."""
+        return sum(self.egress_bytes.values())
 
     def domain_callers(self, domain: str) -> list[str]:
         """Ids of the nodes whose calls pointed at ``domain``."""
@@ -279,6 +339,11 @@ class AgentGraph:
             "skipped_records": self.skipped_records,
             "total_records": self.total_records,
             "seen_domains": sorted(self.seen_domains),
+            "egress_bytes": dict(sorted(self.egress_bytes.items())),
+            "egress_calls": dict(sorted(self.egress_calls.items())),
+            "truncated_scans": self.truncated_scans,
+            "truncated_network_scans": self.truncated_network_scans,
+            "truncation_reasons": sorted(self.truncation_reasons),
             "nodes": [asdict(n) for n in self.nodes.values()],
             "edges": [asdict(e) for e in self.edges],
         }
@@ -298,11 +363,22 @@ class AgentGraph:
             _check(isinstance(nodes, list) and isinstance(edges, list))
             domains = data.get("seen_domains", [])          # absent in graphs written before v0.7
             _check(isinstance(domains, list) and all(isinstance(d, str) for d in domains))
+            volumes = {}
+            for key in ("egress_bytes", "egress_calls"):    # absent in graphs written before v0.8
+                value = data.get(key, {})
+                _check(isinstance(value, dict)
+                       and all(isinstance(d, str) and _is_count(n) for d, n in value.items()))
+                volumes[key] = dict(value)
+            _check(all(_is_count(data.get(k, 0)) for k in ("truncated_scans", "truncated_network_scans")))
+            reasons = data.get("truncation_reasons", [])
+            _check(isinstance(reasons, list) and all(isinstance(r, str) for r in reasons))
             g = cls(session_id=data.get("session_id"), project=data.get("project"),
                     total_messages=data.get("total_messages", 0), total_tool_calls=data.get("total_tool_calls", 0),
                     duration_seconds=duration, started_at=data.get("started_at"), ended_at=data.get("ended_at"),
                     skipped_records=data.get("skipped_records", 0), total_records=data.get("total_records", 0),
-                    seen_domains=set(domains))
+                    seen_domains=set(domains), truncated_scans=data.get("truncated_scans", 0),
+                    truncated_network_scans=data.get("truncated_network_scans", 0),
+                    truncation_reasons=set(reasons), **volumes)
             for n in nodes:
                 _check(isinstance(n, dict) and set(n) <= set(AgentNode.__dataclass_fields__))
                 _check(isinstance(n.get("id"), str) and n.get("kind") in NODE_KINDS and isinstance(n.get("name"), str))
@@ -330,8 +406,8 @@ class AgentGraph:
                 m.call_count += n.call_count
                 m.error_count += n.error_count
                 for k, v in n.metadata.items():
-                    if k == "domains":
-                        continue        # a set, not a scalar: unioned below
+                    if k in ("domains", "egress", "scan_truncated", "scan_truncated_reasons"):
+                        continue        # a set or a sum, not a scalar: combined below
                     m.metadata.setdefault(k, v)
                 # The per-node destinations have to be unioned, not defaulted:
                 # one tool node reached one host in the first session and
@@ -340,6 +416,19 @@ class AgentGraph:
                 # is exactly what record_domains keeps the second copy for.
                 if n.metadata.get("domains"):
                     out.record_domains(n.id, n.metadata["domains"])
+                # Same reason, same fix, for the per-node byte counters: they
+                # are sums, so they are added rather than defaulted.
+                for domain, stats in (n.metadata.get("egress") or {}).items():
+                    entry = m.metadata.setdefault("egress", {}).setdefault(domain, {"bytes": 0, "calls": 0})
+                    entry["bytes"] += int(stats.get("bytes", 0) or 0)
+                    entry["calls"] += int(stats.get("calls", 0) or 0)
+                for key in ("scan_truncated",):
+                    if n.metadata.get(key):
+                        m.metadata[key] = m.metadata.get(key, 0) + n.metadata[key]
+                if n.metadata.get("scan_truncated_reasons"):
+                    m.metadata["scan_truncated_reasons"] = sorted(
+                        set(m.metadata.get("scan_truncated_reasons", []))
+                        | set(n.metadata["scan_truncated_reasons"]))
             for e in g.edges:
                 f = out.get_edge(e.source, e.target)
                 if f is None:
@@ -350,6 +439,13 @@ class AgentGraph:
                     f.weight += e.weight
                     f.errors += e.errors
             out.seen_domains |= g.seen_domains
+            for domain, size in g.egress_bytes.items():
+                out.egress_bytes[domain] = out.egress_bytes.get(domain, 0) + size
+            for domain, calls in g.egress_calls.items():
+                out.egress_calls[domain] = out.egress_calls.get(domain, 0) + calls
+            out.truncated_scans += g.truncated_scans
+            out.truncated_network_scans += g.truncated_network_scans
+            out.truncation_reasons |= g.truncation_reasons
             out.total_messages += g.total_messages
             out.total_tool_calls += g.total_tool_calls
             out.skipped_records += g.skipped_records

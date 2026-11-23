@@ -36,6 +36,13 @@ AGENT_TYPES = ("Explore", "Plan")
 #: learn and an injected foreign host is genuinely new.
 HOME_DOMAIN = "api.internal.example"
 
+#: Outbound bytes per call to :data:`HOME_DOMAIN`. It **varies by session**,
+#: like everything else here: a destination whose traffic never varied would
+#: have a deviation of zero, and ``egress_volume_spike`` would then fall back
+#: to its no-variation rule instead of being measured against a real sigma.
+HOME_BYTES = 1800
+HOME_CALLS = 3
+
 _EPOCH = datetime(2026, 10, 1, 9, 0, tzinfo=timezone.utc)
 
 
@@ -91,7 +98,11 @@ def clean_session(index: int, seed: int | None = None) -> AgentGraph:
         g.add_call(aid, shared, count=2)
         calls += 3
 
-    g.record_domains(f"tool:{TOOLS[0]}", {HOME_DOMAIN})   # the one destination this system calls
+    # The one destination this system calls, with the data it usually sends
+    # there: a few calls carrying an argument object of a plausible size.
+    g.record_egress(f"tool:{TOOLS[0]}", {HOME_DOMAIN},
+                    outbound_bytes=HOME_CALLS * (HOME_BYTES + 60 * (index % 5) + 20 * jitter(seed, index, 9)),
+                    calls=HOME_CALLS)
     g.total_tool_calls = calls
     g.total_messages = calls + 2
     for e in range(index % 3):                        # 0, 1 or 2 failed calls: the baseline needs a spread

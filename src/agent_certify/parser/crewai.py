@@ -61,7 +61,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
-from agent_certify.domains import extract_call_domains
+from agent_certify.domains import measure_call
 from agent_certify.graph import AgentGraph
 from agent_certify.parser.base import BaseParser, iso, read_records, to_datetime
 from agent_certify.paths import MAX_FILES
@@ -259,22 +259,29 @@ class CrewAIParser(BaseParser):
         g.add_node(target, "tool", tool)
         status = _status(rec)
         key = (caller, target, _first(rec, _ID_KEYS) or _first(rec, _TASK_KEYS))
+        counted = True                              # does this record stand for a call not counted yet?
         if status == "failed":
             if state.open.pop(key, None) is not None:
                 g.record_error(caller, target)      # the start of this call was already counted
+                counted = False
             else:
                 g.add_call(caller, target, error=True)
                 state.tool_calls += 1
         elif status == "finished" and state.open.pop(key, None) is not None:
-            pass                                    # start already counted; nothing new happened
+            counted = False                         # start already counted; nothing new happened
         else:
             g.add_call(caller, target)
             state.tool_calls += 1
             if status == "started":
                 state.open[key] = True
-        destinations = extract_call_domains(_call_payload(rec), _call_result(rec))
-        if destinations:
-            g.record_domains(target, destinations)
+        egress = measure_call(_call_payload(rec), _call_result(rec))
+        if egress.domains:
+            # The start and the end of one call both carry the payload, so the
+            # bytes are counted once: on the record that counted the call.
+            g.record_egress(target, egress.domains,
+                            egress.outbound_bytes if counted else 0, calls=1 if counted else 0)
+        if egress.truncated:
+            g.note_scan_truncation(target, egress.truncated, network=egress.network)
         self._delegation(g, rec, caller, tool)
 
     def _delegation(self, g: AgentGraph, rec: dict, caller: str, tool: str) -> None:

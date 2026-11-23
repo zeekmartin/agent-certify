@@ -35,7 +35,7 @@ from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 
-from agent_certify.domains import extract_domains
+from agent_certify.domains import extract_domains, measure_call
 from agent_certify.graph import AgentGraph
 from agent_certify.parser.base import BaseParser, decode_json, session_files
 from agent_certify.paths import MAX_LINE_BYTES, iter_lines
@@ -181,7 +181,8 @@ class ClaudeCodeParser(BaseParser):
         if call_id in state.calls:
             return  # same block re-streamed in a later record
         inp = block.get("input") if isinstance(block.get("input"), dict) else {}
-        destinations = extract_domains(inp)
+        egress = measure_call(inp)
+        destinations = set(egress.domains)
         if name in SPAWN_TOOLS or "subagent_type" in inp:
             linked = state.spawn_links.get(call_id)
             target = agent_id(linked or call_id or f"anon{len(state.calls)}")
@@ -194,8 +195,12 @@ class ClaudeCodeParser(BaseParser):
         g.add_call(caller, target)
         state.calls[call_id or f"anon{len(state.calls)}"] = (caller, target)
         if destinations:
-            g.record_domains(target, destinations)
-            state.net_calls[call_id] = target        # its result may name redirects, so read that too
+            g.record_egress(target, destinations, egress.outbound_bytes)
+            # Its result may name redirects, so read that too — and attribute
+            # the same request to them, once each: the bytes went there as well.
+            state.net_calls[call_id] = (target, egress.outbound_bytes, frozenset(destinations))
+        if egress.truncated:
+            g.note_scan_truncation(target, egress.truncated, network=egress.network)
 
     def _user(self, rec: dict, content, caller: str, g: AgentGraph, state: _State, is_main: bool) -> None:
         if isinstance(content, list):
@@ -208,7 +213,8 @@ class ClaudeCodeParser(BaseParser):
                 if b.get("is_error") and rid in state.calls:
                     g.record_error(*state.calls[rid])
                 if rid in state.net_calls:
-                    g.record_domains(state.net_calls[rid], extract_domains(b.get("content")))
+                    target, size, already = state.net_calls[rid]
+                    g.record_egress(target, extract_domains(b.get("content")) - already, size)
             if results:
                 return
         # A prompt typed by the person. A sub-agent's first "user" message is
@@ -244,7 +250,9 @@ class _State:
         self.calls: dict[str, tuple[str, str]] = {}   # tool_use id -> (caller, target)
         self.results: set[str] = set()
         self.spawn_links: dict[str, str] = {}         # spawning tool_use id -> agent id
-        self.net_calls: dict[str, str] = {}           # tool_use id -> tool node, for calls with a destination
+        #: tool_use id -> (tool node, outbound bytes, destinations already counted),
+        #: for the calls that named one; their result may add redirects.
+        self.net_calls: dict[str, tuple[str, int, frozenset]] = {}
         self.first: datetime | None = None
         self.last: datetime | None = None
 

@@ -7,6 +7,7 @@ from conftest import session_graph
 
 from agent_certify import AgentFIScanner, AnomalyDetector, BaselineLearner
 from agent_certify.anomaly import (
+    CALL_MIN_DELTA_CALLS,
     CRITICAL,
     VOLUME_RATIO_WARNING,
     VOLUME_SIGMA_CRITICAL,
@@ -16,12 +17,21 @@ from agent_certify.anomaly import (
 from agent_certify.baseline import link_volume
 
 
-def detect(graph, baseline):
-    return AnomalyDetector(baseline, "test").detect(graph, AgentFIScanner(graph).scan())
+def detect(graph, baseline, min_call_delta=CALL_MIN_DELTA_CALLS):
+    return AnomalyDetector(baseline, "test", min_call_delta=min_call_delta).detect(
+        graph, AgentFIScanner(graph).scan())
 
 
-def volume_anomalies(graph, baseline):
-    return [a for a in detect(graph, baseline).anomalies if a.category == "call_volume_spike"]
+def volume_anomalies(graph, baseline, min_call_delta=CALL_MIN_DELTA_CALLS):
+    """Volume anomalies of one session. The sigma tests pass ``min_call_delta=0``.
+
+    The absolute floor (:data:`CALL_MIN_DELTA_CALLS`) and the sigma thresholds
+    are two independent rules, and a test of one must not be answered by the
+    other: the tests that probe the sigma boundary turn the floor off, and the
+    tests below it probe the floor with the sigma rule wide open.
+    """
+    return [a for a in detect(graph, baseline, min_call_delta).anomalies
+            if a.category == "call_volume_spike"]
 
 
 @pytest.fixture
@@ -33,6 +43,53 @@ def sessions():
 @pytest.fixture
 def baseline(sessions):
     return BaselineLearner().learn_graphs(sessions)
+
+
+# ---------------------------------------------------------------- the floor
+def test_a_small_rise_is_not_a_finding(baseline):
+    """Past 3 sigma but a handful of calls: a relative threshold alone is noise.
+
+    The baseline calls Bash 46 to 60 times (mean 53, sigma 4.6). Sixty-six
+    calls is 2.8 sigma and six calls past the most ever seen — not a finding,
+    and a check that reports it is a check an operator learns to skip.
+    """
+    stats = baseline.volume("tool", "Bash")
+    assert stats["max"] == 60 and stats["mean"] == 53
+    for count in (61, 65, 69):                                   # up to +9 over the max
+        assert volume_anomalies(session_graph("creep", {"Bash": count, "Read": 10}), baseline) == []
+        # The sigma rule *would* have fired on the larger ones: it is the floor
+        # that is silencing them, not the relative threshold.
+        if count > stats["mean"] + VOLUME_SIGMA_WARNING * stats["std"]:
+            assert volume_anomalies(session_graph("creep", {"Bash": count, "Read": 10}), baseline, 0)
+
+
+def test_a_rise_past_the_floor_is_still_reported(baseline):
+    """The floor is a floor, not a dampener: ten calls past the max and it fires."""
+    peak = int(baseline.volume("tool", "Bash")["max"])
+    assert volume_anomalies(session_graph("spike", {"Bash": peak + 9, "Read": 10}), baseline) == []
+    hits = volume_anomalies(session_graph("spike", {"Bash": peak + 10, "Read": 10}), baseline)
+    assert len(hits) == 1 and hits[0].severity == WARNING
+    assert len(volume_anomalies(session_graph("spike", {"Bash": peak * 10, "Read": 10}), baseline)) == 1
+
+
+def test_the_floor_applies_to_the_no_variation_fallback():
+    """Twice a mean of one call is two calls, which is why the floor covers this rule too."""
+    one = BaselineLearner().learn_graphs([session_graph("only", {"Bash": 2, "Read": 10})])
+    assert one.volume("tool", "Bash")["std"] == 0.0
+    assert volume_anomalies(session_graph("double", {"Bash": 5, "Read": 10}), one) == []
+    assert volume_anomalies(session_graph("double", {"Bash": 5, "Read": 10}), one, 0)   # 2x the mean
+    hits = volume_anomalies(session_graph("flood", {"Bash": 12, "Read": 10}), one)
+    assert len(hits) == 1 and hits[0].z_score is None and hits[0].severity == WARNING
+
+
+def test_the_floor_is_configurable(baseline):
+    peak = int(baseline.volume("tool", "Bash")["max"])
+    session = session_graph("spike", {"Bash": peak + 11, "Read": 10})
+    assert len(volume_anomalies(session, baseline)) == 1                  # +11, past the default 10
+    assert volume_anomalies(session, baseline, min_call_delta=20) == []   # a stricter operator
+    assert len(volume_anomalies(session, baseline, min_call_delta=0)) == 1
+    assert AnomalyDetector(baseline).min_call_delta == CALL_MIN_DELTA_CALLS
+    assert AnomalyDetector(baseline, min_call_delta=-5).min_call_delta == 0    # never negative
 
 
 # ------------------------------------------------------------------- learning
@@ -76,7 +133,7 @@ def test_normal_volume_is_not_flagged(baseline, sessions):
 def test_three_sigma_spike_is_a_warning(baseline):
     stats = baseline.volume("tool", "Bash")
     count = int(stats["mean"] + VOLUME_SIGMA_WARNING * stats["std"]) + 2      # just past 3 sigma
-    hits = volume_anomalies(session_graph("spike", {"Bash": count, "Read": 10}), baseline)
+    hits = volume_anomalies(session_graph("spike", {"Bash": count, "Read": 10}), baseline, 0)
     assert [a.severity for a in hits] == [WARNING]
     assert VOLUME_SIGMA_WARNING < hits[0].z_score < VOLUME_SIGMA_CRITICAL
 
@@ -94,8 +151,8 @@ def test_exactly_at_three_sigma_is_not_flagged():
     two = [session_graph("a", {"Bash": 50}), session_graph("b", {"Bash": 54})]
     b = BaselineLearner().learn_graphs(two)
     assert b.volume("tool", "Bash")["mean"] == 52.0 and b.volume("tool", "Bash")["std"] == 2.0
-    assert volume_anomalies(session_graph("at", {"Bash": 58}), b) == []      # z == 3.0 exactly
-    assert len(volume_anomalies(session_graph("past", {"Bash": 59}), b)) == 1
+    assert volume_anomalies(session_graph("at", {"Bash": 58}), b, 0) == []   # z == 3.0 exactly
+    assert len(volume_anomalies(session_graph("past", {"Bash": 59}), b, 0)) == 1
 
 
 def test_exactly_at_five_sigma_is_a_warning_not_a_critical():
@@ -107,10 +164,10 @@ def test_exactly_at_five_sigma_is_a_warning_not_a_critical():
     """
     two = [session_graph("a", {"Bash": 50}), session_graph("b", {"Bash": 54})]
     b = BaselineLearner().learn_graphs(two)                 # mean 52, std 2
-    at = volume_anomalies(session_graph("at", {"Bash": 62}), b)
+    at = volume_anomalies(session_graph("at", {"Bash": 62}), b, 0)
     assert [a.z_score for a in at] == [VOLUME_SIGMA_CRITICAL]        # z == 5.0 exactly
     assert [a.severity for a in at] == [WARNING]
-    past = volume_anomalies(session_graph("past", {"Bash": 63}), b)
+    past = volume_anomalies(session_graph("past", {"Bash": 63}), b, 0)
     assert [a.severity for a in past] == [CRITICAL] and past[0].z_score > VOLUME_SIGMA_CRITICAL
 
 

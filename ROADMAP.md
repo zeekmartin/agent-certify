@@ -139,12 +139,14 @@ connection: everything below is read from the logs and decided offline.
   measured: `shell_var_domain` (a host built in a shell variable) and `ssh_tunnel_domain` (a host
   at the far end of an `ssh -L` forwarding) — reading either would mean evaluating the shell
   rather than parsing it
-- Exfiltration: outbound volume per destination, learned in the baseline and compared like call
-  volume
+- **Done** (unreleased): exfiltration — outbound volume per destination, learned in the baseline
+  and compared like call volume (`egress_volume_spike`), with the scan limits no longer dropping a
+  destination in silence (`destination_scan_truncated`). A fourth blind spot is measured in their
+  place: `file_upload_exfil`, a file whose size the log does not contain
 - Region policy: `forbidden_regions` (for example sanctioned countries), decided offline from the
   host name and an optional local IP-geolocation database; no DNS lookup unless explicitly enabled
 - Certificates record allowed and forbidden destinations
-- Benchmark: new fault types for shell egress, exfiltration and forbidden regions
+- Benchmark: new fault types for forbidden regions (shell egress and exfiltration: done)
 - `SECURITY.md` updated in the same change for every new category of input read
 
 ### v0.9.0 — Provenance

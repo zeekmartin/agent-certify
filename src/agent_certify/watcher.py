@@ -35,7 +35,7 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
-from agent_certify.anomaly import AnomalyDetector
+from agent_certify.anomaly import CALL_MIN_DELTA_CALLS, EGRESS_MIN_DELTA_BYTES, AnomalyDetector
 from agent_certify.baseline import Baseline
 from agent_certify.graph import AgentGraph
 from agent_certify.parser.auto import AutoParser
@@ -78,6 +78,8 @@ class SessionWatcher:
         max_seconds: float | None = None,
         out: Callable[[str], None] = print,
         on_scan: Callable | None = None,
+        min_call_delta: int = CALL_MIN_DELTA_CALLS,
+        min_egress_delta: int = EGRESS_MIN_DELTA_BYTES,
     ):
         if interval <= 0:
             raise ValueError("interval must be positive")
@@ -93,6 +95,8 @@ class SessionWatcher:
         self.max_seconds = max_seconds
         self.out = out
         self.on_scan = on_scan
+        self.min_call_delta = min_call_delta           # the volume floors; see AnomalyDetector
+        self.min_egress_delta = min_egress_delta
         self.history: list[dict] = []
         self._stop = threading.Event()
         self._last_size: int | None = None
@@ -193,7 +197,8 @@ class SessionWatcher:
 
         anomalies, report, all_violations = [], None, None
         if self.baseline:
-            report = AnomalyDetector(self.baseline).detect(graph, result)
+            report = AnomalyDetector(self.baseline, min_call_delta=self.min_call_delta,
+                                     min_egress_delta=self.min_egress_delta).detect(graph, result)
             for a in report.anomalies:
                 if a.severity in ("critical", "warning") and self._is_new(("anomaly", a.category, self._ident(a)),
                                                                           a.severity):

@@ -166,10 +166,10 @@ def test_injections_cover_every_anomaly_type(injector, session, split):
     injections = injector.injections(session, baseline)
     kinds = [i.kind for i in injections]
     assert sorted(kinds) == sorted(ANOMALY_TYPES)
-    assert len(ANOMALY_TYPES) == 10
+    assert len(ANOMALY_TYPES) == 14
     blind = sorted(i.kind for i in injections if i.is_blind_spot)
-    assert blind == sorted(BLIND_SPOTS) == ["shell_var_domain", "ssh_tunnel_domain"]
-    assert [i.expected_category for i in injections if i.is_blind_spot] == [None, None]
+    assert blind == sorted(BLIND_SPOTS) == ["file_upload_exfil", "shell_var_domain", "ssh_tunnel_domain"]
+    assert [i.expected_category for i in injections if i.is_blind_spot] == [None, None, None]
 
 
 def test_the_blind_spot_branch_is_reachable(injector, session, split):
@@ -253,6 +253,88 @@ def test_the_shell_domain_injection_closed_itself(injector, session, split):
         injector.inject_shell_domain(session, "  ")
 
 
+def test_the_egress_injectors_refuse_what_they_cannot_inject(injector, session):
+    """Every guard, so a fault that does not apply is named rather than half-injected."""
+    import copy
+
+    with pytest.raises(ValueError, match="factor must be"):
+        injector.inject_exfiltration(session, factor=1)
+    with pytest.raises(ValueError, match="decoys must be"):
+        injector.inject_decoy_flood(session, decoys=0)
+    with pytest.raises(ValueError, match="padding must be"):
+        injector.inject_padding_evasion(session, padding=0)
+    for inject in (injector.inject_decoy_flood, injector.inject_padding_evasion):
+        with pytest.raises(ValueError, match="domain is required"):
+            inject(session, "  ")
+        taken = injector.inject_foreign_domain(session, "taken.example.net")
+        with pytest.raises(ValueError, match="already a destination"):
+            inject(taken, "taken.example.net")
+
+    # A session that sent nothing anywhere has no volume to multiply.
+    quiet = copy.deepcopy(session)
+    quiet.egress_bytes.clear()
+    quiet.egress_calls.clear()
+    with pytest.raises(ValueError, match="reached no destination"):
+        injector.inject_exfiltration(quiet)
+    with pytest.raises(ValueError, match="reached no destination"):
+        injector.inject_file_upload_exfil(quiet)
+    with pytest.raises(ValueError, match="no outbound volume"):
+        injector.inject_exfiltration(quiet, domain="api.internal.example")
+
+
+def test_the_exfiltration_injection_changes_nothing_but_the_bytes(injector, session, split):
+    """The case for the check: every structural number is identical."""
+    _, _, baseline = split
+    g = injector.inject_exfiltration(session, factor=20)
+    assert sorted(g.nodes) == sorted(session.nodes)
+    assert {(e.source, e.target, e.weight) for e in g.edges} ==            {(e.source, e.target, e.weight) for e in session.edges}
+    assert g.total_tool_calls == session.total_tool_calls
+    assert g.seen_domains == session.seen_domains            # the same host as always
+    host = injector._busiest_domain(session)
+    assert g.egress_bytes[host] > 20 * session.egress_bytes[host]
+    report = BenchmarkRunner([session], baseline).detect(g, baseline)
+    assert [a.category for a in report.anomalies] == ["egress_volume_spike"]
+
+
+def test_the_decoy_flood_is_reported_as_a_truncated_scan(injector, session, split):
+    """The hidden host is still not read — the bound is real — but the session is not clean."""
+    _, _, baseline = split
+    injection = next(i for i in injector.injections(session, baseline) if i.kind == "decoy_flood")
+    g = injection.graph
+    assert injector.hidden_domain not in g.seen_domains      # past MAX_DOMAINS: not seen, as advertised
+    assert g.truncated_scans == 1 and g.truncated_network_scans == 1
+    report = BenchmarkRunner([session], baseline).detect(g, injection.baseline)
+    assert [a.category for a in report.anomalies] == ["destination_scan_truncated"]
+    assert report.anomalies[0].severity == CRITICAL
+
+
+def test_the_padding_evasion_is_read_through_the_padding(injector, session, split):
+    """70 000 characters of echo used to hide the host that followed. It no longer does."""
+    _, _, baseline = split
+    g = injector.inject_padding_evasion(session)
+    assert injector.padded_domain in g.seen_domains
+    assert g.truncated_scans == 0                            # nothing was cut: the string is read whole
+    report = BenchmarkRunner([session], baseline).detect(g, baseline)
+    assert [a.category for a in report.anomalies] == ["new_domain"]
+
+
+def test_the_file_upload_blind_spot_is_silent_but_present(injector, session, split):
+    """The log holds the file's name, never its size: measured, not hidden."""
+    _, _, baseline = split
+    g = injector.inject_file_upload_exfil(session)
+    host = injector._busiest_domain(session)
+    assert g.egress_calls[host] == session.egress_calls[host] + 1      # the call is seen
+    assert g.egress_bytes[host] < session.egress_bytes[host] * 1.1     # the payload is not
+    assert BenchmarkRunner([session], baseline).detect(g, baseline).anomalies == []
+
+
+def test_accept_domain_leaves_the_original_baseline_alone(injector, split):
+    _, _, baseline = split
+    accepted = injector.accept_domain(baseline, "*.decoy.example.net")
+    assert accepted.accepted_domains == {"*.decoy.example.net"}
+    assert baseline.accepted_domains == set()
+
+
 def test_foreign_domain_injector_guards(injector, session):
     graph = injector.inject_foreign_domain(session, "API.Unknown.CN")
     assert "api.unknown.cn" in graph.seen_domains
@@ -272,6 +354,9 @@ def test_foreign_domain_injector_guards(injector, session):
     ("foreign_domain", "new_domain", CRITICAL),
     ("shell_domain", "new_domain", CRITICAL),
     ("wrapped_shell_domain", "new_domain", CRITICAL),
+    ("exfiltration", "egress_volume_spike", WARNING),
+    ("decoy_flood", "destination_scan_truncated", CRITICAL),
+    ("padding_evasion", "new_domain", CRITICAL),
 ])
 def test_injection_produces_the_expected_anomaly_and_severity(split, injector, kind, category, severity):
     """The point of the benchmark: a known fault comes back as the anomaly it should."""
