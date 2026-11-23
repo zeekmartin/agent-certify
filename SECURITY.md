@@ -39,9 +39,10 @@ descriptions, call and error counts, project folder names, session ids and
 (see §6).
 
 Prompt text is never extracted. Tool inputs and tool outputs are **read but
-not returned**: they are walked for host names only, and nothing else of them
-leaves the parser — not the argument text, not the result text, not URL
-credentials, ports or paths. If that metadata is sensitive in your setting, do
+not returned**: they are walked for host names only — including, for a shell
+tool call, the host names in its command line (§6) — and nothing else of them
+leaves the parser: not the argument text, not the command text, not the result
+text, not URL credentials, ports or paths. If that metadata is sensitive in your setting, do
 not register the server, or start it from a working directory that contains
 nothing else.
 
@@ -99,11 +100,40 @@ but only when that call's own arguments already carried a destination — so a
 file read or a search result full of URLs is not treated as egress. The walk is
 bounded (8 levels deep, 2,000 strings, 64 KB per string, 200 hosts per call).
 
+**The command line of a shell tool call is read too** (since the
+`shell_domain` blind spot was closed; it is a *new category of input data*, so
+it is named here under the review rule below). The value of a field that
+carries a command — `command`, `cmd`, `script` and their variants, the full set
+is `SHELL_KEYS` — is parsed as a command line: split into segments on `|`,
+`||`, `&&`, `;`, `&` and newlines, tokenised with `shlex`, wrappers (`sudo`,
+`env VAR=x`, `time`, `nohup`, `command`, `exec`) and leading `VAR=value`
+assignments dropped. **Only host names are taken out of it, and only from the
+arguments of a known network client** (`curl`, `wget`, `ssh`, `scp`, `nc`,
+`git clone` … the full set is `NETWORK_COMMANDS`): nothing is read from the
+arguments of any other program, and nothing of the command line itself — not
+the program, not the flags, not the data, not file paths, not credentials in a
+`-u` argument — is kept, logged, reported or transmitted.
+
+A command **inside** a command is read the same way, one level deep
+(`MAX_SHELL_DEPTH = 1`): the value of `bash -c` and the other shell wrappers
+(`_SHELL_WRAPPERS`), and the remote command of `ssh host '<command>'`. The
+inner program is judged by the same rule, and nothing but host names comes out
+of it either.
+
+The command is **parsed, never evaluated and never executed**: no variable is
+expanded, no substitution is run, no file is opened, nothing is spawned. A host
+built in a shell variable, or at the far end of an `ssh -L` forwarding, is
+consequently not read at all — both are measured blind spots
+(`shell_var_domain`, `ssh_tunnel_domain`) in the injection benchmark. The same
+bounds apply, with each argument examined costing one against the 2,000-string
+budget, nesting bounded by the depth limit, and a command line that fails to
+tokenise falling back to a whitespace split rather than raising.
+
 **What is kept.** Only host names, lowercased, with URL credentials, port, path
 and query discarded, and nothing resolved: a name is never turned into an
-address. No argument text, result text, prompt or file content is kept at any
-point. The hosts live on the graph (`seen_domains`) and on the calling node, so
-a report can say which tool reached which host.
+address. No argument text, result text, command text, prompt or file content is
+kept at any point. The hosts live on the graph (`seen_domains`) and on the
+calling node, so a report can say which tool reached which host.
 
 **What is stored on disk.** `agent-certify learn` writes every host it saw into
 `known_domains` in `.agent-certify/baseline.json`, alongside the `*.cn`-style
@@ -126,7 +156,9 @@ out of this tool.
 field, a new part of a record, anything beyond the structural metadata listed
 in §1 — requires a review and an update of this document in the same change.
 Network destinations shipped in v0.7.0 without one, and this section is the
-correction.
+correction. Reading the command line of shell tool calls is the first feature
+to go through it: the paragraph above was written in the same change as the
+code.
 
 ## Supported versions
 

@@ -166,10 +166,10 @@ def test_injections_cover_every_anomaly_type(injector, session, split):
     injections = injector.injections(session, baseline)
     kinds = [i.kind for i in injections]
     assert sorted(kinds) == sorted(ANOMALY_TYPES)
-    assert len(ANOMALY_TYPES) == 7
+    assert len(ANOMALY_TYPES) == 10
     blind = sorted(i.kind for i in injections if i.is_blind_spot)
-    assert blind == sorted(BLIND_SPOTS) == ["shell_domain"]
-    assert [i.expected_category for i in injections if i.is_blind_spot] == [None]
+    assert blind == sorted(BLIND_SPOTS) == ["shell_var_domain", "ssh_tunnel_domain"]
+    assert [i.expected_category for i in injections if i.is_blind_spot] == [None, None]
 
 
 def test_the_blind_spot_branch_is_reachable(injector, session, split):
@@ -187,19 +187,68 @@ def test_the_blind_spot_branch_is_reachable(injector, session, split):
     row = next(t for t in result.per_type if t.kind == injection.kind)
     assert row.is_blind_spot and row.expected == "(blind spot)"
     assert row.trials and row not in result.covered         # excluded from the detection rate
-    assert result.blind_spots == ["shell_domain"]
+    assert result.blind_spots == list(BLIND_SPOTS)
     assert "not covered by any check" in result.table()
 
 
-def test_the_blind_spot_injection_is_not_rigged_to_be_silent(injector, session):
-    """It runs the production extractor; a graph host would make it report."""
-    graph = injector.inject_shell_domain(session)
-    assert graph.seen_domains == session.seen_domains        # extraction found nothing to record
-    assert graph.nodes[injector._busiest_tool(graph)].metadata["injected"] == "shell_domain"
-    # The same fault with a scheme *is* extracted, which is what makes the gap
-    # specific rather than a claim: this is the shape the day it closes.
+def test_the_blind_spot_injections_are_not_rigged_to_be_silent(injector, session):
+    """They run the production extractor; a graph host would make them report."""
     from agent_certify.domains import extract_call_domains
-    assert extract_call_domains({"url": f"https://{injector.shell_domain}/health"}) == {injector.shell_domain}
+
+    graph = injector.inject_shell_var_domain(session)
+    assert graph.seen_domains == session.seen_domains        # extraction found nothing to record
+    assert graph.nodes[injector._busiest_tool(graph)].metadata["injected"] == "shell_var_domain"
+    # The same host as an argument of the client *is* extracted, which is what
+    # makes the gap specific rather than a claim: only the variable hides it.
+    assert extract_call_domains({"command": f"curl -sS {injector.shell_var_domain}/health"}) == {
+        injector.shell_var_domain}
+
+    # The tunnel: the jump host is recorded (it is one the session already
+    # reaches, so it is no anomaly), and the tunnelled host is not.
+    tunnel = injector.inject_ssh_tunnel_domain(session)
+    assert tunnel.seen_domains == session.seen_domains
+    assert injector.ssh_tunnel_domain not in tunnel.seen_domains
+    assert tunnel.nodes[injector._busiest_tool(tunnel)].metadata["injected"] == "ssh_tunnel_domain"
+    # Connected to directly, the same host would be reported.
+    assert extract_call_domains({"command": f"ssh ops@{injector.ssh_tunnel_domain}"}) == {
+        injector.ssh_tunnel_domain}
+
+    for inject in (injector.inject_shell_var_domain, injector.inject_ssh_tunnel_domain,
+                   injector.inject_wrapped_shell_domain):
+        with pytest.raises(ValueError, match="domain is required"):
+            inject(session, "  ")
+        with pytest.raises(ValueError, match="already a destination"):
+            inject(injector.inject_foreign_domain(session, "taken.example.net"), "taken.example.net")
+
+
+def test_the_wrapped_shell_injection_is_detected(injector, session, split):
+    """bash -c "curl …": the same gap as shell_domain, one level in, and covered too."""
+    _, _, baseline = split
+    graph = injector.inject_wrapped_shell_domain(session)
+    assert injector.wrapped_shell_domain in graph.seen_domains
+    assert sorted(graph.nodes) == sorted(session.nodes)      # nothing structural, as ever
+    injection = next(i for i in injector.injections(session, baseline) if i.kind == "wrapped_shell_domain")
+    assert not injection.is_blind_spot
+    assert injection.expected_category == "new_domain" and injection.min_severity == CRITICAL
+
+
+def test_the_shell_domain_injection_closed_itself(injector, session, split):
+    """v0.7.0 measured it as a blind spot; reading the command line turned it into a detection.
+
+    The injection builds the same argument object it always did and passes it
+    to the production extractor — nothing in `inject_shell_domain` knows what
+    the answer should be. It reports now because extraction reaches further,
+    which is the whole case for injecting a gap instead of asserting it.
+    """
+    _, _, baseline = split
+    graph = injector.inject_shell_domain(session)
+    assert injector.shell_domain in graph.seen_domains
+    assert graph.nodes[injector._busiest_tool(graph)].metadata["injected"] == "shell_domain"
+    assert sorted(graph.nodes) == sorted(session.nodes)      # still nothing structural
+    assert {(e.source, e.target, e.weight) for e in graph.edges} ==            {(e.source, e.target, e.weight) for e in session.edges}
+    injection = next(i for i in injector.injections(session, baseline) if i.kind == "shell_domain")
+    assert not injection.is_blind_spot
+    assert injection.expected_category == "new_domain" and injection.min_severity == CRITICAL
     with pytest.raises(ValueError, match="domain is required"):
         injector.inject_shell_domain(session, "  ")
 
@@ -221,6 +270,8 @@ def test_foreign_domain_injector_guards(injector, session):
     ("volume_spike", "call_volume_spike", WARNING),
     ("forbidden_tool", "new_tool", CRITICAL),
     ("foreign_domain", "new_domain", CRITICAL),
+    ("shell_domain", "new_domain", CRITICAL),
+    ("wrapped_shell_domain", "new_domain", CRITICAL),
 ])
 def test_injection_produces_the_expected_anomaly_and_severity(split, injector, kind, category, severity):
     """The point of the benchmark: a known fault comes back as the anomaly it should."""
@@ -331,7 +382,7 @@ def test_result_table_and_dict(split):
     assert "Anomaly injection benchmark" in table and "detection rate 100.0%" in table
     for kind in ANOMALY_TYPES:
         assert kind in table
-    assert "blind spots: shell_domain" in table           # the line only appears when there are some
+    assert "blind spots: shell_var_domain" in table       # the line only appears when there are some
     assert "what was injected:" in table                  # every row's note is rendered
     assert all(t.note in table for t in result.per_type)
     data = json.loads(json.dumps(result.to_dict()))       # must be JSON-serialisable as it stands

@@ -6,6 +6,62 @@ project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Shell command egress**: the command line of a shell tool call is now read
+  for network destinations, which closes the `shell_domain` blind spot v0.7.0
+  shipped and measured. `{"command": "curl -sS collector.example.net/x"}` gives
+  `collector.example.net`, so the most common exfiltration path in an agent
+  session reaches the baseline and fires `new_domain`:
+  `[CRITICAL] Network destination collector.example.net in tool call — not in baseline`
+- `agent_certify.domains.domains_in_command()`, with `SHELL_KEYS` (the fields
+  that carry a command: `command`, `cmd`, `script` and their variants) and
+  `NETWORK_COMMANDS` (the programs whose arguments name a destination: `curl`,
+  `wget`, `http`/`https`, `nc`, `ncat`, `netcat`, `socat`, `telnet`, `ssh`,
+  `scp`, `sftp`, `rsync`, `ftp`, `git` for its remote subcommands only, and
+  `Invoke-WebRequest`, `Invoke-RestMethod`, `iwr`, `irm`, `Test-NetConnection`).
+  The line is split on `|`, `||`, `&&`, `;`, `&` and newlines, tokenised with
+  `shlex`, and `sudo`, `env VAR=x`, `time`, `nohup`, `command`, `exec` and
+  leading `VAR=value` assignments are skipped. A destination is a positional
+  argument shaped like `host`, `host:port`, `host/path`, `user@host` or
+  `user@host:path`, a URL, or the value of an option that names one (`-x`,
+  `--proxy`, `--resolve`, `--connect-to`, `ssh -J`)
+- a command **inside** a command is read one level deep (`MAX_SHELL_DEPTH`):
+  the value of `bash -c`, `sh -c`, `zsh -c`, `dash -c`, `pwsh -Command`,
+  `powershell -Command` and `cmd /c` (bundled short flags such as `bash -lc`
+  included), and the remote command of `ssh host '<command>'`, which records
+  both the host connected to and the host that command then reached. The inner
+  program is judged by the same rule, so `bash -c "echo example.com"` gives
+  nothing
+- `extract_domains(payload, shell_key=...)`, the shell counterpart of
+  `network_key`
+- `AnomalyInjector.inject_wrapped_shell_domain()` and the
+  `wrapped_shell_domain` anomaly type (`new_domain`, critical): a host inside
+  the command a shell wrapper runs
+- `AnomalyInjector.inject_shell_var_domain()`, `.inject_ssh_tunnel_domain()`
+  and the `shell_var_domain` / `ssh_tunnel_domain` anomaly types: the
+  benchmark's **two new blind spots**, a host a command builds in a shell
+  variable (`h=<host>; curl -sS $h/health`) and a host at the far end of a
+  forwarding (`ssh -L 8080:<host>:80 ops@<jump>`, where the jump host is
+  recorded and the tunnelled one is not). Reading the first would mean
+  evaluating the shell rather than parsing it; the second is the middle field
+  of an option value that names no destination. Both are boundaries kept on
+  purpose — so they are injected and measured rather than left unsaid
+- `tests/test_shell_egress.py`: every recognised program, pipes and chains,
+  wrappers, broken quoting, PowerShell, `user@host:path`, address literals and
+  ports — and the negative twin of each, plus a non-regression suite that
+  re-runs every extraction case `tests/test_domains.py` asserts
+
+### Changed
+- the injection benchmark's `shell_domain` is now an expected *detection*
+  (`new_domain`, critical) rather than an expected miss, and `BLIND_SPOTS` is
+  `("shell_var_domain", "ssh_tunnel_domain")`. The injection itself did not
+  change: it builds the same argument object and passes it to the production
+  extractor, so the row moved on its own — **10 fault types, 48/48 detected on
+  the eight covered ones, no false positives**
+- nothing else of a command line is read, kept or transmitted: only host names,
+  and only from the arguments of a recognised client. `SECURITY.md` §6 and §1
+  are updated in the same change, under the review rule §6 states
+
 ## [0.7.0] - 2026-11-06
 
 The v0.6.1 benchmark measured one blind spot and reported it for a release

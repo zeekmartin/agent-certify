@@ -141,12 +141,18 @@ def test_a_bare_host_is_truncated_like_a_url_search():
     assert extract_domains({"host": "a" * (4 * MAX_STRING_CHARS)}) == set()
 
 
-def test_a_host_in_a_shell_command_is_a_known_blind_spot():
-    """Documented and measured by the benchmark's shell_domain injection, not asserted away."""
-    assert extract_call_domains({"command": "curl -sS collector.example.net/health"}) == set()
-    # With a scheme it is found, which is what makes the gap specific.
+def test_a_host_in_a_shell_command_is_read():
+    """Was a measured blind spot; closed by domains_in_command (tests/test_shell_egress.py).
+
+    The one assertion in this file whose result moved: a bare host as the
+    positional argument of a known network client is now a destination, with or
+    without a scheme. A host the command merely mentions still is not.
+    """
+    assert extract_call_domains({"command": "curl -sS collector.example.net/health"}) == {
+        "collector.example.net"}
     assert extract_call_domains({"command": "curl -sS https://collector.example.net/health"}) == {
         "collector.example.net"}
+    assert extract_call_domains({"command": "grep -rn collector.example.net ."}) == set()
 
 
 def test_merge_keeps_every_callers_destinations():

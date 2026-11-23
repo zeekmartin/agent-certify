@@ -133,8 +133,12 @@ Fixes the actionable findings of the 2026-10-27 security audit (45 findings: 3 h
 Where an agent's data goes, and how much of it. agent-certify itself still makes no network
 connection: everything below is read from the logs and decided offline.
 
-- Close the `shell_domain` blind spot: hosts named inside shell commands (`curl`, `wget`, `scp`,
-  `ssh`, `nc` …) are destinations (INV-001)
+- **Done** (unreleased): the `shell_domain` blind spot is closed — hosts named inside shell
+  commands (`curl`, `wget`, `scp`, `ssh`, `nc` …) are destinations, including inside the command a
+  shell wrapper or an `ssh` runs (INV-001). Two blind spots take its place in the benchmark, both
+  measured: `shell_var_domain` (a host built in a shell variable) and `ssh_tunnel_domain` (a host
+  at the far end of an `ssh -L` forwarding) — reading either would mean evaluating the shell
+  rather than parsing it
 - Exfiltration: outbound volume per destination, learned in the baseline and compared like call
   volume
 - Region policy: `forbidden_regions` (for example sanctioned countries), decided offline from the
