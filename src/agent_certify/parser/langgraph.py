@@ -71,7 +71,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
-from agent_certify.domains import extract_call_domains
+from agent_certify.domains import measure_call
 from agent_certify.graph import AgentGraph
 from agent_certify.parser.base import BaseParser, iso, read_records, to_datetime
 from agent_certify.paths import MAX_FILES
@@ -353,49 +353,65 @@ class LangGraphParser(BaseParser):
         name = _text(rec.get("name")) if event in _TOOL_EVENTS else _first(rec, _TOOL_KEYS)
         if name:
             state.tool_pending = True
-            self._tool_call(g, state, caller, name, _first(rec, _ID_KEYS),
-                            self._failed(rec, _dict(rec.get("payload")), event),
-                            finished=event in _END_EVENTS or _text(rec.get("status")) in ("end", "finished"))
-            self._destinations(g, rec, f"tool:{name}")
+            counted = self._tool_call(
+                g, state, caller, name, _first(rec, _ID_KEYS),
+                self._failed(rec, _dict(rec.get("payload")), event),
+                finished=event in _END_EVENTS or _text(rec.get("status")) in ("end", "finished"))
+            self._destinations(g, rec, f"tool:{name}", counted)
         for call in _as_list(rec.get("tool_calls")):
             entry = _dict(call)
             tool = _text(entry.get("name")) or _first(entry, _TOOL_KEYS)
             if tool:
                 state.tool_pending = True
-                self._tool_call(g, state, caller, tool, _first(entry, _ID_KEYS),
-                                bool(entry.get("error")), finished=False)
-                self._destinations(g, entry, f"tool:{tool}")
+                counted = self._tool_call(g, state, caller, tool, _first(entry, _ID_KEYS),
+                                           bool(entry.get("error")), finished=False)
+                self._destinations(g, entry, f"tool:{tool}", counted)
 
     @staticmethod
-    def _destinations(g: AgentGraph, rec: dict, target: str) -> None:
-        """Network destinations of one tool record: its input, and its output when the input had one."""
+    def _destinations(g: AgentGraph, rec: dict, target: str, counted: bool = True) -> None:
+        """Destinations and outbound size of one tool record: its input, and its output when the input had one.
+
+        ``counted`` is False for a record that re-states a call already
+        counted (the end event of a call whose start was read), so its bytes
+        are not added twice.
+        """
         data = _dict(rec.get("data"))
         payload = {k: v for k, v in rec.items() if k != "data"}
         arguments = [payload] + [data[k] for k in _INPUT_KEYS if k in data]
         result = [data[k] for k in _OUTPUT_KEYS if k in data] or None
-        found = extract_call_domains(arguments, result)
-        if found:
-            g.record_domains(target, found)
+        egress = measure_call(arguments, result)
+        if egress.domains:
+            g.record_egress(target, egress.domains,
+                            egress.outbound_bytes if counted else 0, calls=1 if counted else 0)
+        if egress.truncated:
+            g.note_scan_truncation(target, egress.truncated, network=egress.network)
 
     @staticmethod
     def _tool_call(g: AgentGraph, state: _State, caller: str, name: str, call_id: str,
-                   failed: bool, finished: bool) -> None:
+                   failed: bool, finished: bool) -> bool:
+        """Record one tool call; True when it counted a call this record had not counted yet.
+
+        The end event of a call whose start was already read counts nothing,
+        and the caller uses that to add the outbound bytes once per call rather
+        than once per record.
+        """
         target = f"tool:{name}"
         g.add_node(target, "tool", name)
         key = (caller, target, call_id)
         if failed:
             if state.open.pop(key, None) is not None:
                 g.record_error(caller, target)      # this call was counted when it started
-            else:
-                g.add_call(caller, target, error=True)
-                state.tool_calls += 1
-        elif finished and state.open.pop(key, None) is not None:
-            pass                                    # start already counted
-        else:
-            g.add_call(caller, target)
+                return False
+            g.add_call(caller, target, error=True)
             state.tool_calls += 1
-            if not finished:
-                state.open[key] = True
+            return True
+        if finished and state.open.pop(key, None) is not None:
+            return False                            # start already counted
+        g.add_call(caller, target)
+        state.tool_calls += 1
+        if not finished:
+            state.open[key] = True
+        return True
 
     @staticmethod
     def _failed(rec: dict, payload: dict, event: str) -> bool:

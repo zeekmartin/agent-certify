@@ -135,7 +135,10 @@ class MCPLogsParser(BaseParser):
             elif g.get_edge(ORCHESTRATOR, nid):
                 g.record_error(ORCHESTRATOR, nid)
             if ev.get("domains"):
-                g.record_domains(nid, ev["domains"])
+                # A server's log line names an endpoint but carries no
+                # arguments, so there is no size to read: the destination is
+                # recorded with a call and zero bytes rather than a guess.
+                g.record_egress(nid, ev["domains"], outbound_bytes=0)
         sessions.discard(None)
         g.skipped_records = self.skipped_lines
         g.total_records = self.records_seen

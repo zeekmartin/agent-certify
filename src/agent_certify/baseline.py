@@ -40,6 +40,14 @@ rarely would otherwise have a mean near zero and fire every time it is used at
 all. ``sessions`` records how many that was, so a check can say what the
 numbers rest on.
 
+**Outbound volume.** ``domain_egress_volume`` is the same statistic for the
+*bytes* each destination received, keyed by host name and learned from the same
+sessions in the same way — only those where the host appeared, for the same
+reason. It is what ``egress_volume_spike`` compares a session against: a
+destination the baseline has learned receiving far more than it ever did is the
+shape of exfiltration, and nothing else in the baseline can see it, because the
+topology, the call counts and the host name are all unchanged.
+
 The sets are stored in the baseline file and copied forward by
 :func:`carry_overrides`, which ``agent-certify learn`` calls. A later
 ``accept``/``reject`` overrides an earlier one on the same tool: "permanent"
@@ -99,6 +107,7 @@ def session_features(graph: AgentGraph, scan: ScanResult | None = None) -> dict:
         "tool_volume": {n.name: n.call_count for n in graph.nodes.values() if n.kind == "tool"},
         "link_volume": link_volume(graph),
         "domains": set(graph.seen_domains),
+        "egress_volume": dict(graph.egress_bytes),
     }
 
 
@@ -164,6 +173,9 @@ class Baseline:
     # Defaulted, so a baseline written by <= 0.6.1 still loads.
     tool_call_volume: dict[str, dict] = field(default_factory=dict)
     link_call_volume: dict[str, dict] = field(default_factory=dict)
+    #: Outbound bytes per destination: host -> {"mean", "std", "max", "sessions"}.
+    #: Defaulted, so a baseline written by <= 0.7.0 still loads.
+    domain_egress_volume: dict[str, dict] = field(default_factory=dict)
     known_domains: set[str] = field(default_factory=set)
     accepted_domains: set[str] = field(default_factory=set)
     rejected_domains: set[str] = field(default_factory=set)
@@ -174,13 +186,18 @@ class Baseline:
                     or self.accepted_domains or self.rejected_domains)
 
     def volume(self, scope: str, key: str) -> dict | None:
-        """Learned call volume for a tool name or a link key, or None when it was never seen.
+        """Learned volume for a tool name, a link key or a destination; None when never seen.
 
-        ``scope`` is ``"tool"`` or ``"link"``. A key with no entry has no
-        baseline to deviate from: that it is new is the business of
-        ``new_tool`` / ``new_link``, not of a volume check.
+        ``scope`` is ``"tool"``, ``"link"`` or ``"egress"`` (bytes per
+        destination). A key with no entry has no baseline to deviate from: that
+        it is new is the business of ``new_tool`` / ``new_link`` /
+        ``new_domain``, not of a volume check.
         """
-        source = self.tool_call_volume if scope == "tool" else self.link_call_volume
+        try:
+            source = {"tool": self.tool_call_volume, "link": self.link_call_volume,
+                      "egress": self.domain_egress_volume}[scope]
+        except KeyError:
+            raise ValueError(f"unknown volume scope {scope!r}; expected tool, link or egress") from None
         stats = source.get(key)
         return stats if isinstance(stats, dict) else None
 
@@ -196,6 +213,7 @@ class Baseline:
         d["rejected_domains"] = sorted(self.rejected_domains)
         d["tool_call_volume"] = dict(sorted(self.tool_call_volume.items()))
         d["link_call_volume"] = dict(sorted(self.link_call_volume.items()))
+        d["domain_egress_volume"] = dict(sorted(self.domain_egress_volume.items()))
         d["tool_frequency"] = dict(sorted(self.tool_frequency.items(), key=lambda kv: (-kv[1], kv[0])))
         return d
 
@@ -232,7 +250,7 @@ class Baseline:
                         "accepted_domains", "rejected_domains"):
                 if key in data:
                     _check(isinstance(data[key], list) and all(isinstance(t, str) for t in data[key]))
-            for key in ("tool_call_volume", "link_call_volume"):
+            for key in ("tool_call_volume", "link_call_volume", "domain_egress_volume"):
                 if key in data:
                     _check(isinstance(data[key], dict))
                     for name, stats in data[key].items():
@@ -364,6 +382,7 @@ class BaselineLearner:
             version=__version__,
             tool_call_volume=_collect_volume(feats, "tool_volume"),
             link_call_volume=_collect_volume(feats, "link_volume"),
+            domain_egress_volume=_collect_volume(feats, "egress_volume"),
             known_domains=set().union(*(f["domains"] for f in feats)),
             fi_min=min(f["fi"] for f in feats),
             fi_max=max(f["fi"] for f in feats),

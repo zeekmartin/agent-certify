@@ -45,7 +45,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from agent_certify import __version__
-from agent_certify.anomaly import AnomalyDetector, AnomalyReport
+from agent_certify.anomaly import (
+    CALL_MIN_DELTA_CALLS,
+    EGRESS_MIN_DELTA_BYTES,
+    AnomalyDetector,
+    AnomalyReport,
+)
 from agent_certify.baseline import (
     DEFAULT_BASELINE_PATH,
     Baseline,
@@ -379,12 +384,21 @@ def cmd_scan(args) -> int:
     return 0
 
 
+def _detector(baseline: Baseline | None, source: str, args) -> AnomalyDetector | None:
+    """The detector a command builds from its arguments, floors included."""
+    if not baseline:
+        return None
+    return AnomalyDetector(baseline, source,
+                           min_call_delta=getattr(args, "min_call_delta", CALL_MIN_DELTA_CALLS),
+                           min_egress_delta=getattr(args, "min_egress_delta", EGRESS_MIN_DELTA_BYTES))
+
+
 def _scan_report(args) -> list[dict]:
     """Print the report; return every session's graph, scan, anomalies and violations."""
     graphs, merged = load(args.path, include_mcp=args.include_mcp)
     baseline, source = _find_baseline(args)
     policy, policy_source = _find_policy(args)
-    detector = AnomalyDetector(baseline, source) if baseline else None
+    detector = _detector(baseline, source, args)
     sessions = []
     for g in graphs:
         r = AgentFIScanner(g, perspective=args.perspective).scan()
@@ -475,6 +489,7 @@ def cmd_watch(args) -> int:
             def out(line):
                 print(line, file=sys.stderr)
     SessionWatcher(str(session), baseline=baseline, policy=policy, interval=args.interval,
+                   min_call_delta=args.min_call_delta, min_egress_delta=args.min_egress_delta,
                    perspective=args.perspective, max_scans=args.scans, max_seconds=args.duration,
                    out=out, on_scan=on_scan).watch()
     return 0
@@ -832,6 +847,12 @@ def _baseline_args(p: argparse.ArgumentParser) -> None:
     g = p.add_mutually_exclusive_group()
     g.add_argument("--baseline", help=f"baseline to compare against (default: {DEFAULT_BASELINE_PATH} if present)")
     g.add_argument("--no-baseline", action="store_true", help="skip anomaly detection")
+    p.add_argument("--min-call-delta", type=int, default=CALL_MIN_DELTA_CALLS, metavar="N",
+                   help="report a call-volume rise only when it passes the baseline maximum by at "
+                        f"least N calls (default: {CALL_MIN_DELTA_CALLS}; 0 turns the floor off)")
+    p.add_argument("--min-egress-delta", type=int, default=EGRESS_MIN_DELTA_BYTES, metavar="BYTES",
+                   help="report an outbound-volume rise only when it passes the baseline maximum by "
+                        f"at least BYTES (default: {EGRESS_MIN_DELTA_BYTES}; 0 turns the floor off)")
 
 
 def _otel_args(p: argparse.ArgumentParser) -> None:

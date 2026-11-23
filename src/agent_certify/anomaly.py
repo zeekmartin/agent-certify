@@ -23,6 +23,11 @@ spike           often than 3 sigma above the mean          critical past 5
 new_domain      a network destination never seen, and not   critical
                 accepted
 rejected_domain a destination matching a rejected pattern  critical
+egress_volume_  a known destination receiving far more      warning past 3 sigma;
+spike           bytes than the baseline ever saw            critical past 5
+destination_    a limit stopped a call's destination scan,  warning; critical
+scan_truncated  so a host after it was not read             when that call did
+                                                           reach a destination
 ==============  =========================================  ======================
 
 **Call volume** answers a question the other checks do not: not *whether* a
@@ -30,6 +35,15 @@ tool was used but *how much*. A tool whose calls jump from 50 to 500 is known,
 reaches no new path and may fail no more often than usual, so until v0.7 it
 passed every check — the injection benchmark measured that blind spot before
 this check closed it.
+
+Both volume checks apply an **absolute floor** as well as a relative one: the
+count must pass the baseline's maximum by at least
+:data:`CALL_MIN_DELTA_CALLS` calls, or :data:`EGRESS_MIN_DELTA_BYTES` bytes,
+before anything is reported. Three deviations above a mean of 402 bytes is 981
+bytes, and twice a mean of one call is two calls; neither is a finding, and a
+check that reports them teaches an operator to ignore it. The floors are
+arguments of :class:`AnomalyDetector` and of ``agent-certify scan``
+(``--min-call-delta``, ``--min-egress-delta``), and zero turns one off.
 
 Volume is compared per link first and per tool second, and a tool is not
 reported when a link to it already is: if one agent is responsible, the
@@ -43,6 +57,27 @@ session is not a risk.
 are patterns, with the precedence that applies to tools: a rejected pattern
 fires even for a host the baseline has learned, and even if a pattern accepts
 it too.
+
+**Outbound volume** is call volume's counterpart for data: how many *bytes*
+went to each destination, compared against what that destination usually
+receives (``domain_egress_volume``). It is the one check that can see
+exfiltration to a host that is entirely normal — the topology, the call counts
+and the host name are all unchanged, and only the size of what left is out of
+place. A destination the baseline never saw is ``new_domain``'s business, not
+this check's, and only increases are reported. The sizes are read from the
+logs: argument text and literal command-line payloads, never the bytes actually
+put on the wire, and never the size of a file an upload named
+(:func:`~agent_certify.domains.measure_call`).
+
+**A truncated scan** is reported rather than hidden. Reading destinations out
+of an argument object is bounded (hosts per call, strings per call, nesting
+depth), and until v0.8 a host that fell past a bound disappeared with no trace:
+200 decoy hosts in one command, or a megabyte of padding, hid the next one for
+free. The bounds remain, because untrusted input needs them, but reaching one
+is now counted on the call and on the graph and reported as
+``destination_scan_truncated`` — critical when that call did name a
+destination, since then something left the machine and the picture of where is
+known to be incomplete.
 
 Three baseline overrides change what ``new_tool`` and ``new_link`` consider
 normal, and they are decisions rather than statistics, so they win over what was
@@ -63,13 +98,21 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 
 from agent_certify.baseline import Baseline, link_volume, node_role
-from agent_certify.domains import matching_pattern
+from agent_certify.domains import TRUNCATION_REASONS, format_bytes, matching_pattern
 from agent_certify.graph import AgentGraph
 from agent_certify.scanner import ScanResult
 
 CRITICAL, WARNING, INFO = "critical", "warning", "info"
 _ORDER = {CRITICAL: 0, WARNING: 1, INFO: 2}
 _CATEGORICAL = {"new_tool", "new_link", "new_domain", "rejected_domain"}
+#: What each truncation reason meant, for the message. Keyed by
+#: :data:`~agent_certify.domains.TRUNCATION_REASONS`.
+_TRUNCATION_TEXT = {
+    "domains": "a call named more hosts than are kept per call",
+    "strings": "a call held more strings than are examined per call",
+    "string": "a string was longer than the limit on one string",
+    "depth": "an argument object nested deeper than the walk goes",
+}
 _EPS = 1e-9
 
 #: Call volume past this many deviations above the mean is a warning, and past
@@ -81,6 +124,19 @@ VOLUME_SIGMA_CRITICAL = 5.0
 #: count), there is no sigma to compare against. A multiple of the mean stands
 #: in for it: the same fallback the other checks make at the lower severity.
 VOLUME_RATIO_WARNING = 2.0
+
+#: **The absolute floor.** A relative threshold alone is noise on small
+#: numbers: three deviations above a mean of 402 bytes is 981 bytes, and twice
+#: a mean of one call is two calls. Neither is exfiltration, and reporting them
+#: trains an operator to ignore the check that matters. So a rise is reported
+#: only when it also passes the most the baseline ever saw by at least this
+#: much — a floor in the unit being measured, not a multiple of it.
+#:
+#: Both are overridable per detector (:class:`AnomalyDetector`) and from the
+#: command line (``--min-call-delta``, ``--min-egress-delta``). **Zero turns
+#: the floor off**, leaving the relative thresholds alone.
+CALL_MIN_DELTA_CALLS = 10
+EGRESS_MIN_DELTA_BYTES = 10 * 1024
 
 
 @dataclass
@@ -158,9 +214,18 @@ class AnomalyDetector:
         report.has_critical
     """
 
-    def __init__(self, baseline: Baseline, source: str = ""):
+    def __init__(self, baseline: Baseline, source: str = "",
+                 min_call_delta: int = CALL_MIN_DELTA_CALLS,
+                 min_egress_delta: int = EGRESS_MIN_DELTA_BYTES):
+        """``min_call_delta`` and ``min_egress_delta`` are the absolute floors
+        the two volume checks apply on top of their sigma thresholds; see
+        :data:`CALL_MIN_DELTA_CALLS` and :data:`EGRESS_MIN_DELTA_BYTES`. Zero
+        turns a floor off.
+        """
         self.baseline = baseline
         self.source = source
+        self.min_call_delta = max(0, int(min_call_delta))
+        self.min_egress_delta = max(0, int(min_egress_delta))
 
     def detect(self, graph: AgentGraph, scan_result: ScanResult) -> AnomalyReport:
         """Run all anomaly checks."""
@@ -173,6 +238,8 @@ class AnomalyDetector:
         anomalies += self._check_node_count(graph)
         anomalies += self._check_call_volume(graph)
         anomalies += self._check_domains(graph)
+        anomalies += self._check_egress_volume(graph)
+        anomalies += self._check_scan_truncation(graph)
         anomalies.sort(key=lambda a: _ORDER[a.severity])
         return AnomalyReport(session_id=graph.session_id or "", anomalies=anomalies,
                              baseline_source=self.source, learned_from=self.baseline.learned_from)
@@ -311,7 +378,8 @@ class AnomalyDetector:
                         z, f"Types: {', '.join(types)}")]
 
     # ------------------------------------------------------------ volume
-    def _volume_verdict(self, count: int, stats: dict) -> tuple[str, float | None, str] | None:
+    def _volume_verdict(self, count: float, stats: dict, fmt=None,
+                        min_delta: float = 0) -> tuple[str, float | None, str] | None:
         """(severity, z, how the baseline reads) for a count, or None when it is normal.
 
         Past :data:`VOLUME_SIGMA_WARNING` deviations above the mean it is a
@@ -319,9 +387,22 @@ class AnomalyDetector:
         deviation to compare against, :data:`VOLUME_RATIO_WARNING` times the
         mean stands in, reported at warning with no z-score — the same thing
         the other checks do when the baseline never varied.
+
+        ``min_delta`` is the absolute floor: whichever of those two rules
+        fires, the count must also pass the baseline's **maximum** by at least
+        this much, or nothing is reported. It is what keeps a relative
+        threshold from firing on small numbers, where a large multiple is a
+        small difference. Zero turns it off.
+
+        ``fmt`` renders the baseline numbers; outbound volume passes a byte
+        formatter so the reference reads ``2.0 KB ± 300 B`` and not ``2048``.
         """
+        fmt = fmt or (lambda v: f"{v:.0f}")
         mean, std = float(stats.get("mean", 0.0)), float(stats.get("std", 0.0))
         sessions = int(stats.get("sessions", 0) or 0)
+        peak = float(stats.get("max", 0.0))
+        if min_delta > 0 and count - peak < min_delta:
+            return None                    # a rise too small to be worth a word
         if std > _EPS:
             z = (count - mean) / std
             if z <= VOLUME_SIGMA_WARNING:
@@ -329,14 +410,14 @@ class AnomalyDetector:
             # Both bounds are exclusive, as "past 3 sigma" and "past 5" say:
             # exactly 5.0 sigma is a warning, not a critical.
             severity = CRITICAL if z > VOLUME_SIGMA_CRITICAL else WARNING
-            return severity, z, f"{mean:.0f} ± {std:.0f}"
+            return severity, z, f"{fmt(mean)} ± {fmt(std)}"
         if mean <= _EPS or count <= VOLUME_RATIO_WARNING * mean:
             return None
-        return WARNING, None, (f"{mean:.0f} in {sessions} session(s), no variation to compare against; "
+        return WARNING, None, (f"{fmt(mean)} in {sessions} session(s), no variation to compare against; "
                                f"flagged past {VOLUME_RATIO_WARNING:g}x")
 
     def _volume_anomaly(self, subject: str, count: int, stats: dict, detail: str) -> Anomaly | None:
-        verdict = self._volume_verdict(count, stats)
+        verdict = self._volume_verdict(count, stats, min_delta=self.min_call_delta)
         if verdict is None:
             return None
         severity, z, reference = verdict
@@ -426,6 +507,64 @@ class AnomalyDetector:
                                f"Network destination {domain} in tool call — not in baseline",
                                domain, f"not among {len(b.known_domains)} known destination(s)", None, detail))
         return out
+
+    # ------------------------------------------------------ outbound volume
+    def _check_egress_volume(self, graph: AgentGraph) -> list[Anomaly]:
+        """Flag a known destination that received far more data than the baseline ever saw.
+
+        The same arithmetic as ``call_volume_spike``, on bytes instead of
+        calls: warning past 3 sigma above the mean, critical past 5, and twice
+        the mean standing in when the baseline never varied. A destination the
+        baseline does not know is ``new_domain``'s business — it is already
+        critical there, and saying it twice would only dilute both.
+        """
+        out = []
+        for domain, sent in sorted(graph.egress_bytes.items()):
+            if not sent:
+                continue
+            if domain not in self.baseline.known_domains:
+                continue                       # an unlearned destination is new_domain's business
+            stats = self.baseline.volume("egress", domain)
+            if stats is None:
+                continue
+            verdict = self._volume_verdict(sent, stats, fmt=format_bytes,
+                                           min_delta=self.min_egress_delta)
+            if verdict is None:
+                continue
+            severity, z, reference = verdict
+            sigma = f", {z:.1f}σ" if z is not None else ""
+            callers = graph.domain_callers(domain)
+            calls = graph.egress_calls.get(domain, 0)
+            detail = (f"sent by {', '.join(callers) or '-'} in {calls} call(s) — "
+                      "argument and payload sizes from the log, not bytes measured on the wire")
+            out.append(Anomaly(severity, "egress_volume_spike",
+                               f"Outbound volume to {domain}: {format_bytes(sent)} "
+                               f"(baseline: {reference}{sigma})",
+                               sent, reference, z, detail))
+        return out
+
+    def _check_scan_truncation(self, graph: AgentGraph) -> list[Anomaly]:
+        """Flag that a bound stopped a destination scan, so the list of hosts may be short.
+
+        Not a baseline comparison: it is the parser saying what it could not
+        read, in the way ``skipped_records`` does. Critical when one of those
+        calls did name a destination — the call reached somewhere, and a host
+        past the limit would not have been seen, which is exactly how a flood
+        of decoy hosts or a block of padding would be used.
+        """
+        if not graph.truncated_scans:
+            return []
+        severity = CRITICAL if graph.truncated_network_scans else WARNING
+        reasons = [r for r in TRUNCATION_REASONS if r in graph.truncation_reasons]
+        why = "; ".join(_TRUNCATION_TEXT.get(r, r) for r in reasons) or "a scan limit was reached"
+        nodes = sorted(nid for nid, n in graph.nodes.items() if n.metadata.get("scan_truncated"))
+        detail = (f"in {', '.join(nodes)}" if nodes else "caller not recorded")
+        if graph.truncated_network_scans:
+            detail += (f" — {graph.truncated_network_scans} of them did reach a destination, so the "
+                       "list of destinations for this session is incomplete")
+        return [Anomaly(severity, "destination_scan_truncated",
+                        f"Destination scan truncated on {graph.truncated_scans} tool call(s): {why}",
+                        graph.truncated_scans, f"limit reached: {', '.join(reasons)}", None, detail)]
 
     def _check_node_count(self, graph: AgentGraph) -> list[Anomaly]:
         """Flag if total node count deviates > 2 std. Info past 2 sigma, warning past 3."""
