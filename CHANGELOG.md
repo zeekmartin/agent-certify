@@ -6,7 +6,7 @@ project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.7.0] - 2026-11-03
+## [0.7.0] - 2026-11-06
 
 The v0.6.1 benchmark measured one blind spot and reported it for a release
 rather than hiding it. This closes it, and adds the question a topology cannot
