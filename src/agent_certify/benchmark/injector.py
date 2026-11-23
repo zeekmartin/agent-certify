@@ -23,8 +23,14 @@ tool``                 (needs :meth:`AnomalyInjector.
                        forbid` on the baseline)
 ``inject_foreign_      a network destination the          ``new_domain``,
 domain``               baseline never saw                 critical
-``inject_shell_        a host named inside a shell        **nothing** — a
-domain``               command argument                    measured blind spot
+``inject_shell_        a host named inside a shell        ``new_domain``,
+domain``               command argument                    critical
+``inject_wrapped_      a host inside a command a shell    ``new_domain``,
+shell_domain``         wrapper runs (``bash -c "…"``)     critical
+``inject_shell_var_    a host a shell command builds in   **nothing** — a
+domain``               a variable                         measured blind spot
+``inject_ssh_tunnel_   a host forwarded by ``ssh -L``,    **nothing** — a
+domain``               never connected to directly        measured blind spot
 =====================  =================================  =====================
 
 The volume spike was a measured blind spot until v0.7.0: no check read how
@@ -34,16 +40,37 @@ clean. The benchmark reported it as a miss for one release, and
 ``call_volume_spike`` now closes it. The case stays in the suite, which is the
 point of keeping a measured gap rather than an omitted one.
 
-``inject_shell_domain`` is the gap that is still open, and it is injected for
-the same reason. It builds a real tool-call argument object and hands it to the
-production extractor, so what lands in the graph is whatever
-:func:`~agent_certify.domains.extract_call_domains` actually finds — today,
-nothing, because a bare host under a key that does not name a destination is
-not read. Its ``expected_category`` is therefore None: the expected outcome is
-silence, the benchmark reports it as a blind spot rather than as a detection
-failure, and it starts counting as a detection by itself if extraction ever
-reaches shell commands. Nothing about this injection is hard-coded to produce
-silence — that is the whole point of running it.
+``inject_shell_domain`` was the next one, measured as a blind spot by v0.7.0
+and closed since: it builds a real tool-call argument object
+(``{"command": "curl -sS <host>/health"}``) and hands it to the production
+extractor, so what lands in the graph is whatever
+:func:`~agent_certify.domains.extract_call_domains` actually finds. It now
+finds the host, because :func:`~agent_certify.domains.domains_in_command` reads
+the command line of a shell argument, so the injection turned into a
+``new_domain`` detection on its own — **no edit to the injection** was needed
+for that, which was the point of injecting it rather than asserting it.
+
+``inject_wrapped_shell_domain`` closed the same way, one step later: a host
+inside the command a shell wrapper runs (``bash -c "curl -sS <host>/health"``)
+was read by nobody while only the outer program was judged, and is read now
+that a command inside a command is parsed one level deep.
+
+**Two blind spots are open**, and both are injected rather than asserted:
+
+* ``inject_shell_var_domain`` — the host never appears as an argument of the
+  network client at all: the command builds it in a shell variable
+  (``h=<host>; curl -sS $h/health``), and reading it would mean *evaluating*
+  the shell rather than parsing it.
+* ``inject_ssh_tunnel_domain`` — the host is the far end of a forwarding
+  (``ssh -L 8080:<host>:80 ops@<jump>``). The session connects to the jump
+  host, which *is* recorded; traffic then reaches the tunnelled host through
+  it, named only in the value of an option that does not name a destination.
+
+Their ``expected_category`` is therefore None: the expected outcome is silence,
+the benchmark reports them as blind spots rather than as detection failures,
+and each starts counting as a detection by itself if extraction ever goes that
+far. Nothing about any of these injections is hard-coded to produce its result
+— that is the whole point of running them.
 
 Injections are deterministic: errors are spread over the edges in a fixed
 order, so the same session always yields the same injected copy and a benchmark
@@ -69,17 +96,21 @@ NEW_TOOL = "bench_unseen_tool"
 NEW_AGENT = "bench_unseen_agent"
 FOREIGN_DOMAIN = "api.unknown.cn"
 SHELL_DOMAIN = "shell.unknown.cn"
+SHELL_VAR_DOMAIN = "shellvar.unknown.cn"
+WRAPPED_SHELL_DOMAIN = "wrapped.unknown.cn"
+SSH_TUNNEL_DOMAIN = "tunnelled.unknown.cn"
 
 #: Every anomaly type the benchmark injects, in report order. The last one is a
 #: blind spot: it is injected and expected to go unreported (see the module
 #: docstring).
 ANOMALY_TYPES = ("new_tool", "error_spike", "new_agent", "volume_spike", "forbidden_tool",
-                 "foreign_domain", "shell_domain")
+                 "foreign_domain", "shell_domain", "wrapped_shell_domain",
+                 "shell_var_domain", "ssh_tunnel_domain")
 
 #: Blind spots among :data:`ANOMALY_TYPES`: faults no check covers yet, whose
 #: expected outcome is silence. Kept here so a test can state the list the
 #: release claims rather than re-deriving it from the registry.
-BLIND_SPOTS = ("shell_domain",)
+BLIND_SPOTS = ("shell_var_domain", "ssh_tunnel_domain")
 
 
 @dataclass
@@ -123,11 +154,17 @@ class AnomalyInjector:
     """
 
     def __init__(self, new_tool: str = NEW_TOOL, new_agent: str = NEW_AGENT,
-                 foreign_domain: str = FOREIGN_DOMAIN, shell_domain: str = SHELL_DOMAIN):
+                 foreign_domain: str = FOREIGN_DOMAIN, shell_domain: str = SHELL_DOMAIN,
+                 shell_var_domain: str = SHELL_VAR_DOMAIN,
+                 wrapped_shell_domain: str = WRAPPED_SHELL_DOMAIN,
+                 ssh_tunnel_domain: str = SSH_TUNNEL_DOMAIN):
         self.new_tool = new_tool
         self.new_agent = new_agent
         self.foreign_domain = foreign_domain
         self.shell_domain = shell_domain
+        self.shell_var_domain = shell_var_domain
+        self.wrapped_shell_domain = wrapped_shell_domain
+        self.ssh_tunnel_domain = ssh_tunnel_domain
 
     # ------------------------------------------------------------ injectors
     def inject_new_tool(self, session: AgentGraph, tool_name: str | None = None) -> AgentGraph:
@@ -274,26 +311,22 @@ class AnomalyInjector:
         return g
 
     def inject_shell_domain(self, session: AgentGraph, domain: str | None = None) -> AgentGraph:
-        """Reach a host from inside a shell command, which extraction does not read.
+        """Reach a host from inside a shell command.
 
-        This is the benchmark's one **blind spot** injection, and it is built so
-        that it cannot lie in either direction. The fault is a genuine tool-call
-        argument object — ``{"command": "curl -sS <host>/health"}`` — and it is
-        passed to :func:`~agent_certify.domains.extract_call_domains`, the same
-        function the parsers use. Whatever that returns is recorded on the
-        graph.
+        This was the benchmark's **blind spot** until the command line of a
+        shell argument started being read, and it is built so that it cannot
+        lie in either direction. The fault is a genuine tool-call argument
+        object — ``{"command": "curl -sS <host>/health"}`` — passed to
+        :func:`~agent_certify.domains.extract_call_domains`, the same function
+        the parsers use. Whatever that returns is recorded on the graph.
 
-        Today it returns nothing: ``command`` does not name a destination and
-        the host carries no scheme, so the walk finds no URL and does not treat
-        the value as a host. The injected graph is therefore identical to the
-        clean one apart from a marker, no check has anything to compare, and
-        the expected outcome is silence — which is what
-        ``expected_category=None`` says.
-
-        The day extraction reads shell commands, this same injection will put a
-        host in ``seen_domains``, ``new_domain`` will fire, and the benchmark
-        will report the type as "reported anyway" instead of as a blind spot.
-        No edit here is needed for that to happen.
+        It now returns the host: ``command`` is a field that carries a command
+        line, ``curl`` is a known network client, and the host is a positional
+        argument of it. So ``new_domain`` fires, and the injection became a
+        detection with **no edit to this method** — the expected outcome moved
+        from silence to ``new_domain``/critical in the registry below, and
+        nothing else about the fault changed. That is what injecting a gap
+        instead of asserting it buys.
         """
         name = (domain or self.shell_domain).strip().lower()
         if not name:
@@ -305,6 +338,97 @@ class AnomalyInjector:
         arguments = {"command": f"curl -sS {name}/health", "description": f"probe {name}"}
         g.record_domains(target, extract_call_domains(arguments))
         g.nodes[target].metadata["injected"] = "shell_domain"
+        g.nodes[target].metadata["shell_destination"] = name
+        return g
+
+    def inject_wrapped_shell_domain(self, session: AgentGraph, domain: str | None = None) -> AgentGraph:
+        """Reach a host from inside the command a shell wrapper runs.
+
+        ``{"command": "bash -c \"curl -sS <host>/health\""}``: the outer
+        program is ``bash``, which is no network client, so while only the
+        outer program was judged this reached nobody — the same gap as
+        :meth:`inject_shell_domain`, one level in. It is read now that a
+        command inside a command is parsed one level deep, and the expected
+        outcome is ``new_domain``/critical.
+
+        Built like the others: a real argument object, the production
+        extractor, whatever comes back recorded on the graph.
+        """
+        name = (domain or self.wrapped_shell_domain).strip().lower()
+        if not name:
+            raise ValueError("domain is required: a wrapped destination has to be named")
+        g = self._copy(session, "wrapped_shell_domain")
+        if name in g.seen_domains:
+            raise ValueError(f"{name!r} is already a destination in this session; pick one it does not use")
+        target = self._busiest_tool(g) or self._caller(g)
+        arguments = {"command": f'bash -lc "curl -sS {name}/health"', "description": f"probe {name}"}
+        g.record_domains(target, extract_call_domains(arguments))
+        g.nodes[target].metadata["injected"] = "wrapped_shell_domain"
+        g.nodes[target].metadata["shell_destination"] = name
+        return g
+
+    def inject_ssh_tunnel_domain(self, session: AgentGraph, domain: str | None = None) -> AgentGraph:
+        """Reach a host through an ``ssh -L`` forwarding, never naming it as a destination.
+
+        ``{"command": "ssh -L 8080:<host>:80 ops@<jump>"}``. The session
+        connects to ``<jump>``, and that host *is* recorded; the traffic then
+        reaches ``<host>`` through the tunnel, which appears only in the value
+        of an option that does not name a destination — ``-L`` takes a
+        forwarding specification, not a host to connect to, and reading its
+        middle field as egress would also read ``-L 8080:localhost:80``, which
+        reaches nothing new at all.
+
+        So this is a **blind spot**, measured rather than left unsaid. The jump
+        host is chosen from the destinations the session already reaches, so
+        the only *new* host in the command is the tunnelled one — and silence
+        about it is the whole measurement: if anything reported, it would be
+        this host and the row would say "reported anyway".
+        """
+        name = (domain or self.ssh_tunnel_domain).strip().lower()
+        if not name:
+            raise ValueError("domain is required: a tunnelled destination has to be named")
+        g = self._copy(session, "ssh_tunnel_domain")
+        if name in g.seen_domains:
+            raise ValueError(f"{name!r} is already a destination in this session; pick one it does not use")
+        jump = min(g.seen_domains) if g.seen_domains else "jumphost"   # deterministic
+        target = self._busiest_tool(g) or self._caller(g)
+        arguments = {"command": f"ssh -L 8080:{name}:80 ops@{jump}", "description": f"tunnel to {name}"}
+        g.record_domains(target, extract_call_domains(arguments))
+        g.nodes[target].metadata["injected"] = "ssh_tunnel_domain"
+        g.nodes[target].metadata["shell_destination"] = name
+        return g
+
+    def inject_shell_var_domain(self, session: AgentGraph, domain: str | None = None) -> AgentGraph:
+        """Reach a host a shell command builds in a variable, which parsing cannot read.
+
+        This is the benchmark's one **blind spot** injection, and the successor
+        to :meth:`inject_shell_domain`. The argument object is as real as that
+        one's — ``{"command": "h=<host>; curl -sS $h/health"}`` — and it goes
+        through the same production extractor. The host is in the command line,
+        but never as an argument of ``curl``: it is assigned to a variable, and
+        ``curl`` is handed ``$h``.
+
+        Extraction therefore finds nothing, and that is a deliberate boundary
+        rather than an oversight. Reading it would mean *evaluating* the shell —
+        tracking assignments, expansions, substitutions and sourced files —
+        which is a shell interpreter inside a log parser, with everything that
+        goes wrong when the log is hostile. Parsing a command line is bounded;
+        evaluating one is not.
+
+        So the expected outcome is silence (``expected_category=None``), it is
+        counted apart from the detection rate, and the day something does read
+        it this same injection reports a ``new_domain`` by itself.
+        """
+        name = (domain or self.shell_var_domain).strip().lower()
+        if not name:
+            raise ValueError("domain is required: a shell destination has to be named")
+        g = self._copy(session, "shell_var_domain")
+        if name in g.seen_domains:
+            raise ValueError(f"{name!r} is already a destination in this session; pick one it does not use")
+        target = self._busiest_tool(g) or self._caller(g)
+        arguments = {"command": f"h={name}; curl -sS $h/health", "description": f"probe {name}"}
+        g.record_domains(target, extract_call_domains(arguments))
+        g.nodes[target].metadata["injected"] = "shell_var_domain"
         g.nodes[target].metadata["shell_destination"] = name
         return g
 
@@ -366,11 +490,20 @@ class AnomalyInjector:
                       baseline=self.forbid(baseline, name))
         self._add(out, "foreign_domain", lambda: self.inject_foreign_domain(session),
                   "new_domain", CRITICAL, f"a tool pointed at {self.foreign_domain}")
-        # A blind spot on purpose: expected_category None means "nothing should
-        # be reported", so it is scored apart from the covered faults.
         self._add(out, "shell_domain", lambda: self.inject_shell_domain(session),
-                  None, None, f"{self.shell_domain} named inside a shell command argument, "
-                              "which destination extraction does not read")
+                  "new_domain", CRITICAL,
+                  f"{self.shell_domain} named inside a shell command argument (curl)")
+        self._add(out, "wrapped_shell_domain", lambda: self.inject_wrapped_shell_domain(session),
+                  "new_domain", CRITICAL,
+                  f"{self.wrapped_shell_domain} inside the command a shell wrapper runs (bash -c)")
+        # Blind spots on purpose: expected_category None means "nothing should
+        # be reported", so they are scored apart from the covered faults.
+        self._add(out, "shell_var_domain", lambda: self.inject_shell_var_domain(session),
+                  None, None, f"{self.shell_var_domain} built in a shell variable, which parsing a "
+                              "command line does not read (it would take evaluating the shell)")
+        self._add(out, "ssh_tunnel_domain", lambda: self.inject_ssh_tunnel_domain(session),
+                  None, None, f"{self.ssh_tunnel_domain} forwarded by ssh -L, reached through a jump "
+                              "host that is recorded instead of it")
         return out
 
     @staticmethod

