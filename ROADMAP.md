@@ -94,14 +94,22 @@ Fixes the actionable findings of the 2026-10-27 security audit (45 findings: 3 h
     distributed them, and `LICENSE`, `pyproject.toml` and every source header now agree)
 - 279 tests, 95% coverage (Ubuntu and Windows, Python 3.10–3.12)
 
-### v0.6.0 — Multi-framework parsers (Nov 2026)
+### v0.5.1 — Ergonomics (Oct 2026)
+
+- Files with no readable records exit 1 with a clear message instead of an empty report
+- One warning per file for unreadable records; `keygen` default file name; `verify` usage hint
+
+### v0.6.0 — Baseline decisions (Nov 2026)
+
+- `baseline accept/reject --tool`, scoped `accept --link "agent:A -> tool"`, `baseline show`
+- Decisions survive `learn`; last write wins; rejection beats a scoped link
+- `learn --forget-overrides` drops them on purpose
+
+### v0.6.1 — Multi-framework parsers and anomaly injection benchmark (Nov 2026)
 
 - CrewAI parser: execution logs and event bus → AgentGraph
-- LangGraph parser: node transitions and tool calls → AgentGraph
+- LangGraph parser: event stream, debug stream and plain transition records → AgentGraph
 - Auto-detection extended to both, `.json` included
-
-### v0.6.1 — Anomaly injection benchmark (Nov 2026)
-
 - Anomaly injection benchmark: detection rate, false positive rate, false negative rate and blind
   spots, per fault type; `python -m agent_certify.benchmark`
 - Baseline learned from held-out sessions (`learn_holdout`), so the false positive rate means
@@ -120,20 +128,38 @@ Fixes the actionable findings of the 2026-10-27 security audit (45 findings: 3 h
 
 ## Planned
 
-### v0.8.0 — Fleet & dashboard
+### v0.8.0 — Egress
 
-- Fleet mode: scan multiple projects/systems, aggregate results
-- Dashboard: HTML/web view of all monitored systems
-- Alerting integrations: Slack, email, PagerDuty webhooks
-- Baseline drift over time: is the system's topology evolving?
+Where an agent's data goes, and how much of it. agent-certify itself still makes no network
+connection: everything below is read from the logs and decided offline.
 
-### v0.9.0 — Carried over
+- Close the `shell_domain` blind spot: hosts named inside shell commands (`curl`, `wget`, `scp`,
+  `ssh`, `nc` …) are destinations (INV-001)
+- Exfiltration: outbound volume per destination, learned in the baseline and compared like call
+  volume
+- Region policy: `forbidden_regions` (for example sanctioned countries), decided offline from the
+  host name and an optional local IP-geolocation database; no DNS lookup unless explicitly enabled
+- Certificates record allowed and forbidden destinations
+- Benchmark: new fault types for shell egress, exfiltration and forbidden regions
+- `SECURITY.md` updated in the same change for every new category of input read
 
-- OTel trace parser: import OpenInference/Arize format spans
+### v0.9.0 — Provenance
+
+- Benchmark against published traces of multi-step tool attacks, run before provenance ships so the
+  number has a "before"
+- Provenance: link untrusted content (a fetched page, an e-mail, a document) to the actions it
+  triggers — the prompt injection path
+
+### v0.10.0 — Standard telemetry input
+
+- OTel trace parser: GenAI semantic conventions and OpenInference/Arize spans as an input, not only
+  an export
 - AutoGen parser: message history → AgentGraph
-- Alert output: JSON webhook
+
+### Carried over
+
 - Kill switch recommendation: "isolate node X, keep the rest running"
-- Cross-session trending: FI over time, tool usage patterns
+- Cross-session trending: FI over time, tool usage patterns, baseline drift
 - Open items from the v0.5.0 audit:
   - Signed baselines and policies (ARC-001)
   - Encrypted private keys (passphrase, PKCS#8) and a revocation list (SEC-003, SEC-004)
@@ -141,7 +167,6 @@ Fixes the actionable findings of the 2026-10-27 security audit (45 findings: 3 h
   - Incremental `watch` from the last file offset (PRF-004)
   - Fuzz tests for the parsers; secret scanning in CI (TST-003, SCR-001)
 - Open items from the 2026-11-03 audit:
-  - Close the `shell_domain` blind spot, or decide the trade is permanent and say so (INV-001)
   - Extract report formatting out of `cli.py` and `describe` out of `mcp_server.py` (MNT-003)
   - Version-counter invalidation for the edge index instead of `(id, len)` (COD-012)
 - Dynamic coverage and test-count badges fed by the measurement, not written by hand (DOC-007)
@@ -149,12 +174,18 @@ Fixes the actionable findings of the 2026-10-27 security audit (45 findings: 3 h
 ### v1.0.0 — Production-ready
 
 - API frozen with semantic versioning
-- Published on PyPI
 - Comprehensive documentation
 - Published benchmarks across agent frameworks
 - Compliance reporting mapped to NIST AI RMF (MANAGE 1.3, 4.1)
 - Integration guide for CI/CD pipelines
 - HuggingFace Space: upload a trace, see your agent graph
+
+## Paid editions
+
+Fleet view, dashboard, alerting, advanced policies, compliance reports, SSO and
+supported service belong to the Enterprise and Cloud editions, not to this
+roadmap; see [Editions](README.md#editions). The open-source tool loses nothing
+to them.
 
 ## Research directions
 

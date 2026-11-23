@@ -832,6 +832,34 @@ tools: each shared tool closes a triangle with the orchestrator.
 
 New sources subclass `agent_certify.parser.BaseParser` and return an `AgentGraph`.
 
+## Editions
+
+agent-certify is open core. Everything on this page is the open-source command
+line tool, under Apache 2.0, and stays that way: nothing in it will move to a
+paid edition. The paid editions add what a team needs to run it across many
+agent systems.
+
+| | Open source | Enterprise *(planned)* | Cloud *(later)* |
+|---|---|---|---|
+| Parsers, topology, blast radius | ✓ | ✓ | ✓ |
+| Baselines, anomaly detection, policy | ✓ | ✓ | ✓ |
+| Signed certificates (your own key) | ✓ | ✓ | ✓ |
+| MCP server, OpenTelemetry export, live watch | ✓ | ✓ | ✓ |
+| Fleet view across all your agent systems | | ✓ | ✓ |
+| Dashboard | | ✓ (on your infrastructure) | ✓ (hosted) |
+| Alerts by e-mail, Slack or webhook | | ✓ | ✓ |
+| Advanced policies | | ✓ | ✓ |
+| Exportable audit reports for compliance | | ✓ | ✓ |
+| Single sign-on (SSO) | | ✓ | ✓ |
+| Support with a service-level agreement | | ✓ | ✓ |
+
+**Enterprise** runs on your own infrastructure: your agent logs never leave it.
+**Cloud** is the same service hosted by us, and will follow when there is demand
+for it.
+
+Interested in Enterprise, or in an early pilot? Get in touch through
+[cognitive-engineering.dev](https://cognitive-engineering.dev).
+
 ## Links
 
 - [sal-torch](https://pypi.org/project/sal-torch/) — structural analysis of AI models
