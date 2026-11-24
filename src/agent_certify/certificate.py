@@ -125,7 +125,7 @@ EGRESS_COVERAGE_STATES = (COVERAGE_CHECKED, COVERAGE_NOTHING_REACHED,
 MIN_VERSION_FOR_FORMAT = {
     1: "0.1.0",
     2: "0.5.0",
-    3: "0.8.0.dev0",
+    3: "0.8.0",
 }
 _TS = "%Y-%m-%dT%H:%M:%SZ"
 _V2_ONLY = ("cert_format", "not_before", "not_after", "skipped_records")

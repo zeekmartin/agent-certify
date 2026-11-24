@@ -97,7 +97,7 @@ def graph_with_domain():
 
 
 def version_tuple(text: str) -> tuple:
-    """``"0.8.0.dev0"`` as a comparable tuple, dev releases sorting first.
+    """``"0.8.0"`` or ``"0.8.0.dev0"`` as a comparable tuple, dev first.
 
     A tiny parser rather than `packaging`: this project has two runtime
     dependencies and a test is not the place to add a third.
@@ -110,15 +110,20 @@ def version_tuple(text: str) -> tuple:
 
 
 # ------------------------------------------------------------------- INT-001
-def test_the_version_is_a_development_version_of_the_format_it_writes():
+def test_the_version_is_allowed_to_write_the_format_it_writes():
     """INT-001: a build must not claim a version that cannot read what it writes.
 
     The tree wrote ``cert_format`` 3 while calling itself 0.7.0 — a version
-    whose verifier rejects a format 3 certificate outright. The dev suffix says
-    "between releases", which is the truth, and the release commit drops it.
+    whose verifier rejects a format 3 certificate outright. The assertion is
+    the relation rather than a literal, so a release commit (dropping a
+    ``.dev`` suffix) and a later bump both keep it true; what it forbids is a
+    version *older* than the format the tree writes.
     """
-    assert agent_certify.__version__ == "0.8.0.dev0"
-    assert version_tuple(agent_certify.__version__) >= version_tuple(MIN_VERSION_FOR_FORMAT[3])
+    assert (version_tuple(agent_certify.__version__)
+            >= version_tuple(MIN_VERSION_FOR_FORMAT[CURRENT_FORMAT])), (
+        f"this tree writes cert_format {CURRENT_FORMAT}, which needs "
+        f"{MIN_VERSION_FOR_FORMAT[CURRENT_FORMAT]} or later, and calls itself "
+        f"{agent_certify.__version__}")
 
 
 def test_every_certificate_format_declares_the_version_that_introduced_it():

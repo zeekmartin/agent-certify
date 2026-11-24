@@ -23,6 +23,13 @@ OpenTelemetry export and the Cursor, CrewAI and LangGraph parsers need nothing
 else — no framework is imported to read its logs (the `[mcp]`, `[otel]`,
 `[cursor]` and `[all]` extras exist but are empty).
 
+**Python 3.10 to 3.14**, each tested in CI on Linux and Windows. The declared
+dependency floors are `numpy>=1.26.4` and `cryptography>=46.0.0`, and a
+separate CI job installs exactly those two versions under Python 3.10 and runs
+the whole suite against them, so the minimum is tested rather than asserted.
+An install with no constraint of your own takes the most recent release of
+each.
+
 ## Let your agent scan itself (MCP server)
 
 agent-certify runs as an MCP server, so an agent can check its own structure

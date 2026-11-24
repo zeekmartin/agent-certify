@@ -483,4 +483,9 @@ measuring the size of what a call sent.
 
 ## Supported versions
 
-Security fixes go into the latest minor version.
+Security fixes go into the latest minor version, which is **0.8.x**. There is
+no backport to 0.7 or earlier: upgrade to 0.8.x to receive a fix. Upgrading the
+verifying side does not invalidate what is already signed: formats 1 and 2 keep
+their original signed bytes and 0.8 reads all three. The one deliberate
+exception is in §2: a format 1 certificate carrying no validity window now
+needs `--allow-no-expiry`.
