@@ -167,7 +167,7 @@ def test_injections_cover_every_anomaly_type(injector, session, split):
     injections = injector.injections(session, baseline)
     kinds = [i.kind for i in injections]
     assert sorted(kinds) == sorted(ANOMALY_TYPES)
-    assert len(ANOMALY_TYPES) == 16
+    assert len(ANOMALY_TYPES) == 22
     blind = sorted(i.kind for i in injections if i.is_blind_spot)
     assert blind == sorted(BLIND_SPOTS) == ["file_upload_exfil", "shell_var_domain", "ssh_tunnel_domain"]
     assert [i.expected_category for i in injections if i.is_blind_spot] == [None, None, None]
@@ -414,8 +414,10 @@ def test_the_runner_scores_a_policy_fault_like_any_other(split, injector):
     assert row.detected == row.trials == len(test) and row.missed == []
     assert row.severities == {CRITICAL: len(test)}
     assert row in result.covered and not row.is_blind_spot and not row.false_positive
-    assert [t.kind for t in result.policy_cases] == ["forbidden_region"]
-    assert result.to_dict()["policy_cases"] == ["forbidden_region"]
+    # Both region faults are scored against the policy engine: the second one
+    # is the same fault under an internationalised ccTLD.
+    assert [t.kind for t in result.policy_cases] == ["forbidden_region", "forbidden_region_idn"]
+    assert result.to_dict()["policy_cases"] == ["forbidden_region", "forbidden_region_idn"]
     assert next(t for t in result.to_dict()["per_type"]
                 if t["kind"] == "forbidden_region")["expected_rule"] == "forbidden_region"
     assert "policy forbidden_region/crit" in result.table()
@@ -615,7 +617,11 @@ def test_result_table_and_dict(split):
     result = BenchmarkRunner(test, baseline).run()
     table = result.table()
     assert table == str(result)
-    assert "Anomaly injection benchmark" in table and "detection rate 100.0%" in table
+    assert "Anomaly injection benchmark" in table
+    # Both rates, side by side. See INT-002: the covered-only figure never
+    # appears on its own, here or anywhere else.
+    assert "detection 100.0% (" in table and "among covered types" in table
+    assert "of all injected faults, blind spots included" in table
     for kind in ANOMALY_TYPES:
         assert kind in table
     assert "blind spots: shell_var_domain" in table       # the line only appears when there are some
@@ -681,3 +687,91 @@ def test_cli_bad_input(capsys, tmp_path):
     assert "Cannot read sessions" in capsys.readouterr().err
     assert main(["--count", "2"]) == 1                    # too few sessions to hold one out
     assert "Cannot benchmark" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# The five injections for the egress false negatives of 2026-11-24. Each one
+# was silence in a released version, so each one is measured from now on.
+AUDIT_INJECTIONS = ("idn_domain", "cloud_storage", "dns_exfil", "numeric_ipv4",
+                    "assignment_substitution")
+
+
+@pytest.mark.parametrize("kind", AUDIT_INJECTIONS)
+def test_an_audited_false_negative_is_now_detected(kind, injector, session, split):
+    _, _, baseline = split
+    injection = next(i for i in injector.injections(session, baseline) if i.kind == kind)
+    assert injection.expected_category == "new_domain"
+    assert injection.min_severity == "critical"
+    assert kind not in BLIND_SPOTS
+    reached = injection.graph.seen_domains - session.seen_domains
+    assert reached, f"{kind} injected nothing: the fault has to be reachable to be measured"
+
+
+def test_the_audited_injections_record_their_destination_the_way_production_does(injector, session, split):
+    """The injections go through measure_call, not around it.
+
+    An injection that wrote the expected destination straight into the graph
+    would pass whatever the extractor does — it would measure the benchmark
+    instead of the tool. These build a real argument object and record what
+    comes back, so the one Unicode host injected has to come out as punycode
+    and the bucket as ``s3:…``.
+    """
+    _, _, baseline = split
+    found = {i.kind: i.graph.seen_domains - session.seen_domains
+             for i in injector.injections(session, baseline) if i.kind in AUDIT_INJECTIONS}
+    assert found["idn_domain"] == {"collector.xn--p1ai"}       # punycode, not the Unicode form
+    assert found["cloud_storage"] == {"s3:benchmark-exfil"}
+    assert found["numeric_ipv4"] == {"127.0.0.1"}              # canonical, not 2130706433
+    assert found["dns_exfil"] == {"secret.benchmark.unknown.cn"}
+    assert found["assignment_substitution"] == {"assigned.unknown.cn"}
+
+
+def test_both_detection_rates_are_reported_together(split):
+    """INT-002: the covered-only rate never stands alone.
+
+    102/102 among covered types reads as "nothing gets past this" while three
+    declared blind spots sit in the same table. Quoting the second figure
+    beside it is the whole point, so the table, the JSON summary and the README
+    all carry both.
+    """
+    _, test, baseline = split
+    result = BenchmarkRunner(test, baseline).run()
+    assert result.all_trials > result.trials          # the blind spots are in the denominator
+    assert result.overall_detection_rate < result.detection_rate
+    summary = result.to_dict()
+    assert summary["all_trials"] == result.all_trials
+    assert summary["overall_detection_rate"] == result.overall_detection_rate
+    table = result.table()
+    assert "among covered types" in table
+    assert "of all injected faults, blind spots included" in table
+    # The one line that carries a rate carries both of them.
+    rate_lines = [line for line in table.splitlines() if line.startswith("detection ")]
+    assert len(rate_lines) == 1
+    assert "among covered types;" in rate_lines[0] and "all injected faults" in rate_lines[0]
+
+
+def test_the_internationalised_region_fault_is_scored_as_a_policy_violation(split, injector, session):
+    """A rule naming RU has to catch a destination under `xn--p1ai`.
+
+    The quiet half of a policy that looks like it works: the destination was
+    recorded and reported as new, and the region rule — the one the operator
+    wrote to stop exactly this — said nothing, because the two-letter table
+    could not answer for a label that is not two letters.
+    """
+    _, test, baseline = split
+    injection = next(i for i in injector.injections(session, baseline)
+                     if i.kind == "forbidden_region_idn")
+    assert injection.expected_rule == "forbidden_region"
+    assert injection.min_severity == CRITICAL
+    assert injector.region_idn_domain in injection.graph.seen_domains
+
+    violations = BenchmarkRunner([session], baseline).check_policy(injection.graph, injection.policy)
+    assert [v.rule.kind for v in violations] == ["forbidden_region"]
+    assert "RU" in violations[0].message
+    assert injector.region_idn_domain in violations[0].message
+    assert "ccTLD (IDN)" in violations[0].message        # and it says which table answered
+
+    result = BenchmarkRunner(test, baseline).run()
+    row = next(t for t in result.per_type if t.kind == "forbidden_region_idn")
+    assert row.detected == row.trials == len(test) and row.missed == []
+    assert row.expected == "policy forbidden_region/crit"

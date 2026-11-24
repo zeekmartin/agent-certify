@@ -13,6 +13,10 @@ applies to each session, runs the anomaly checks over the result and counts:
   worse. Both count the same way, because a product that reports "not allowed"
   as well as "unusual" has to measure both;
 * **false negative rate** — the rest of them (1 − detection rate);
+* **overall detection rate** — detections over **everything injected**, the
+  declared blind spots counted in the denominator. Both rates are reported
+  together, every time, because the covered-only rate alone reads as "nothing
+  gets past this" while a fault nobody catches sits in the same table;
 * **false positive rate** — clean sessions, with nothing injected, that the
   checks flag anyway;
 * **blind spots** — faults no check covers, counted separately so they neither
@@ -160,6 +164,36 @@ class BenchmarkResult:
         return 1.0 - self.detection_rate if self.trials else 0.0
 
     @property
+    def injected(self) -> list[TypeResult]:
+        """Every injected fault, blind spots included; the clean-session cases excluded.
+
+        The denominator of :attr:`overall_detection_rate`. A fault nobody
+        catches is still a fault that was injected, and leaving it out of the
+        denominator is how a detection rate flatters itself: the three blind
+        spots are declared, so the honest figure counts them.
+        """
+        return [t for t in self.per_type if not t.false_positive]
+
+    @property
+    def all_trials(self) -> int:
+        return sum(t.trials for t in self.injected)
+
+    @property
+    def all_detected(self) -> int:
+        return sum(t.detected for t in self.injected)
+
+    @property
+    def overall_detection_rate(self) -> float:
+        """Detection over **everything injected**, blind spots in the denominator.
+
+        This is the number to quote on its own. :attr:`detection_rate` answers a
+        narrower question — "of the faults a check is meant to catch, how many
+        does it catch?" — and quoting that one alone turns every uncovered fault
+        into a rounding error.
+        """
+        return _rate(self.all_detected, self.all_trials)
+
+    @property
     def false_positive_rate(self) -> float:
         """Clean sessions flagged, over clean sessions run."""
         return _rate(self.clean_flagged, self.clean_sessions)
@@ -168,6 +202,8 @@ class BenchmarkResult:
         return {"clean_sessions": self.clean_sessions, "clean_flagged": self.clean_flagged,
                 "clean_anomalies": self.clean_anomalies, "learned_from": self.learned_from,
                 "trials": self.trials, "detected": self.detected,
+                "all_trials": self.all_trials, "all_detected": self.all_detected,
+                "overall_detection_rate": self.overall_detection_rate,
                 "detection_rate": self.detection_rate, "false_negative_rate": self.false_negative_rate,
                 "false_positive_rate": self.false_positive_rate, "blind_spots": self.blind_spots,
                 "false_positive_cases": [t.kind for t in self.false_positive_cases],
@@ -177,11 +213,11 @@ class BenchmarkResult:
 
     def table(self) -> str:
         """The run as a summary table, for a terminal or a CI log."""
-        width = 106
+        width = 112
         head = (f"Anomaly injection benchmark — {self.clean_sessions} clean session(s) "
                 f"against a baseline of {self.learned_from}")
         lines = [head, "=" * width,
-                 f"{'anomaly type':<22}{'expected':<32}{'trials':>7}{'detected':>10}{'rate':>9}  severity",
+                 f"{'anomaly type':<24}{'expected':<32}{'trials':>7}{'detected':>10}{'rate':>9}  severity",
                  "-" * width]
         for t in self.per_type:
             if t.false_positive:
@@ -192,15 +228,24 @@ class BenchmarkResult:
             else:
                 severity = ", ".join(f"{n} {s}" for s, n in sorted(t.severities.items(), key=lambda kv: SEVERITY_ORDER[kv[0]]))
                 severity = severity or "-"
-            lines.append(f"{t.kind:<22}{t.expected:<32}{t.trials:>7}{t.detected:>10}"
+            lines.append(f"{t.kind:<24}{t.expected:<32}{t.trials:>7}{t.detected:>10}"
                          f"{_pct(t.detection_rate):>9}  {severity}")
         plural = "y" if self.clean_anomalies == 1 else "ies"
-        totals = (f"detection rate {_pct(self.detection_rate).strip()} ({self.detected}/{self.trials})   "
-                  f"false negatives {_pct(self.false_negative_rate).strip()}   "
-                  f"false positives {_pct(self.false_positive_rate).strip()} "
-                  f"({self.clean_flagged}/{self.clean_sessions} clean, "
-                  f"{self.clean_anomalies} anomal{plural})")
-        lines += ["-" * width, totals]
+        # Both rates, always together. The covered-only rate is the answer to a
+        # narrower question, and on its own it reads as "we catch everything"
+        # while three declared faults go unreported — so it never appears here,
+        # in the JSON summary or in the README without the second figure beside
+        # it. See INT-002.
+        totals = (f"detection {_pct(self.detection_rate).strip()} "
+                  f"({self.detected}/{self.trials}) among covered types; "
+                  f"{_pct(self.overall_detection_rate).strip()} "
+                  f"({self.all_detected}/{self.all_trials}) of all injected faults, "
+                  f"blind spots included")
+        rest = (f"false negatives {_pct(self.false_negative_rate).strip()} of covered types   "
+                f"false positives {_pct(self.false_positive_rate).strip()} "
+                f"({self.clean_flagged}/{self.clean_sessions} clean, "
+                f"{self.clean_anomalies} anomal{plural})")
+        lines += ["-" * width, totals, rest]
         if self.false_positive_cases:
             trials = sum(t.trials for t in self.false_positive_cases)
             wrong = self.injected_false_positives
@@ -217,7 +262,7 @@ class BenchmarkResult:
         notes = [t for t in self.per_type if t.note]
         if notes:
             lines += ["-" * width, "what was injected:"]
-            lines += [f"  {t.kind:<22}{t.note}" for t in notes]
+            lines += [f"  {t.kind:<24}{t.note}" for t in notes]
         return "\n".join(lines)
 
     def __str__(self) -> str:

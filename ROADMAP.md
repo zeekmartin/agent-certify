@@ -143,10 +143,19 @@ connection: everything below is read from the logs and decided offline.
   and compared like call volume (`egress_volume_spike`), with the scan limits no longer dropping a
   destination in silence (`destination_scan_truncated`). A fourth blind spot is measured in their
   place: `file_upload_exfil`, a file whose size the log does not contain
-- Region policy: `forbidden_regions` (for example sanctioned countries), decided offline from the
-  host name and an optional local IP-geolocation database; no DNS lookup unless explicitly enabled
-- Certificates record allowed and forbidden destinations
-- Benchmark: new fault types for forbidden regions (shell egress and exfiltration: done)
+- **Done** (unreleased): region policy — `forbidden_region`, decided offline from the host name or
+  an optional local IP-geolocation database; no DNS lookup unless `--resolve-dns` says so, and
+  never from the MCP server. Certificates carry a signed `egress` section, and `certify` refuses to
+  sign a system that already breaks its own egress rules
+- **Done** (unreleased): five classes of egress false negative the 2026-11-24 audit found, each of
+  which produced no destination, no truncation and no warning at all — internationalised names
+  (EGR-001), schemes and clients beyond the web, including object storage, resolvers and database
+  clients (EGR-002), numeric address spellings (EGR-003), and commands substituted into an
+  assignment (EGR-005). The filename-label list is pinned to the day it was last checked against
+  the DNS root (EGR-004), and the benchmark reports the covered-only detection rate and the rate
+  over everything injected together, never one alone (INT-002)
+- Benchmark: new fault types for forbidden regions (shell egress, exfiltration and the five egress
+  false negatives: done)
 - `SECURITY.md` updated in the same change for every new category of input read
 
 ### v0.9.0 — Provenance

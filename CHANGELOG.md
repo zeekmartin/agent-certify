@@ -7,6 +7,77 @@ project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Five classes of egress false negative closed** (`agent_certify.domains`).
+  A static audit of the extractor found five ways to reach a destination that
+  produced **no destination, no truncation and no warning** — the report was
+  silent, and none of the five was declared in the README or in `SECURITY.md`:
+  - **internationalised names.** A host shape may now end in a punycode tag,
+    and a Unicode host (`collector.рф`) is converted with the standard
+    library's `idna` codec — never raising, nothing resolved — before the shape
+    test. The punycode form is what is recorded and compared, so one pattern
+    covers both spellings; a pattern typed in Unicode converts the same way
+  - **schemes beyond the web.** `s3`, `gs`, `azure`, `abfs(s)`, `wasb(s)`,
+    `smb`, `ssh`, `sftp`, `scp`, `rsync`, `tftp`, `redis(s)`, `postgres(ql)`,
+    `mysql`, `mongodb`, `mongodb+srv`, `amqp(s)`, `mqtt` and `ldap(s)` join
+    `http(s)`, `ws(s)` and `ftp(s)` (`URL_SCHEMES`). A scheme glued to a
+    preceding word is not one: `logs://x` names nothing
+  - **buckets and configured remotes**, which are destinations with no host
+    name in them: `s3://logs-eu/key` and `rclone copy f backup:dir` are
+    recorded as `s3:logs-eu` and `rclone:backup` — a `<kind>:<name>` shape no
+    host can take. Accept and reject patterns apply as to a host, with
+    `s3:*` for every bucket of a kind and no `*.` wildcard, and the **region
+    is always `unknown`**, resolved for by nothing
+  - **numeric addresses.** `2130706433`, `0x7f000001`, `0177.0.0.1` and
+    `127.1` are all 127.0.0.1 to every socket library; all four normalise to
+    the dotted quad and count as one destination
+  - **command substitutions.** `$(…)` and backticks are read as a command line
+    one level deep and then removed from the line that held them, so both
+    `X=$(curl host/x)` and `TOKEN=$(cat f) curl api.example.net/v1` read
+    correctly
+- **Twenty-three network clients** (`NETWORK_COMMANDS`), in three new families:
+  object storage and cloud (`aws`, `gcloud`, `gsutil`, `az`, `azcopy`,
+  `rclone`, `mc`, `s3cmd`, `kubectl`), resolvers (`dig`, `nslookup`, `host`,
+  `drill`) and databases, caches and TLS (`psql`, `mysql`, `mysqldump`,
+  `redis-cli`, `mongosh`, `mongo`, `mongodump`, `openssl s_client`), plus
+  `tftp` and `smbclient`. For these the destination is read from a named option
+  or a connection URL rather than from the shape of a positional argument, so
+  `aws --version`, `kubectl get pods` and `psql -f file.sql` name nothing and
+  produce nothing. **For a resolver the queried name is the destination**: DNS
+  exfiltration opens no connection, and a reader looking for connections saw
+  none
+- **`NOT_HOSTS_CHECKED`**: the day the filename-label list was last checked
+  against the DNS root zone, pinned by a test that fails if the list changes
+  without the date changing. A label that quietly becomes a gTLD turns that
+  filter into an egress hole, so it is re-checked at every new ICANN gTLD round
+- **Internationalised ccTLDs name their country, offline**
+  (`IDN_CCTLD_COUNTRY` in `agent_certify.regions`): all 61 delegated IDN
+  ccTLDs with the IANA Root Zone Database's own `iso3166_code` for each —
+  `xn--p1ai` → `RU`, both Chinese forms → `CN`, `xn--90ais` → `BY`,
+  `xn--mgba3a4f16a` → `IR`, India's fourteen scripts, Taiwan's two — read from
+  the database's machine-readable form, cited in the module, and pinned by a
+  test to the day the table was last checked. The determination source is
+  reported as **`ccTLD (IDN)`**. A `forbidden_region RU` rule now reaches
+  `collector.xn--p1ai`; before, the region came back `unknown` and the rule
+  written to stop that destination said nothing about it
+- **Six benchmark injections** — `idn_domain`, `cloud_storage`, `dns_exfil`,
+  `numeric_ipv4`, `assignment_substitution`, each building a real argument
+  object and handing it to the production extractor, all expected as
+  `new_domain`/critical; and `forbidden_region_idn`, the region fault under an
+  internationalised ccTLD, expected as a `forbidden_region` policy violation.
+  All six detected on every trial
+
+### Changed
+- **The benchmark reports two detection rates, always together**: the rate
+  among the fault types a check is meant to catch, and the rate over
+  **everything injected with the blind spots in the denominator**
+  (`overall_detection_rate` in `--format json`). A covered-only rate alone
+  reads as "nothing gets past this" while a fault nobody catches is counted out
+  of the denominator; a test fails if that line ever carries one figure alone
+- **A truncated scan is reported when a nesting that could hold a destination
+  is too deep to read**, and not when it demonstrably holds none: a
+  substitution whose text has neither a URL nor the name of a known client was
+  read far enough to establish there is nothing in it
+
 - **Where a destination is** (`agent_certify.regions`): a destination gets an
   ISO 3166-1 alpha-2 country code, decided **offline**, and the answer says how
   it was reached — `cctld` (a country-code domain: `api.example.cn` → `CN`,
