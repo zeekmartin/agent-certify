@@ -11,6 +11,7 @@ from agent_certify.anomaly import CRITICAL, WARNING
 from agent_certify.benchmark import (
     ANOMALY_TYPES,
     BLIND_SPOTS,
+    FALSE_POSITIVE_CASES,
     AnomalyInjector,
     BenchmarkRunner,
     clean_session,
@@ -166,10 +167,15 @@ def test_injections_cover_every_anomaly_type(injector, session, split):
     injections = injector.injections(session, baseline)
     kinds = [i.kind for i in injections]
     assert sorted(kinds) == sorted(ANOMALY_TYPES)
-    assert len(ANOMALY_TYPES) == 14
+    assert len(ANOMALY_TYPES) == 15
     blind = sorted(i.kind for i in injections if i.is_blind_spot)
     assert blind == sorted(BLIND_SPOTS) == ["file_upload_exfil", "shell_var_domain", "ssh_tunnel_domain"]
     assert [i.expected_category for i in injections if i.is_blind_spot] == [None, None, None]
+    # A clean session is injected too, and is not a blind spot: silence there
+    # is the rule working, not a check missing.
+    clean = sorted(i.kind for i in injections if i.false_positive)
+    assert clean == sorted(FALSE_POSITIVE_CASES) == ["written_url"]
+    assert not any(i.is_blind_spot for i in injections if i.false_positive)
 
 
 def test_the_blind_spot_branch_is_reachable(injector, session, split):
@@ -328,6 +334,53 @@ def test_the_file_upload_blind_spot_is_silent_but_present(injector, session, spl
     assert BenchmarkRunner([session], baseline).detect(g, baseline).anomalies == []
 
 
+def test_the_written_url_case_is_a_clean_session(injector, session, split):
+    """A Write whose contents name a host: nothing to find, and nothing found.
+
+    Not a blind spot — the rule is right, and this is the measurement that says
+    so. It is also the shape that produced 35 of 56 new_domain alerts on real
+    logs before content stopped being read.
+    """
+    _, _, baseline = split
+    g = injector.inject_written_url(session)
+    assert injector.written_domain not in g.seen_domains
+    assert g.seen_domains == session.seen_domains and g.egress_bytes == session.egress_bytes
+    assert g.nodes[injector._busiest_tool(g)].metadata["injected"] == "written_url"
+    report = BenchmarkRunner([session], baseline).detect(g, baseline)
+    assert report.anomalies == []
+
+    injection = next(i for i in injector.injections(session, baseline) if i.kind == "written_url")
+    assert injection.false_positive and not injection.is_blind_spot
+    assert injection.expected_category is None
+
+    # The same host in a command *is* read: that is the line being drawn.
+    from agent_certify.domains import extract_call_domains
+    assert extract_call_domains({"command": f"curl -sS {injector.written_domain}/drop"}) == {
+        injector.written_domain}
+    with pytest.raises(ValueError, match="domain is required"):
+        injector.inject_written_url(session, "  ")
+    with pytest.raises(ValueError, match="already a destination"):
+        injector.inject_written_url(injector.inject_foreign_domain(session, "taken.example.net"),
+                                    "taken.example.net")
+
+
+def test_a_reported_false_positive_case_is_named_as_one(split, injector):
+    """The row has to be able to fail, or it measures nothing."""
+    from agent_certify.benchmark.runner import TypeResult
+
+    row = TypeResult(kind="written_url", expected_category=None, min_severity=None,
+                     false_positive=True, trials=6, detected=2)
+    assert row.expected == "(must stay silent)" and row.quiet == 4
+    assert not row.is_blind_spot
+    result = BenchmarkRunner(split[1], split[2]).run()
+    assert result.injected_false_positives == 0
+    assert [t.kind for t in result.false_positive_cases] == ["written_url"]
+    assert "silent, as it must be" in result.table()
+    data = result.to_dict()
+    assert data["false_positive_cases"] == ["written_url"] and data["injected_false_positives"] == 0
+    assert next(t for t in data["per_type"] if t["kind"] == "written_url")["false_positive_case"]
+
+
 def test_accept_domain_leaves_the_original_baseline_alone(injector, split):
     _, _, baseline = split
     accepted = injector.accept_domain(baseline, "*.decoy.example.net")
@@ -346,7 +399,10 @@ def test_foreign_domain_injector_guards(injector, session):
 
 
 @pytest.mark.parametrize("kind,category,severity", [
-    ("new_tool", "new_tool", CRITICAL),
+    # The fixture baseline is four sessions, under MIN_BASELINE_SESSIONS, so an
+    # unknown tool is expected at warning — the injector takes the expectation
+    # from the rule rather than assuming one (see the test below).
+    ("new_tool", "new_tool", WARNING),
     ("error_spike", "error_rate", WARNING),
     ("new_agent", "new_link", WARNING),
     ("volume_spike", "call_volume_spike", WARNING),
@@ -370,6 +426,25 @@ def test_injection_produces_the_expected_anomaly_and_severity(split, injector, k
         assert hit is not None, f"{kind} not reported for {session.session_id}: {report.summary}"
         assert hit.severity in (severity, CRITICAL)      # the expected severity, or an escalation
     assert runner  # the runner is reusable across sessions
+
+
+def test_the_expected_severity_of_new_tool_follows_the_baseline_size(sessions, injector):
+    """A thin baseline turns an unknown tool into a warning, and the suite knows it.
+
+    The benchmark would otherwise score a miss for a rule the detector is
+    following on purpose: the expectation has to come from the same rule.
+    """
+    from agent_certify.anomaly import MIN_BASELINE_SESSIONS
+
+    thin = learn_holdout(sessions)[2]                       # four sessions
+    assert thin.learned_from < MIN_BASELINE_SESSIONS
+    injection = next(i for i in injector.injections(sessions[1], thin) if i.kind == "new_tool")
+    assert injection.min_severity == WARNING and "expected at warning" in injection.note
+
+    thick = learn_holdout(clean_sessions(12))[2]            # six sessions
+    assert thick.learned_from >= MIN_BASELINE_SESSIONS
+    injection = next(i for i in injector.injections(sessions[1], thick) if i.kind == "new_tool")
+    assert injection.min_severity == CRITICAL and "expected at warning" not in injection.note
 
 
 def test_forbidden_tool_is_reported_as_rejected_not_as_new(split, injector):
@@ -435,10 +510,16 @@ def test_runner_scores_the_full_suite(split):
     result = BenchmarkRunner(test, baseline).run()
     assert {t.kind for t in result.per_type} == set(ANOMALY_TYPES)
     assert result.detection_rate == 1.0 and result.false_negative_rate == 0.0
-    covered = len(ANOMALY_TYPES) - len(BLIND_SPOTS)
-    assert result.trials == covered * len(test)               # blind spots are not counted in the rate
+    covered = len(ANOMALY_TYPES) - len(BLIND_SPOTS) - len(FALSE_POSITIVE_CASES)
+    assert result.trials == covered * len(test)    # blind spots and clean cases are not in the rate
     assert result.false_positive_rate == 0.0 and result.clean_flagged == 0
     assert result.blind_spots == list(BLIND_SPOTS)            # measured, not asserted away
+    # The clean session injected on purpose: nothing reported about it, ever.
+    assert [t.kind for t in result.false_positive_cases] == list(FALSE_POSITIVE_CASES)
+    assert result.injected_false_positives == 0
+    for t in result.false_positive_cases:
+        assert t.trials == len(test) and t.quiet == t.trials and t.expected == "(must stay silent)"
+    assert "stayed silent, as a clean session must" in result.table()
     assert result.learned_from == baseline.learned_from
     for t in result.covered:
         assert t.detected == t.trials and t.missed == [] and sum(t.severities.values()) == t.trials

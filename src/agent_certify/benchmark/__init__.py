@@ -18,6 +18,12 @@ package injects faults whose answer is known into clean sessions and scores
 * :mod:`agent_certify.benchmark.synthetic` — varied clean sessions, so the
   suite runs with no logs at hand.
 
+One row of the table is not a fault: ``written_url`` injects a **clean**
+session — a ``Write`` whose contents name a host — and measures that nothing is
+reported about it. Silence there is the rule working rather than a check
+missing, which is why it is scored apart from the blind spots
+(:data:`~agent_certify.benchmark.injector.FALSE_POSITIVE_CASES`).
+
 Run the whole thing with ``python -m agent_certify.benchmark`` (add
 ``--format json`` for a machine-readable report, or ``--sessions PATH`` to
 benchmark against real logs instead of synthetic ones).
@@ -55,6 +61,7 @@ that far.
 from agent_certify.benchmark.injector import (
     ANOMALY_TYPES,
     BLIND_SPOTS,
+    FALSE_POSITIVE_CASES,
     AnomalyInjector,
     Injection,
 )
@@ -67,5 +74,6 @@ from agent_certify.benchmark.runner import (
 )
 from agent_certify.benchmark.synthetic import clean_session, clean_sessions
 
-__all__ = ["ANOMALY_TYPES", "BLIND_SPOTS", "SEVERITY_ORDER", "AnomalyInjector", "BenchmarkResult", "BenchmarkRunner",
+__all__ = ["ANOMALY_TYPES", "BLIND_SPOTS", "FALSE_POSITIVE_CASES", "SEVERITY_ORDER",
+           "AnomalyInjector", "BenchmarkResult", "BenchmarkRunner",
            "Injection", "TypeResult", "clean_session", "clean_sessions", "learn_holdout"]

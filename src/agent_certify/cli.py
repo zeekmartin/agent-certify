@@ -48,6 +48,7 @@ from agent_certify import __version__
 from agent_certify.anomaly import (
     CALL_MIN_DELTA_CALLS,
     EGRESS_MIN_DELTA_BYTES,
+    MIN_BASELINE_SESSIONS,
     AnomalyDetector,
     AnomalyReport,
 )
@@ -301,7 +302,27 @@ def _learn_report(b: Baseline, saved: Path) -> str:
           if b.known_domains else []),
         "",
         f"Saved to {saved.as_posix()}",
+        *_thin_baseline_note(b),
     ])
+
+
+def _thin_baseline_note(b: Baseline) -> list[str]:
+    """A warning when a baseline rests on too few sessions to compare against.
+
+    Learning from two sessions is allowed and sometimes all there is, but the
+    result is not a description of normal: every statistic has a deviation near
+    zero or as wide as its mean, so the volume checks fire on a handful of
+    calls and ``new_tool`` fires on tools the sessions simply happened not to
+    use. Saying so once, here, costs nothing and saves an operator the triage.
+    """
+    if b.learned_from >= MIN_BASELINE_SESSIONS:
+        return []
+    return ["", (f"WARNING: learned from {b.learned_from} session(s), under the "
+                 f"{MIN_BASELINE_SESSIONS} this needs to describe normal. Expect noise: an unknown "
+                 "tool is reported at warning rather than critical (--min-baseline-sessions), and "
+                 "the call-volume and outbound-volume checks compare against a deviation that is "
+                 "near zero or as wide as its own mean. Learn from more sessions when you have "
+                 "them.")]
 
 
 def _emit(text: str, output: str | None) -> None:
@@ -388,9 +409,11 @@ def _detector(baseline: Baseline | None, source: str, args) -> AnomalyDetector |
     """The detector a command builds from its arguments, floors included."""
     if not baseline:
         return None
-    return AnomalyDetector(baseline, source,
-                           min_call_delta=getattr(args, "min_call_delta", CALL_MIN_DELTA_CALLS),
-                           min_egress_delta=getattr(args, "min_egress_delta", EGRESS_MIN_DELTA_BYTES))
+    return AnomalyDetector(
+        baseline, source,
+        min_call_delta=getattr(args, "min_call_delta", CALL_MIN_DELTA_CALLS),
+        min_egress_delta=getattr(args, "min_egress_delta", EGRESS_MIN_DELTA_BYTES),
+        min_baseline_sessions=getattr(args, "min_baseline_sessions", MIN_BASELINE_SESSIONS))
 
 
 def _scan_report(args) -> list[dict]:
@@ -490,6 +513,7 @@ def cmd_watch(args) -> int:
                 print(line, file=sys.stderr)
     SessionWatcher(str(session), baseline=baseline, policy=policy, interval=args.interval,
                    min_call_delta=args.min_call_delta, min_egress_delta=args.min_egress_delta,
+                   min_baseline_sessions=args.min_baseline_sessions,
                    perspective=args.perspective, max_scans=args.scans, max_seconds=args.duration,
                    out=out, on_scan=on_scan).watch()
     return 0
@@ -853,6 +877,9 @@ def _baseline_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--min-egress-delta", type=int, default=EGRESS_MIN_DELTA_BYTES, metavar="BYTES",
                    help="report an outbound-volume rise only when it passes the baseline maximum by "
                         f"at least BYTES (default: {EGRESS_MIN_DELTA_BYTES}; 0 turns the floor off)")
+    p.add_argument("--min-baseline-sessions", type=int, default=MIN_BASELINE_SESSIONS, metavar="N",
+                   help="sessions a baseline needs before an unknown tool is critical rather than a "
+                        f"warning (default: {MIN_BASELINE_SESSIONS}; a rejected tool is always critical)")
 
 
 def _otel_args(p: argparse.ArgumentParser) -> None:

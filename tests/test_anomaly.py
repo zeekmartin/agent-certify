@@ -44,14 +44,53 @@ def test_normal_session_has_no_anomalies():
 
 def test_new_tool_is_critical():
     g = session_graph("deploy", {"Bash": 10, "Read": 6, "deploy": 4}, errors=1)
-    report = _detect(make_baseline(), g)
+    report = _detect(make_baseline(), g)                    # learned from 10 sessions
     new_tools = [a for a in report.anomalies if a.category == "new_tool"]
     assert len(new_tools) == 1
     assert new_tools[0].severity == "critical" and new_tools[0].value == "deploy"
     assert new_tools[0].z_score is None
+    assert new_tools[0].baseline_value == "not in 3 known tools, learned from 10 session(s)"
     assert report.has_critical
     # The new tool's link is not reported a second time.
     assert not any(a.category == "new_link" for a in report.anomalies)
+
+
+def test_an_unknown_tool_on_a_thin_baseline_is_a_warning():
+    """Two sessions that happened not to use Read do not make Read a critical finding.
+
+    Measured on real logs: six of six new_tool alerts were ordinary Claude Code
+    tools absent from a two-session baseline. The tool is still reported — a
+    thin baseline is a reason to look twice — and the message says how thin.
+    """
+    from agent_certify.anomaly import MIN_BASELINE_SESSIONS
+
+    g = session_graph("deploy", {"Bash": 10, "Read": 6, "deploy": 4}, errors=1)
+    thin = make_baseline(learned_from=MIN_BASELINE_SESSIONS - 1)
+    hits = [a for a in _detect(thin, g).anomalies if a.category == "new_tool"]
+    assert len(hits) == 1 and hits[0].severity == "warning"
+    assert "learned from 4 session(s)" in hits[0].baseline_value
+    assert "under the 5 this needs" in hits[0].detail
+    assert not _detect(thin, g).has_critical
+
+    # At the threshold it is critical again, and the knob moves the threshold.
+    at = make_baseline(learned_from=MIN_BASELINE_SESSIONS)
+    assert [a.severity for a in _detect(at, g).anomalies if a.category == "new_tool"] == ["critical"]
+    detector = AnomalyDetector(thin, min_baseline_sessions=0)
+    hits = [a for a in detector.detect(g, AgentFIScanner(g).scan()).anomalies
+            if a.category == "new_tool"]
+    assert [a.severity for a in hits] == ["critical"]
+    assert AnomalyDetector(thin).thin_baseline and not AnomalyDetector(at).thin_baseline
+
+
+def test_a_rejected_tool_is_critical_however_thin_the_baseline():
+    """An operator's decision is not a statistic: no number of sessions revises it."""
+    g = session_graph("deploy", {"Bash": 10, "Read": 6, "deploy": 4}, errors=1)
+    thin = make_baseline(learned_from=1)
+    thin.rejected_tools.add("deploy")
+    hits = [a for a in _detect(thin, g).anomalies if a.category == "new_tool"]
+    assert len(hits) == 1 and hits[0].severity == "critical"
+    assert hits[0].message == "Rejected tool used: deploy"
+    assert "learned from" not in hits[0].baseline_value
 
 
 def test_new_link_is_warning():
@@ -169,17 +208,55 @@ def test_cli_scan_with_baseline(session_dir, capsys):
     other = session_dir / "other.jsonl"
     other.write_text(json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [
         {"type": "tool_use", "id": "x", "name": "deploy_production", "input": {}}]}}) + "\n")
-    assert main(["scan", str(other), "--baseline", ".agent-certify/baseline.json"]) == 2   # critical: exit 2
+    # One session learned, so an unknown tool is a warning and says so.
+    assert main(["scan", str(other), "--baseline", ".agent-certify/baseline.json"]) == 0
+    out = capsys.readouterr().out
+    assert "[WARNING]  New tool never seen: deploy_production" in out
+    assert "learned from 1 session(s)" in out
+    assert "under the 5 this needs to call an unknown tool critical" in out
+
+    # With a baseline the operator considers thick enough, it is critical again
+    # and the scan fails: --min-baseline-sessions is the knob.
+    assert main(["scan", str(other), "--baseline", ".agent-certify/baseline.json",
+                 "--min-baseline-sessions", "1"]) == 2                            # critical: exit 2
     out = capsys.readouterr().out
     assert "[CRITICAL] New tool never seen: deploy_production" in out
 
-    assert main(["scan", str(other), "--format", "json"]) == 2
+    assert main(["scan", str(other), "--format", "json", "--min-baseline-sessions", "1"]) == 2
     assert json.loads(capsys.readouterr().out)["anomalies"]["has_critical"] is True
+    # And at the default, the same session is a warning the JSON carries too.
+    assert main(["scan", str(other), "--format", "json"]) == 0
+    data = json.loads(capsys.readouterr().out)["anomalies"]
+    assert data["has_critical"] is False
+    assert data["anomalies"][0]["severity"] == "warning"
 
     # --no-baseline: v0.1 output, no anomaly section.
     assert main(["scan", str(other), "--no-baseline"]) == 0
     out = capsys.readouterr().out
     assert "ANOMALIES" not in out and "baseline" not in out.lower()
+
+
+def test_learn_warns_about_a_thin_baseline(session_dir, capsys):
+    """Learning from two sessions is allowed; calling the result "normal" is not."""
+    assert main(["learn", str(session_dir / "sess-1.jsonl")]) == 0
+    out = capsys.readouterr().out
+    assert "WARNING: learned from 1 session(s), under the 5" in out
+    assert "an unknown tool is reported at warning rather than critical" in out
+    assert "--min-baseline-sessions" in out
+
+
+def test_learn_says_nothing_about_a_baseline_with_enough_sessions(tmp_path, capsys):
+    from conftest import session_graph
+
+    from agent_certify.baseline import BaselineLearner
+
+    graphs = [session_graph(f"s{i}", {"Bash": 10 + i, "Read": 4}) for i in range(5)]
+    baseline = BaselineLearner().learn_graphs(graphs)
+    assert baseline.learned_from == 5
+    BaselineLearner().save(baseline, tmp_path / "b.json")
+    capsys.readouterr()
+    from agent_certify.cli import _learn_report
+    assert "WARNING: learned from" not in _learn_report(baseline, tmp_path / "b.json")
 
 
 def test_cli_missing_baseline(session_dir):
@@ -192,7 +269,9 @@ def test_cli_directory_scan_lists_anomalies_per_session(session_dir, capsys):
     capsys.readouterr()
     (session_dir / "sess-2.jsonl").write_text(json.dumps({"type": "assistant", "message": {
         "role": "assistant", "content": [{"type": "tool_use", "id": "x", "name": "deploy", "input": {}}]}}) + "\n")
-    assert main(["scan", str(session_dir)]) == 2                      # sess-2 has a critical anomaly
+    # The baseline is one session, so the unknown tool is a warning; the table
+    # still has to show it against the right session.
+    assert main(["scan", str(session_dir), "--min-baseline-sessions", "1"]) == 2   # sess-2: critical
     table = capsys.readouterr().out.split("Merged graph")[0]
     assert "ANOMALIES" in table.splitlines()[0]
     rows = {line.split()[0]: line for line in table.splitlines()[1:] if line.strip()}

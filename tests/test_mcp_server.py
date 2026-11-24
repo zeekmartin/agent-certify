@@ -163,7 +163,10 @@ def test_check_anomalies(server, session_dir):
     other.write_text(json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [
         {"type": "tool_use", "id": "x", "name": "deploy", "input": {}}]}}) + "\n")
     data, _ = call(server, "check_anomalies", session_path=str(other))
-    assert any(a["category"] == "new_tool" and a["severity"] == "critical" for a in data["anomalies"])
+    # One session learned, so the unknown tool is reported at warning, with the
+    # size of the baseline in the message (see MIN_BASELINE_SESSIONS).
+    hit = next(a for a in data["anomalies"] if a["category"] == "new_tool")
+    assert hit["severity"] == "warning" and "learned from 1 session(s)" in hit["baseline_value"]
 
 
 def test_check_policy(server, tmp_path):

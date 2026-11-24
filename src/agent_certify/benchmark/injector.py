@@ -40,6 +40,8 @@ flood``                hosts than one call keeps          truncated``, critical
 evasion``              padding in one string              critical
 ``inject_file_         a file uploaded to a known host,   **nothing** — a
 upload_exfil``         whose size the log does not hold   measured blind spot
+``inject_written_      a URL *written into a file*, not   **nothing** — a
+url``                  called                             false-positive case
 =====================  =================================  =====================
 
 The volume spike was a measured blind spot until v0.7.0: no check read how
@@ -77,6 +79,15 @@ with no trace at all. Padding is no longer a bound (a string is read whole, to
 the 10 MB a record already allows), and the hosts-per-call bound remains but is
 now counted and reported, so a flood of decoys no longer buys silence.
 
+``inject_written_url`` is not a fault at all: it is a **false-positive case**,
+the one shape the suite asserts must stay silent for a good reason rather than
+for want of a check. A session that writes ``curl evil.example.net`` into a test
+file has contacted nobody, and before :data:`~agent_certify.domains.CONTENT_KEYS`
+it was reported as egress — of the 43 hosts eleven held-out real sessions
+stopped reading, 19 were written and never called. It is scored apart from the
+detections and the blind spots: silence is a pass, and anything reported is a
+false positive the table names as one.
+
 **Three blind spots are open**, and all three are injected rather than
 asserted:
 
@@ -113,7 +124,7 @@ import copy
 import math
 from dataclasses import dataclass, field
 
-from agent_certify.anomaly import CRITICAL, WARNING
+from agent_certify.anomaly import CRITICAL, MIN_BASELINE_SESSIONS, WARNING
 from agent_certify.baseline import Baseline
 from agent_certify.domains import MAX_DOMAINS, extract_call_domains, measure_call, normalise_pattern
 from agent_certify.graph import AgentGraph
@@ -130,6 +141,7 @@ SSH_TUNNEL_DOMAIN = "tunnelled.unknown.cn"
 HIDDEN_DOMAIN = "hidden.unknown.cn"          # buried behind a flood of decoys
 PADDED_DOMAIN = "padded.unknown.cn"          # buried behind a block of padding
 DECOY_DOMAIN = "decoy.example.net"           # the decoys themselves, accepted by the operator
+WRITTEN_DOMAIN = "written.unknown.cn"        # named in a file's contents, never called
 
 #: Every anomaly type the benchmark injects, in report order. The last one is a
 #: blind spot: it is injected and expected to go unreported (see the module
@@ -137,20 +149,27 @@ DECOY_DOMAIN = "decoy.example.net"           # the decoys themselves, accepted b
 ANOMALY_TYPES = ("new_tool", "error_spike", "new_agent", "volume_spike", "forbidden_tool",
                  "foreign_domain", "shell_domain", "wrapped_shell_domain", "exfiltration",
                  "decoy_flood", "padding_evasion",
-                 "shell_var_domain", "ssh_tunnel_domain", "file_upload_exfil")
+                 "shell_var_domain", "ssh_tunnel_domain", "file_upload_exfil", "written_url")
 
 #: Blind spots among :data:`ANOMALY_TYPES`: faults no check covers yet, whose
 #: expected outcome is silence. Kept here so a test can state the list the
 #: release claims rather than re-deriving it from the registry.
 BLIND_SPOTS = ("shell_var_domain", "ssh_tunnel_domain", "file_upload_exfil")
 
+#: Injections that are **not** faults: the session is clean and the suite
+#: measures that nothing is reported about it. A detection here is a false
+#: positive, which is why they are scored apart from the blind spots — those
+#: are gaps, these are correctness.
+FALSE_POSITIVE_CASES = ("written_url",)
+
 
 @dataclass
 class Injection:
     """One injected session and the anomaly it is expected to produce.
 
-    ``expected_category`` is None for a fault no check covers (a blind spot),
-    in which case the expected outcome is that nothing is reported.
+    ``expected_category`` is None for a fault no check covers (a blind spot) and
+    for a clean session that must stay quiet (``false_positive``); in both cases
+    the expected outcome is that nothing is reported.
     ``min_severity`` is the *least* severe report that still counts as a
     detection: a fault expected at warning is also detected when it comes back
     critical.
@@ -162,11 +181,17 @@ class Injection:
     baseline: Baseline | None = None          # overrides the benchmark's baseline for this injection
     note: str = ""
     detail: dict = field(default_factory=dict)
+    #: True when this is not a fault at all but a **clean** session that must
+    #: produce nothing: a false-positive case (:data:`FALSE_POSITIVE_CASES`).
+    #: Both it and a blind spot expect silence, for opposite reasons — one
+    #: because the rule is right, the other because a check is missing — so
+    #: they are scored apart.
+    false_positive: bool = False
 
     @property
     def is_blind_spot(self) -> bool:
         """True when no check covers this fault, so the expected outcome is silence."""
-        return self.expected_category is None
+        return self.expected_category is None and not self.false_positive
 
 
 class AnomalyInjector:
@@ -191,7 +216,7 @@ class AnomalyInjector:
                  wrapped_shell_domain: str = WRAPPED_SHELL_DOMAIN,
                  ssh_tunnel_domain: str = SSH_TUNNEL_DOMAIN,
                  hidden_domain: str = HIDDEN_DOMAIN, padded_domain: str = PADDED_DOMAIN,
-                 decoy_domain: str = DECOY_DOMAIN):
+                 decoy_domain: str = DECOY_DOMAIN, written_domain: str = WRITTEN_DOMAIN):
         self.new_tool = new_tool
         self.new_agent = new_agent
         self.foreign_domain = foreign_domain
@@ -202,6 +227,7 @@ class AnomalyInjector:
         self.hidden_domain = hidden_domain
         self.padded_domain = padded_domain
         self.decoy_domain = decoy_domain
+        self.written_domain = written_domain
 
     # ------------------------------------------------------------ injectors
     def inject_new_tool(self, session: AgentGraph, tool_name: str | None = None) -> AgentGraph:
@@ -571,6 +597,39 @@ class AnomalyInjector:
         g.nodes[target].metadata["hidden_destination"] = name
         return g
 
+    def inject_written_url(self, session: AgentGraph, domain: str | None = None) -> AgentGraph:
+        """Write a URL into a file, which is not the same as calling it.
+
+        ``{"file_path": "tests/fixture.py", "content": "curl -sS <host>/drop"}``:
+        a ``Write`` whose *contents* name a host. The session has contacted
+        nobody, so the expected outcome is silence — and this is a
+        **false-positive case**, not a blind spot: nothing is missing, the rule
+        is right.
+
+        It earns a place in the suite because it used to fail: 19 of the 43
+        hosts that eleven held-out real sessions stopped reading had only been
+        written into a file, which is what
+        :data:`~agent_certify.domains.CONTENT_KEYS` now prevents. The injection
+        goes through the production extractor, so if content is ever read again
+        the row says so.
+        """
+        name = (domain or self.written_domain).strip().lower()
+        if not name:
+            raise ValueError("domain is required: a written destination has to be named")
+        g = self._copy(session, "written_url")
+        if name in g.seen_domains:
+            raise ValueError(f"{name!r} is already a destination in this session; pick one it does not use")
+        target = self._busiest_tool(g) or self._caller(g)
+        arguments = {"file_path": "tests/fixture.py",
+                     "content": f"def test_egress():\n    run('curl -sS {name}/drop')\n"
+                                f"    assert 'https://{name}/' in LOG\n"}
+        egress = measure_call(arguments)
+        g.record_egress(target, egress.domains, egress.outbound_bytes)
+        g.note_scan_truncation(target, egress.truncated, network=egress.network)
+        g.nodes[target].metadata["injected"] = "written_url"
+        g.nodes[target].metadata["written_destination"] = name
+        return g
+
     def inject_padding_evasion(self, session: AgentGraph, domain: str | None = None,
                                padding: int = 70_000) -> AgentGraph:
         """Push a destination past the limit on how much of one string is read.
@@ -654,8 +713,16 @@ class AnomalyInjector:
         calls gets no error spike, one with no tools no volume spike.
         """
         out: list[Injection] = []
-        self._add(out, "new_tool", lambda: self.inject_new_tool(session), "new_tool", CRITICAL,
-                  f"a tool named {self.new_tool!r}, never seen in the baseline")
+        # An unknown tool is critical on a baseline that has seen enough
+        # sessions for "never seen" to mean something, and a warning below
+        # that; the expectation follows the rule rather than assuming one
+        # (see :data:`~agent_certify.anomaly.MIN_BASELINE_SESSIONS`).
+        thin = baseline.learned_from < MIN_BASELINE_SESSIONS
+        unknown_tool = WARNING if thin else CRITICAL
+        self._add(out, "new_tool", lambda: self.inject_new_tool(session), "new_tool", unknown_tool,
+                  f"a tool named {self.new_tool!r}, never seen in the baseline"
+                  + (f" (expected at warning: the baseline is {baseline.learned_from} session(s))"
+                     if thin else ""))
         self._add(out, "error_spike", lambda: self.inject_error_spike(session), "error_rate", WARNING,
                   "existing calls failed until the error rate reaches 15%")
         self._add(out, "new_agent", lambda: self.inject_new_agent(session), "new_link", WARNING,
@@ -698,16 +765,22 @@ class AnomalyInjector:
         self._add(out, "file_upload_exfil", lambda: self.inject_file_upload_exfil(session),
                   None, None, "a file uploaded with curl -T to a known destination, whose size the "
                               "log does not contain")
+        # Not a fault: a clean session the suite measures for false positives.
+        self._add(out, "written_url", lambda: self.inject_written_url(session),
+                  None, None, f"{self.written_domain} written into a file's contents by a Write "
+                              "call, never contacted — nothing may be reported",
+                  false_positive=True)
         return out
 
     @staticmethod
-    def _add(out: list, kind: str, build, category, severity, note, baseline: Baseline | None = None) -> None:
+    def _add(out: list, kind: str, build, category, severity, note, baseline: Baseline | None = None,
+             false_positive: bool = False) -> None:
         try:
             graph = build()
         except (ValueError, KeyError):
             return                      # this fault does not apply to this session
         out.append(Injection(kind=kind, graph=graph, expected_category=category, min_severity=severity,
-                             baseline=baseline, note=note))
+                             baseline=baseline, note=note, false_positive=false_positive))
 
     # ------------------------------------------------------------ internals
     @staticmethod
