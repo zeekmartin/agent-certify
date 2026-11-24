@@ -301,6 +301,22 @@ def describe(graph: AgentGraph, result: ScanResult, anomalies=None, violations=N
     return " ".join(out)
 
 
+#: How many tool calls may be in flight at once, counting the ones that have
+#: already timed out.
+#:
+#: A timeout here does not stop the work: the worker is a daemon thread and
+#: Python cannot kill a thread, so a request that ran past its deadline is
+#: *abandoned*, not cancelled — it keeps holding its file handles and its CPU
+#: until it finishes on its own. A client that retries a slow call therefore
+#: adds a thread each time, and ten retries mean ten scans of the same large
+#: session running at once: the server gets slower, which makes the next call
+#: time out, which makes the client retry. Refusing is the only honest answer,
+#: and a readable refusal is a better answer than a pile of threads.
+#:
+#: Two, because one in flight and one arriving is the normal case for a single
+#: agent, and anything beyond that is either a parallel caller or a retry storm.
+MAX_INFLIGHT = 2
+
 # ---------------------------------------------------------------- server
 class AgentCertifyMCPServer:
     """MCP server exposing agent-certify tools via stdio JSON-RPC.
@@ -309,19 +325,28 @@ class AgentCertifyMCPServer:
     response (``None`` for notifications); ``run()`` is the stdio loop.
     ``projects_root``, ``cwd`` and ``env`` override session auto-detection;
     ``projects_root`` and the process working directory are the roots that
-    path arguments are confined to. ``request_timeout`` bounds each tool call.
+    path arguments are confined to. ``request_timeout`` bounds each tool call,
+    and ``max_inflight`` bounds how many may be running at once — a timed-out
+    call cannot be killed, so without that bound a retrying client turns one
+    slow scan into a thread pile (:data:`MAX_INFLIGHT`).
     """
 
     TOOLS = TOOLS
 
     def __init__(self, projects_root: str | os.PathLike | None = None, cwd: str | None = None,
-                 env: dict | None = None, request_timeout: float = DEFAULT_REQUEST_TIMEOUT):
+                 env: dict | None = None, request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
+                 max_inflight: int = MAX_INFLIGHT):
         from agent_certify import __version__
         self.version = __version__
         self.projects_root = Path(projects_root) if projects_root else None
         self.cwd = cwd
         self.env = env
         self.request_timeout = request_timeout
+        self.max_inflight = max(1, int(max_inflight))
+        #: Worker threads that are still alive, abandoned ones included. Pruned
+        #: on every call rather than on a timer: there is no event loop here.
+        self._workers: list[threading.Thread] = []
+        self._abandoned = 0                   # threads given up on, for the log
         self.protocol_version = PROTOCOL_VERSIONS[0]
         self._handlers: dict[str, Callable[..., dict]] = {
             "scan_topology": self._scan_topology,
@@ -438,8 +463,28 @@ class AgentCertifyMCPServer:
             result["structuredContent"] = payload
         return self._result(request, result)
 
+    def inflight(self) -> int:
+        """Worker threads still alive, abandoned ones included. Prunes as it counts."""
+        self._workers = [w for w in self._workers if w.is_alive()]
+        return len(self._workers)
+
     def _run_with_timeout(self, handler: Callable[..., dict], arguments: dict) -> dict:
-        """Run a tool in a worker thread; give up after ``request_timeout`` seconds."""
+        """Run a tool in a worker thread; give up after ``request_timeout`` seconds.
+
+        Refuses outright when :data:`MAX_INFLIGHT` earlier calls are still
+        running. The refusal is the point: a timeout abandons its thread rather
+        than cancelling it, so a client that keeps retrying would otherwise have
+        the server running one more copy of the same scan each time, each copy
+        making the next one slower.
+        """
+        running = self.inflight()
+        if running >= self.max_inflight:
+            logger.warning("agent-certify MCP: refusing a tool call, %d still running "
+                           "(%d abandoned so far)", running, self._abandoned)
+            raise ToolError(f"server busy: {running} earlier request(s) still running. "
+                            "A timed-out request keeps running to the end — it cannot be "
+                            "cancelled — so retrying adds work rather than replacing it. "
+                            "Wait for it, or scan a smaller session.")
         outcome: dict[str, Any] = {}
 
         def target():
@@ -449,11 +494,21 @@ class AgentCertifyMCPServer:
                 outcome["error"] = exc
 
         worker = threading.Thread(target=target, daemon=True)
+        self._workers.append(worker)
         worker.start()
         worker.join(self.request_timeout)
         if worker.is_alive():
-            # The thread cannot be killed; it is a daemon and its result is discarded.
-            raise ToolError(f"Request timed out after {self.request_timeout:g} s")
+            # The thread cannot be killed; it is a daemon and its result is
+            # discarded. It stays in self._workers, counted against the cap
+            # until it ends on its own, and it is counted in the log.
+            self._abandoned += 1
+            logger.warning("agent-certify MCP: request abandoned after %gs, still running "
+                           "(%d abandoned so far, %d in flight)",
+                           self.request_timeout, self._abandoned, self.inflight())
+            raise ToolError(f"Request timed out after {self.request_timeout:g} s "
+                            "(the work continues in the background and still counts "
+                            "against the server's in-flight limit)")
+        self._workers = [w for w in self._workers if w is not worker]
         if "error" in outcome:
             raise outcome["error"]
         return outcome["value"]

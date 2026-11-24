@@ -76,7 +76,7 @@ from agent_certify.mcp_server import AgentCertifyMCPServer
 from agent_certify.otel import DEFAULT_TRACES_PATH, OTelExporter
 from agent_certify.parser import AutoParser, MCPLogsParser
 from agent_certify.parser.auto import is_trace_dir
-from agent_certify.paths import expand_cli
+from agent_certify.paths import expand_cli, hash_project
 from agent_certify.policy import DEFAULT_POLICY_PATH, Policy, PolicyGenerator, PolicyViolation
 from agent_certify.regions import OFFLINE, RegionResolver, load_geoip
 from agent_certify.scanner import AgentFIScanner, Perspective, ScanResult
@@ -87,6 +87,21 @@ FAIL_EXIT = 2
 #: `certify` refusing to sign is a failed command, not a finding in a report:
 #: exit 1, the way `verify` reports drift.
 CERTIFY_REFUSED = 1
+
+#: ``verify`` exit codes. 0 and 1 are the answer to "does this system still
+#: match its certificate?"; 2 is the usual "you called it wrong"; 3 exists
+#: because there is a third answer, and reporting it as either of the first two
+#: would be a lie:
+#:
+#: * **0** — valid: signature, validity window, topology and egress coverage
+#:   all checked and all in order.
+#: * **1** — invalid: something was checked and did not match.
+#: * **2** — the command line was wrong (missing argument, unreadable key).
+#: * **3** — signature and topology valid, **egress coverage not verifiable**:
+#:   the certificate carries no list of observed destinations and the session
+#:   reached some. Nobody can say whether those were the certified ones.
+#:   ``--accept-unverified-egress`` turns this case into 0, deliberately.
+VERIFY_OK, VERIFY_INVALID, VERIFY_USAGE, VERIFY_EGRESS_UNVERIFIABLE = 0, 1, 2, 3
 
 
 def _path(p: str) -> Path:
@@ -404,6 +419,7 @@ def cmd_scan(args) -> int:
             written = exporter.write(span, args.otel_file, stdout=args.otel_stdout)
         if written:
             print(f"OTel: {len(sessions)} span(s) appended to {written.as_posix()}", file=sys.stderr)
+    _geoip_attribution(args)
     if _fails(sessions, args.fail_on):
         print(f"agent-certify: findings at or above '{args.fail_on}' (exit {FAIL_EXIT})", file=sys.stderr)
         return FAIL_EXIT
@@ -452,6 +468,7 @@ def _detector(baseline: Baseline | None, source: str, args) -> AnomalyDetector |
 def _scan_report(args) -> list[dict]:
     """Print the report; return every session's graph, scan, anomalies and violations."""
     graphs, merged = load(args.path, include_mcp=args.include_mcp)
+    _hash_projects([*graphs, merged], args)
     baseline, source = _find_baseline(args)
     policy, policy_source = _find_policy(args)
     detector = _detector(baseline, source, args)
@@ -547,7 +564,9 @@ def cmd_watch(args) -> int:
         if args.otel_stdout:
             def out(line):
                 print(line, file=sys.stderr)
+    _geoip_attribution(args)        # before the loop: a watch may never end
     SessionWatcher(str(session), baseline=baseline, policy=policy, interval=args.interval,
+                   hash_project=args.hash_project,
                    min_call_delta=args.min_call_delta, min_egress_delta=args.min_egress_delta,
                    min_baseline_sessions=args.min_baseline_sessions, regions=_regions(args),
                    perspective=args.perspective, max_scans=args.scans, max_seconds=args.duration,
@@ -927,10 +946,61 @@ def cmd_verify(args) -> int:
             raise SystemExit(f"agent-certify: {args.public_key} does not hold an Ed25519 public key (64 hex chars)")
     _, g = load(args.path)
     report = cert.verify(g, fi_tolerance=args.fi_tolerance, public_key=pub, allow_unsigned=args.allow_unsigned,
-                         ignore_expiry=args.ignore_expiry, expected_system_id=args.expect_system_id,
-                         regions=_regions(args))
+                         ignore_expiry=args.ignore_expiry, allow_no_expiry=args.allow_no_expiry,
+                         expected_system_id=args.expect_system_id, regions=_regions(args))
     _emit(json.dumps(report.to_dict(), indent=2) if args.format == "json" else str(report), None)
-    return 0 if report.is_valid else 1
+    _geoip_attribution(args)
+    if not report.is_valid:
+        return VERIFY_INVALID
+    if report.egress_verifiable:
+        return VERIFY_OK
+    if args.accept_unverified_egress:
+        _warn("--accept-unverified-egress: the certificate records no observed destinations, so "
+              f"whether the {len(g.seen_domains)} destination(s) of this session were certified "
+              "was not checked; reported as valid because you asked for that")
+        return VERIFY_OK
+    print(f"agent-certify: exit {VERIFY_EGRESS_UNVERIFIABLE}: signature and topology are valid, "
+          "egress coverage is NOT verifiable: this certificate carries no list of observed "
+          f"destinations and the session reached {len(g.seen_domains)}. Re-issue the certificate "
+          "without --omit-observed-destinations, or pass --accept-unverified-egress to accept "
+          "the narrower check as valid.", file=sys.stderr)
+    return VERIFY_EGRESS_UNVERIFIABLE
+
+
+#: DB-IP's *IP to Country Lite* database is published under CC BY 4.0, which
+#: asks for attribution wherever the data is used. A report that places a
+#: destination in a country is a use of it, so the line is printed whenever the
+#: database was read — on stderr, so it never lands inside a JSON report or an
+#: HTML file, and the operator who passes a report on has seen it.
+GEOIP_ATTRIBUTION = "IP geolocation by DB-IP.com, CC BY 4.0"
+
+
+def _hash_projects(graphs, args) -> None:
+    """Replace every graph's project name with its digest, when asked.
+
+    Done once, on the graph, so that every output downstream — the text report,
+    the JSON, the OTel span, the HTML — carries the label rather than the name.
+    One place to change it is one place to get it wrong.
+    """
+    if not getattr(args, "hash_project", False):
+        return
+    # By identity: for a single session the merged graph *is* that session's
+    # graph, and hashing one object twice would give the digest of a digest —
+    # stable, but not the digest of the project name, so two reports of the
+    # same project would not match each other.
+    seen: dict[int, object] = {}
+    for g in graphs:
+        seen.setdefault(id(g), g)
+    for g in seen.values():
+        g.project = hash_project(g.project)
+
+
+def _geoip_attribution(args) -> bool:
+    """Print the attribution line when a GeoIP database was used. True if printed."""
+    if not getattr(args, "geoip_db", None):
+        return False
+    print(f"agent-certify: {GEOIP_ATTRIBUTION}", file=sys.stderr)
+    return True
 
 
 def _safe(s: str | None) -> str:
@@ -995,6 +1065,8 @@ def build_parser() -> argparse.ArgumentParser:
     _baseline_args(s)
     _policy_args(s)
     _region_args(s, dns=True)
+    s.add_argument("--hash-project", action="store_true",
+                   help="replace the project name with 'sha256:<12 hex>' in every output (report, JSON, OTel, HTML). A project name comes from a filesystem path and can carry a user or client name; the digest is stable, so sessions of one project still group together. Pseudonymisation, not anonymisation: a guessed name can be confirmed by hashing it")
     s.add_argument("--include-mcp", action="store_true",
                    help="add the session's calls from MCP server logs (claude-cli-nodejs cache)")
     s.add_argument("--fail-on", choices=["critical", "warning", "never"], default="critical",
@@ -1012,6 +1084,8 @@ def build_parser() -> argparse.ArgumentParser:
     _policy_args(w)
     _region_args(w, dns=True)
     _otel_args(w)
+    w.add_argument("--hash-project", action="store_true",
+                   help="replace the project name with 'sha256:<12 hex>' in every output (report, JSON, OTel, HTML). A project name comes from a filesystem path and can carry a user or client name; the digest is stable, so sessions of one project still group together. Pseudonymisation, not anonymisation: a guessed name can be confirmed by hashing it")
     w.set_defaults(func=cmd_watch)
 
     sp = sub.add_parser("suggest-policy", help="draft a policy from a learned baseline")
@@ -1106,13 +1180,32 @@ def build_parser() -> argparse.ArgumentParser:
     _region_args(c)
     c.set_defaults(func=cmd_certify)
 
-    v = sub.add_parser("verify", help="check a graph against a certificate (exit 1 on drift)")
+    v = sub.add_parser(
+        "verify",
+        help="check a graph against a certificate (exit 1 on drift, 3 if egress coverage is unverifiable)",
+        description="Check a session against a certificate.\n\n"
+                    "Exit codes:\n"
+                    "  0  valid: signature, validity window, topology and egress coverage all in order\n"
+                    "  1  invalid: something was checked and did not match\n"
+                    "  2  the command line was wrong (missing argument, unreadable key)\n"
+                    "  3  signature and topology valid, egress coverage NOT verifiable: the certificate\n"
+                    "     records no observed destinations and the session reached some, so whether those\n"
+                    "     were the certified ones cannot be decided. --accept-unverified-egress makes\n"
+                    "     this case 0.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     v.add_argument("certificate", nargs="?", help="certificate file from `agent-certify certify` (.cert.json)")
     v.add_argument("path", nargs="?", help="session (.jsonl, .agent-trace) or project folder to check")
     v.add_argument("--public-key", help="REQUIRED: the issuer's public key file (KEY.pub), obtained out of band")
     v.add_argument("--allow-unsigned", action="store_true",
                    help="skip the signature check (unsafe: anyone can write an unsigned certificate)")
     v.add_argument("--ignore-expiry", action="store_true", help="accept a certificate outside its validity period")
+    v.add_argument("--allow-no-expiry", action="store_true",
+                   help="accept a certificate that has no validity window at all (format 1, issued "
+                        "before v0.5). Such a certificate never expires and there is no revocation "
+                        "list, so accepting one is a decision: without this option it fails")
+    v.add_argument("--accept-unverified-egress", action="store_true",
+                   help="exit 0 instead of 3 when the certificate records no observed destinations "
+                        "and this session reached some: accepts that coverage was not checked")
     v.add_argument("--expect-system-id", help="fail unless the certificate was issued for this system id")
     v.add_argument("--fi-tolerance", type=float, default=0.001)
     v.add_argument("--format", choices=["text", "json"], default="text")

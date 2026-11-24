@@ -91,6 +91,42 @@ DEFAULT_FI_TOLERANCE = 0.001
 DEFAULT_VALIDITY_DAYS = 90
 DOMAIN = b"agent-certify/cert/v1\x00"
 CURRENT_FORMAT = 3
+
+#: Certificate format -> the oldest ``agent_certify.__version__`` allowed to
+#: write it. A format is a wire contract: a verifier that predates one cannot
+#: read it, so the version that introduced it is part of its definition rather
+#: than a release note. The table exists so that adding a format without
+#: declaring its version is a **test failure** instead of a surprise for
+#: whoever has to tell a reader which version to install.
+#:
+#: Format 1 is pre-v0.5 (no validity window). Format 2 added the window and
+#: ``skipped_records``. Format 3 added the signed ``egress`` section.
+#: What a verification could decide about egress coverage.
+#:
+#: * ``checked`` — the certificate records what the system was observed
+#:   reaching, so every destination of the live session was compared to it.
+#: * ``nothing_reached`` — the session reached nowhere, so there is nothing to
+#:   cover and nothing to doubt.
+#: * ``not_recorded`` — the certificate was issued with
+#:   ``--omit-observed-destinations``: its patterns and forbidden regions were
+#:   checked, coverage was not.
+#: * ``no_section`` — the certificate predates ``cert_format`` 3 and carries no
+#:   egress rules at all.
+#:
+#: The last two are the ones ``verify`` will not call a pass: see
+#: :attr:`DriftReport.egress_verifiable`.
+COVERAGE_CHECKED = "checked"
+COVERAGE_NOTHING_REACHED = "nothing_reached"
+COVERAGE_NOT_RECORDED = "not_recorded"
+COVERAGE_NO_SECTION = "no_section"
+EGRESS_COVERAGE_STATES = (COVERAGE_CHECKED, COVERAGE_NOTHING_REACHED,
+                          COVERAGE_NOT_RECORDED, COVERAGE_NO_SECTION)
+
+MIN_VERSION_FOR_FORMAT = {
+    1: "0.1.0",
+    2: "0.5.0",
+    3: "0.8.0.dev0",
+}
 _TS = "%Y-%m-%dT%H:%M:%SZ"
 _V2_ONLY = ("cert_format", "not_before", "not_after", "skipped_records")
 _V3_ONLY = ("egress",)
@@ -418,14 +454,16 @@ class AgentCertificate:
     # ------------------------------------------------------------ verification
     def verify(self, graph: AgentGraph, fi_tolerance: float = DEFAULT_FI_TOLERANCE,
                public_key: str | bytes | None = None, *, allow_unsigned: bool = False,
-               ignore_expiry: bool = False, expected_system_id: str | None = None,
+               ignore_expiry: bool = False, allow_no_expiry: bool = False,
+               expected_system_id: str | None = None,
                now: datetime | None = None, regions: RegionResolver | None = None) -> DriftReport:
         """Compare a live graph against this certificate.
 
         Fails (``is_valid`` False) when: the topology or FI changed; no trusted
         ``public_key`` is given (unless ``allow_unsigned``); the certificate is
         unsigned or its signature does not match that key; the current time is
-        outside [``not_before``, ``not_after``] (unless ``ignore_expiry``); the
+        outside [``not_before``, ``not_after``] (unless ``ignore_expiry``), or
+        has no window at all (unless ``allow_no_expiry``); the
         system id differs from ``expected_system_id``. Agents are compared the
         way the certificate names them: by type since v0.3, by spawn id before.
 
@@ -460,7 +498,20 @@ class AgentCertificate:
         # --- validity window
         moment = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
         if not (self.not_before or self.not_after):
-            warnings.append("Certificate has no validity period (issued before v0.5): it never expires")
+            # A certificate that never expires is a credential with no end,
+            # and the only thing that can retire it is the issuer destroying
+            # the key that signed it (there is no revocation list: SECURITY.md
+            # §2). Until v0.8.0 this was a warning and such a certificate
+            # passed; it is now a failure that the operator can waive in one
+            # explicit option, because "valid forever" should be a decision
+            # rather than a default inherited from a 2026 release.
+            if allow_no_expiry:
+                warnings.append("Certificate has no validity period (issued before v0.5): it never "
+                                "expires, and --allow-no-expiry was given")
+            else:
+                reasons.append("Certificate has no validity period (issued before v0.5): it would "
+                               "never expire. Re-issue it with --validity-days, or pass "
+                               "--allow-no-expiry to accept it as it is")
         elif not ignore_expiry:
             try:
                 if self.not_before and moment < _parse_ts(self.not_before):
@@ -528,6 +579,7 @@ class AgentCertificate:
 
         # --- egress: destinations the certificate does not cover, and forbidden regions
         added_destinations, forbidden_destinations = [], []
+        coverage = COVERAGE_CHECKED if graph.seen_domains else COVERAGE_NOTHING_REACHED
         if self.egress:
             added_destinations, forbidden_destinations = self._egress_drift(graph, regions or OFFLINE)
             if added_destinations:
@@ -543,12 +595,14 @@ class AgentCertificate:
                     "present in the certified session (--allow-egress-violations): "
                     + "; ".join(recorded[:3]))
             if "destinations" not in self.egress and graph.seen_domains:
+                coverage = COVERAGE_NOT_RECORDED
                 warnings.append(
                     "Certificate records no observed destinations (issued with "
                     "--omit-observed-destinations): only its rejected patterns and forbidden "
                     f"regions were checked against the {len(graph.seen_domains)} destination(s) "
                     "of this session, not whether each one was certified")
         elif graph.seen_domains:
+            coverage = COVERAGE_NO_SECTION
             warnings.append("Certificate records no egress section (issued before v0.8.0): the "
                             f"{len(graph.seen_domains)} destination(s) of this session are not checked")
 
@@ -562,6 +616,7 @@ class AgentCertificate:
             added_agent_types=added_types, removed_agent_types=removed_types,
             kind_changes=kind_changed, warnings=warnings,
             added_destinations=added_destinations, forbidden_destinations=forbidden_destinations,
+            egress_coverage=coverage,
         )
 
     def _egress_drift(self, graph: AgentGraph, resolver: RegionResolver) -> tuple[list[str], list[dict]]:
@@ -729,6 +784,22 @@ class DriftReport:
     #: ones in a region its policy forbade ({"host", "country", "source", "detail"}).
     added_destinations: list[str] = field(default_factory=list)
     forbidden_destinations: list[dict] = field(default_factory=list)
+    #: What could be decided about egress coverage. One of
+    #: :data:`EGRESS_COVERAGE_STATES` — see :attr:`egress_verifiable`.
+    egress_coverage: str = COVERAGE_CHECKED
+
+    @property
+    def egress_verifiable(self) -> bool:
+        """Could this verification decide whether every destination was certified?
+
+        False when the certificate carries no observed list and the session
+        reached somewhere: the signature is good and the topology matches, and
+        **nobody can say** whether those destinations were the certified ones.
+        A pass is the wrong answer to that, and so is a failure — the
+        certificate is not invalid, the question is unanswerable — which is why
+        ``verify`` exits 3 rather than 0 or 1 unless the operator accepts it.
+        """
+        return self.egress_coverage in (COVERAGE_CHECKED, COVERAGE_NOTHING_REACHED)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -746,6 +817,8 @@ class DriftReport:
         if self.added_destinations or self.forbidden_destinations:
             lines.append(f"  Destinations: {len(self.added_destinations)} not covered, "
                          f"{len(self.forbidden_destinations)} in a forbidden region")
+        if not self.egress_verifiable:
+            lines.append(f"  Egress coverage: NOT VERIFIABLE ({self.egress_coverage})")
         lines += [f"  - {r}" for r in self.reasons]
         lines += [f"  ! {w}" for w in self.warnings]
         return "\n".join(lines)

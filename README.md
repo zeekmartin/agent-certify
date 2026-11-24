@@ -155,7 +155,7 @@ agent-certify learn logs/crew-runs/                          # a folder of crew 
 # Structural baseline and drift detection
 agent-certify keygen ~/keys/signing.key                      # mode 600; keep it outside the repository
 agent-certify certify <path> --key ~/keys/signing.key -o system.cert.json   # valid 90 days (--validity-days)
-agent-certify verify system.cert.json <path> --public-key signing.key.pub   # exit 1 on drift
+agent-certify verify system.cert.json <path> --public-key signing.key.pub   # 0 ok, 1 drift, 3 egress not verifiable
 #   --public-key is required: it is the issuer's key, obtained out of band
 #   --expect-system-id ID   --ignore-expiry   --allow-unsigned (skips the signature check; warns)
 
@@ -860,6 +860,19 @@ Country Lite* export, published under CC BY 4.0 — from a path you give. Ranges
 are looked up with a binary search, so a three-million-row file costs
 microseconds and no dependency.
 
+**Attribution.** CC BY 4.0 asks for credit wherever the data is used, and a
+report that places a destination in a country is a use of it. So whenever
+`--geoip-db` was read, `scan`, `watch` and `verify` print one line on stderr:
+
+```
+agent-certify: IP geolocation by DB-IP.com, CC BY 4.0
+```
+
+It goes to stderr so that it never lands inside a JSON report or an HTML file —
+which means that **if you pass a report on, the attribution has to go with
+it**. If you use a different database, credit that one instead; the line names
+DB-IP because that is the format `--geoip-db` documents.
+
 **`--resolve-dns` is the one thing in this tool that makes a network
 connection.** It is off by default, available on `scan`, `learn` and `watch`
 only, requires `--geoip-db`, and announces itself before the first lookup:
@@ -999,6 +1012,42 @@ issued before this still verifies** — `verify` says which format it read and
 that its destinations were not checked. And the section is signed, so an
 operator cannot quietly widen what a certificate allowed.
 
+### What verify exits with, and why there are three answers
+
+| exit | meaning |
+|---|---|
+| **0** | valid: signature, validity window, topology **and egress coverage** all checked and in order |
+| **1** | invalid: something was checked and did not match |
+| **2** | the command line was wrong (missing argument, unreadable key) |
+| **3** | signature and topology valid, **egress coverage not verifiable** |
+
+Exit 3 exists because "pass" and "fail" are both wrong answers to one
+situation: the certificate carries **no list of observed destinations** — it was
+issued with `--omit-observed-destinations`, or predates `cert_format` 3 — and
+the session reached somewhere. The signature is good and the topology matches,
+so the certificate is not invalid; and nobody can say whether those
+destinations were the certified ones, so it is not a pass either.
+
+```
+$ agent-certify verify shared.cert.json session.jsonl --public-key issuer.pub
+Verification: PASS
+  ...
+  Egress coverage: NOT VERIFIABLE (not_recorded)
+agent-certify: exit 3: signature and topology are valid, egress coverage is NOT
+verifiable: this certificate carries no list of observed destinations and the
+session reached 2. Re-issue the certificate without
+--omit-observed-destinations, or pass --accept-unverified-egress to accept the
+narrower check as valid.
+```
+
+`--accept-unverified-egress` turns that case into 0 and keeps the warning on
+stderr. In CI, treat 3 as its own signal: it means "re-issue this certificate",
+not "this system drifted".
+
+A certificate with **no validity window at all** (`cert_format` 1, issued
+before v0.5) now **fails**: with no expiry and no revocation list, it is a
+credential nothing can retire. `--allow-no-expiry` accepts one with a warning.
+
 ### certify refuses to sign a system that already breaks its rules
 
 A certificate says a system was in a known good state. Signing one for a
@@ -1092,6 +1141,37 @@ to overwrite an existing file or follow a symlink. `certify` warns when the key
 is readable by other users. On Windows the file inherits the folder's ACL, so
 keep keys in a folder only you can read. Never commit a key; `*.key` is in
 `.gitignore`.
+
+## What a report says about you
+
+A report names more than the structure it measured, and two of those names came
+from the machine it ran on:
+
+- **the project name** — derived from the session folder, which is derived from
+  a path: `C--Users-jdoe-work-bigbank` is a path, so it can carry a user name,
+  a customer name or a project nobody has announced. It appears in the text
+  report, in `--format json`, in the OTel span attribute
+  `agent_certify.project` and in the header of an HTML report.
+- **the session id** — one session, one agent, one machine, in the same four
+  places and in every certificate.
+
+```bash
+agent-certify scan session.jsonl --hash-project     # project becomes sha256:3f2a1c0d9e8b
+agent-certify watch <project> --hash-project        # same, on every cycle
+```
+
+`--hash-project` replaces the name with `sha256:` and the first twelve hex
+characters of its SHA-256, in **every** output. The digest is stable, so
+sessions of one project still group together across reports and across runs.
+
+It is **pseudonymisation, not anonymisation**, and the difference matters: a
+twelve-character digest of a short name is confirmable by anyone who can guess
+the name. It keeps a client's name out of a report that gets forwarded; it does
+not protect that name from someone holding a list of candidates. The session id
+is deliberately *not* hashed — it is what makes a report traceable back to the
+session it describes, which is the point of a report.
+
+`SECURITY.md` §5 lists everything written to disk and what it carries.
 
 ## Policy
 

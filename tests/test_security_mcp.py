@@ -158,8 +158,12 @@ def test_request_timeout(session_dir, monkeypatch):
     monkeypatch.setitem(server._handlers, "scan_topology", slow)
     start = time.monotonic()
     reply, _ = call(server, "scan_topology")
-    assert error_text(reply) == "Request timed out after 0.2 s"
+    # The message now says what the timeout does *not* do: the work goes on,
+    # and it still counts against the server's in-flight limit (MCP-001).
+    assert error_text(reply).startswith("Request timed out after 0.2 s")
+    assert "still counts against" in error_text(reply)
     assert time.monotonic() - start < 1.5
+    assert server.inflight() == 1 and server._abandoned == 1
     assert server.handle({"jsonrpc": "2.0", "id": 2, "method": "ping"})["result"] == {}
 
 

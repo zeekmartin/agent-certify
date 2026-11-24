@@ -267,12 +267,23 @@ def test_certify_can_keep_the_rules_and_drop_the_observed_destinations(tmp_path,
     assert "destinations" not in cert["egress"]
     assert cert["egress"]["forbidden_regions"] == ["RU"]
 
-    # And it still verifies: the signature covers the section as written.
-    assert main(["verify", str(out_path), session, "--allow-unsigned", "--format", "json"]) == 0
-    report = json.loads(capsys.readouterr().out)
+    # The signature still covers the section as written — and the answer is no
+    # longer "valid": with no observed list and a session that reached
+    # somewhere, coverage cannot be decided, so verify exits 3 (CRY-001).
+    assert main(["verify", str(out_path), session, "--allow-unsigned", "--format", "json"]) == 3
+    printed = capsys.readouterr()
+    report = json.loads(printed.out)
     assert report["is_valid"] and report["added_destinations"] == []
+    assert report["egress_coverage"] == "not_recorded"
     assert any("no observed destinations" in w for w in report["warnings"])
     assert any("--omit-observed-destinations" in w for w in report["warnings"])
+    assert "NOT verifiable" in printed.err and "--accept-unverified-egress" in printed.err
+
+    # Accepting the narrower check is a decision the operator can make, once,
+    # out loud: exit 0 with the warning still on stderr.
+    assert main(["verify", str(out_path), session, "--allow-unsigned", "--format", "json",
+                 "--accept-unverified-egress"]) == 0
+    assert "--accept-unverified-egress" in capsys.readouterr().err
 
 
 def test_without_an_observed_list_verify_still_enforces_rejections_and_regions(tmp_path, capsys, no_dns):
