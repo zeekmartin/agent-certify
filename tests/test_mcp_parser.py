@@ -139,7 +139,8 @@ def test_cli_learn_include_mcp_makes_mcp_tools_known(cache, session_dir, monkeyp
     monkeypatch.setattr(mcp_logs, "default_roots", lambda: [cache])
     session = str(session_dir / "sess-1.jsonl")
     assert main(["learn", session]) == 0                      # transcript-only baseline
-    assert main(["scan", session, "--include-mcp"]) == 2               # critical: unseen tool
+    assert main(["scan", session, "--include-mcp",
+                 "--min-baseline-sessions", "1"]) == 2                 # critical: unseen tool
     assert "New tool never seen: mcp__ide__getDiagnostics" in capsys.readouterr().out
 
     assert main(["learn", session, "--include-mcp"]) == 0     # same data sources on both sides

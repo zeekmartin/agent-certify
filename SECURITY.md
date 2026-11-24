@@ -100,14 +100,41 @@ but only when that call's own arguments already carried a destination — so a
 file read or a search result full of URLs is not treated as egress. The walk is
 bounded (8 levels deep, 2,000 strings, 64 KB per string, 200 hosts per call).
 
+**What is not read at all** (since v0.8.1). Two categories of value are
+skipped before anything else happens, because reading them produced findings
+about traffic that never existed:
+
+- **file and document content.** The value of a field that carries content —
+  `content`, `contents`, `new_string`, `old_string`, `file_text`, `new_source`,
+  `text`, `body`, `edits`, `patch`, `diff`, `replacement`; the full set is
+  `CONTENT_KEYS` in `agent_certify/domains.py` — is not walked, whatever the
+  tool. A session that *writes* `curl evil.example.net` into a test file, a
+  README or a code example has contacted nobody. This is the same distinction
+  already made for a tool's result, applied to the arguments of a tool that
+  writes; the `Bash` call that later runs what was written is read exactly as
+  before, since `command` is not a content key.
+- **anything that is not shaped like a host.** The host of a URL now passes the
+  same shape test as a bare value: at least one dot and a letters-only suffix,
+  or an address literal (v4 or bracketed v6), or `localhost`. Trailing prose
+  and markdown punctuation is stripped first. `https://a`, `http://api/x` and a
+  URL at the end of a markdown span used to be recorded as the destinations
+  `a`, `api` and `` x.example.com` ``.
+
+Measured over eleven held-out real sessions (baselines of two to four sessions, so a worst case), before and after, back to back on the same files: **109 anomalies before, 72 after; 94 critical before, 58 after**. Of the 104 hosts read before, 43 stopped being read, and **not one of them had been contacted** — traced key by key: 16 were not shaped like a host, 19 appeared only in a file-writing argument, 8 were a fragment of a quoted argument. Every genuine destination survived, the outbound-volume spike included. The benchmark injects a clean `Write` call whose contents name a
+host (`written_url`) so the content claim stays measured.
+
 **The command line of a shell tool call is read too** (since the
 `shell_domain` blind spot was closed; it is a *new category of input data*, so
 it is named here under the review rule below). The value of a field that
 carries a command — `command`, `cmd`, `script` and their variants, the full set
 is `SHELL_KEYS` — is parsed as a command line: split into segments on `|`,
-`||`, `&&`, `;`, `&` and newlines, tokenised with `shlex`, wrappers (`sudo`,
+`||`, `&&`, `;` and `&` **outside quotes** (a line break always separates, and
+quoting is judged per line), tokenised with `shlex`, wrappers (`sudo`,
 `env VAR=x`, `time`, `nohup`, `command`, `exec`) and leading `VAR=value`
-assignments dropped. **Only host names are taken out of it, and only from the
+assignments dropped. A separator inside a quoted argument does not start a
+command, so `git commit -m "fix; curl api.example.net"` reads as the one
+command it is; a line whose quoting does not balance falls back to splitting on
+every separator. **Only host names are taken out of it, and only from the
 arguments of a known network client** (`curl`, `wget`, `ssh`, `scp`, `nc`,
 `git clone` … the full set is `NETWORK_COMMANDS`): nothing is read from the
 arguments of any other program, and nothing of the command line itself — not

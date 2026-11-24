@@ -168,8 +168,11 @@ def warning_only(session_dir):
 def test_fail_on_critical_default(session_dir, warning_only):
     other = session_dir / "other.jsonl"
     other.write_text(json.dumps(_assistant([("x", "deploy", {})])) + "\n")
-    assert main(["scan", str(other)]) == 2                              # critical: new tool
-    assert main(["scan", str(other), "--fail-on", "never"]) == 0
+    # A one-session baseline makes an unknown tool a warning, so the critical
+    # exit needs either a thicker baseline or the knob that says to trust it.
+    assert main(["scan", str(other), "--min-baseline-sessions", "1"]) == 2   # critical: new tool
+    assert main(["scan", str(other)]) == 0                                   # warning: thin baseline
+    assert main(["scan", str(other), "--fail-on", "never", "--min-baseline-sessions", "1"]) == 0
     assert main(["scan", warning_only]) == 0                            # warning only
     assert main(["scan", warning_only, "--fail-on", "warning"]) == 2
     assert main(["scan", warning_only, "--fail-on", "never"]) == 0

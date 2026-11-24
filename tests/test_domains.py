@@ -51,7 +51,7 @@ def baseline():
     ({"host": "db.internal.corp"}, {"db.internal.corp"}),
     ({"endpoint": {"host": "1.2.3.4", "port": 5432}}, {"1.2.3.4"}),
     ({"urls": ["https://a.example/x", "http://user:pw@B.example:8080/y"]}, {"a.example", "b.example"}),
-    ({"body": {"deep": {"nested": {"text": "see http://deep.example/z"}}}}, {"deep.example"}),
+    ({"payload": {"deep": {"nested": {"uri": "see http://deep.example/z"}}}}, {"deep.example"}),
     ({"base_url": "https://eu.example.com", "model": "x"}, {"eu.example.com"}),
 ])
 def test_domains_are_extracted(payload, expected):
@@ -60,6 +60,12 @@ def test_domains_are_extracted(payload, expected):
 
 @pytest.mark.parametrize("payload", [
     {"pattern": "alibaba.com", "path": "notes.md"},          # a bare domain in a non-network field
+    # File content: written, not contacted. See CONTENT_KEYS.
+    {"file_path": "t.py", "content": "curl evil.example.net/x and https://also.example.net/"},
+    {"file_path": "R.md", "old_string": "https://old.example.net/", "new_string": "https://new.example.net/"},
+    {"file_path": "a.py", "edits": [{"old_string": "https://a.example.net/"}]},
+    {"text": "see https://mentioned.example.net/"},
+    {"body": "https://inside.example.net/"},
     {"text": "contact us at example.com for details"},
     {"file_path": "notes.md"},
     {"address": "report.pdf"},                                # a filename in a network-named field
@@ -141,6 +147,43 @@ def test_a_bare_host_is_truncated_like_a_url_search():
     assert extract_domains({"host": "a" * (4 * MAX_STRING_CHARS)}) == set()
 
 
+def test_content_is_written_not_contacted():
+    """A session that writes a URL into a file has reached nobody.
+
+    The largest source of false positives measured on real logs: of 56
+    new_domain alerts over eleven held-out sessions, 35 came from two sessions
+    that were writing this module's own tests. The command that *runs* what was
+    written is read exactly as before, which is the line that matters.
+    """
+    written = {"file_path": "fixture.py", "content": "curl evil.example.net/x"}
+    assert extract_call_domains(written) == set()
+    assert extract_call_domains({"command": "python fixture.py && curl evil.example.net/x"}) == {
+        "evil.example.net"}
+    # A content key does not shadow a destination elsewhere in the same call.
+    assert extract_call_domains({"url": "https://api.example.com/v1",
+                                 "body": "https://inside.example.net/"}) == {"api.example.com"}
+
+
+def test_a_url_host_has_to_look_like_a_host():
+    """The second source: the shape test applied to bare values, not to URLs.
+
+    ``https://a``, ``http://api/x`` and a URL at the end of a markdown span
+    were destinations named ``a``, ``api`` and ``x.example.com```. A real host,
+    an address literal and localhost are not touched.
+    """
+    for text in ("http://a/", "http://api/x", "http://r", "https://h%d.example.net/",
+                 "http://[0-9]/", "https://-.-/"):
+        assert extract_call_domains({"uri": text}) == set(), text
+    assert extract_call_domains({"uri": "see `https://x.example.com`"}) == {"x.example.com"}
+    assert extract_call_domains({"uri": "https://x.example.com``"}) == {"x.example.com"}
+    assert extract_call_domains({"uri": "see https://api.example.com., then (https://p.example.com)"}) == {
+        "api.example.com", "p.example.com"}
+    assert extract_call_domains({"uri": "http://localhost:8080"}) == {"localhost"}
+    assert extract_call_domains({"uri": "http://[::1]/"}) == {"[::1]"}
+    assert extract_call_domains({"uri": "http://[::1]:8080/x"}) == {"[::1]"}
+    assert extract_call_domains({"uri": "https://1.2.3.4/x"}) == {"1.2.3.4"}
+
+
 def test_a_host_in_a_shell_command_is_read():
     """Was a measured blind spot; closed by domains_in_command (tests/test_shell_egress.py).
 
@@ -186,10 +229,42 @@ def test_merged_destinations_are_reported_with_their_caller(baseline):
     assert "no caller recorded" not in hits[0].detail
 
 
+@pytest.mark.parametrize("host,kept", [
+    ("api.openai.com", "api.openai.com"),
+    ("x.example", "x.example"),
+    ("1.2.3.4", "1.2.3.4"),
+    ("[::1]", "[::1]"),
+    ("[2001:db8::1]", "[2001:db8::1]"),
+    ("localhost", "localhost"),
+    # and the seven shapes a URL search used to hand over as destinations
+    ("a", None), ("api", None), ("r", None), ("h%d.example.net", None),
+    ("x``", None), ("a.example``", None), ("[0-9]", None),
+    ("", None), (None, None), ("-.-", None),
+])
+def test_host_shape(host, kept):
+    """One notion of "shaped like a host", used by the URL search and bare values alike."""
+    from agent_certify.domains import host_shape
+
+    assert host_shape(host) == kept
+
+
+def test_the_shape_test_does_not_narrow_the_patterns_an_operator_writes():
+    """normalise_pattern runs on the same primitives: "*.cn" has no dot to give."""
+    assert normalise_pattern("*.cn") == "*.cn"
+    assert normalise_pattern(".cn") == "*.cn"
+    assert domain_matches("api.unknown.cn", "*.cn") is True
+    assert normalise_pattern("https://api.openai.com/v1") == "api.openai.com"
+
+
 def test_host_normalisation():
     assert normalise_host("User:pw@API.OpenAI.com:443.") == "api.openai.com"
     assert normalise_host("[::1]:8080") == "[::1]"
     assert normalise_host("") is None and normalise_host(None) is None
+    # Trailing prose and markdown, which a hostname never carries.
+    assert normalise_host("api.openai.com`") == "api.openai.com"
+    assert normalise_host("api.openai.com),") == "api.openai.com"
+    assert normalise_host("`api.openai.com`") == "api.openai.com"
+    assert normalise_host("```") is None
 
 
 def test_extraction_from_a_real_transcript(tmp_path):

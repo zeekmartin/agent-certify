@@ -17,7 +17,14 @@ applies to each session, runs the anomaly checks over the result and counts:
   injected like any other fault and its expected outcome is silence; the day a
   check starts reporting one, the table says so instead
   (:data:`~agent_certify.benchmark.injector.BLIND_SPOTS` lists the ones this
-  release ships with).
+  release ships with);
+* **false-positive cases** — sessions that are *clean* and must produce
+  nothing, injected for the same reason a fault is: so the claim is measured.
+  A blind spot and a false-positive case both expect silence, for opposite
+  reasons — one because a check is missing, the other because the rule is
+  right — so they are scored apart, and a report here is named a false
+  positive rather than a surprise detection
+  (:data:`~agent_certify.benchmark.injector.FALSE_POSITIVE_CASES`).
 
 **The baseline must not have been learned from the sessions being tested.** A
 baseline learned from exactly the sessions it is then run against reports
@@ -31,7 +38,11 @@ from dataclasses import dataclass, field
 
 from agent_certify.anomaly import CRITICAL, INFO, WARNING, AnomalyDetector, AnomalyReport
 from agent_certify.baseline import Baseline, BaselineLearner
-from agent_certify.benchmark.injector import ANOMALY_TYPES, AnomalyInjector, Injection
+from agent_certify.benchmark.injector import (
+    ANOMALY_TYPES,
+    AnomalyInjector,
+    Injection,
+)
 from agent_certify.graph import AgentGraph
 from agent_certify.scanner import AgentFIScanner
 
@@ -59,10 +70,16 @@ class TypeResult:
     missed: list[str] = field(default_factory=list)            # session ids where it was not reported
     extra_anomalies: int = 0                                   # other anomalies reported alongside
     note: str = ""
+    false_positive: bool = False                               # a clean session that must stay quiet
 
     @property
     def is_blind_spot(self) -> bool:
-        return self.expected_category is None
+        return self.expected_category is None and not self.false_positive
+
+    @property
+    def quiet(self) -> int:
+        """Trials of a false-positive case that reported nothing, as they must."""
+        return self.trials - self.detected
 
     @property
     def detection_rate(self) -> float:
@@ -70,6 +87,8 @@ class TypeResult:
 
     @property
     def expected(self) -> str:
+        if self.false_positive:
+            return "(must stay silent)"
         if self.is_blind_spot:
             return "(blind spot)"
         return f"{self.expected_category}/{(self.min_severity or '')[:4]}"
@@ -78,6 +97,7 @@ class TypeResult:
         return {"kind": self.kind, "expected_category": self.expected_category,
                 "min_severity": self.min_severity, "trials": self.trials, "detected": self.detected,
                 "detection_rate": self.detection_rate, "blind_spot": self.is_blind_spot,
+                "false_positive_case": self.false_positive,
                 "severities": dict(sorted(self.severities.items())), "missed": self.missed,
                 "extra_anomalies": self.extra_anomalies, "note": self.note}
 
@@ -93,12 +113,22 @@ class BenchmarkResult:
 
     @property
     def covered(self) -> list[TypeResult]:
-        """Types a check is supposed to catch (blind spots excluded)."""
-        return [t for t in self.per_type if not t.is_blind_spot]
+        """Types a check is supposed to catch (blind spots and clean sessions excluded)."""
+        return [t for t in self.per_type if not t.is_blind_spot and not t.false_positive]
 
     @property
     def blind_spots(self) -> list[str]:
         return [t.kind for t in self.per_type if t.is_blind_spot]
+
+    @property
+    def false_positive_cases(self) -> list[TypeResult]:
+        """Clean sessions injected to measure that nothing is reported about them."""
+        return [t for t in self.per_type if t.false_positive]
+
+    @property
+    def injected_false_positives(self) -> int:
+        """Reports about a session that should have produced none: outright false positives."""
+        return sum(t.detected for t in self.false_positive_cases)
 
     @property
     def trials(self) -> int:
@@ -127,6 +157,8 @@ class BenchmarkResult:
                 "trials": self.trials, "detected": self.detected,
                 "detection_rate": self.detection_rate, "false_negative_rate": self.false_negative_rate,
                 "false_positive_rate": self.false_positive_rate, "blind_spots": self.blind_spots,
+                "false_positive_cases": [t.kind for t in self.false_positive_cases],
+                "injected_false_positives": self.injected_false_positives,
                 "per_type": [t.to_dict() for t in self.per_type]}
 
     def table(self) -> str:
@@ -138,7 +170,10 @@ class BenchmarkResult:
                  f"{'anomaly type':<22}{'expected':<32}{'trials':>7}{'detected':>10}{'rate':>9}  severity",
                  "-" * width]
         for t in self.per_type:
-            if t.is_blind_spot:
+            if t.false_positive:
+                severity = (f"silent, as it must be ({t.quiet}/{t.trials})" if not t.detected
+                            else f"REPORTED on {t.detected}/{t.trials}: a false positive")
+            elif t.is_blind_spot:
                 severity = "not covered by any check" if not t.detected else "reported anyway"
             else:
                 severity = ", ".join(f"{n} {s}" for s, n in sorted(t.severities.items(), key=lambda kv: SEVERITY_ORDER[kv[0]]))
@@ -152,6 +187,13 @@ class BenchmarkResult:
                   f"({self.clean_flagged}/{self.clean_sessions} clean, "
                   f"{self.clean_anomalies} anomal{plural})")
         lines += ["-" * width, totals]
+        if self.false_positive_cases:
+            trials = sum(t.trials for t in self.false_positive_cases)
+            wrong = self.injected_false_positives
+            lines.append(f"false-positive cases: {', '.join(t.kind for t in self.false_positive_cases)}"
+                         + (f" — {trials - wrong}/{trials} stayed silent, as a clean session must"
+                            if not wrong else
+                            f" — {wrong}/{trials} REPORTED: a clean session was flagged"))
         if self.blind_spots:
             lines.append("blind spots: " + ", ".join(self.blind_spots)
                          + " — injected and expected to go unreported, no check covers the fault")
@@ -199,7 +241,9 @@ class BenchmarkRunner:
             for injection in self.injector.injections(session, self.baseline):
                 self._score(results.setdefault(injection.kind, _result_for(injection)), injection)
         order = {kind: i for i, kind in enumerate(ANOMALY_TYPES)}
-        per_type = sorted(results.values(), key=lambda t: (t.is_blind_spot, order.get(t.kind, len(order)), t.kind))
+        per_type = sorted(results.values(), key=lambda t: (t.is_blind_spot or t.false_positive,
+                                                           t.false_positive,
+                                                           order.get(t.kind, len(order)), t.kind))
         return BenchmarkResult(per_type=per_type, clean_sessions=len(self.sessions), clean_flagged=clean_flagged,
                                clean_anomalies=clean_anomalies, learned_from=self.baseline.learned_from)
 
@@ -214,8 +258,11 @@ class BenchmarkRunner:
         hit = next((a for a in report.anomalies
                     if a.category == injection.expected_category
                     and SEVERITY_ORDER[a.severity] <= SEVERITY_ORDER[injection.min_severity or a.severity]), None)
-        if injection.is_blind_spot:
-            result.detected += bool(report.anomalies)       # anything reported at all is a surprise
+        if injection.is_blind_spot or injection.false_positive:
+            # Silence is the expected outcome either way. ``detected`` counts
+            # the reports: a surprise for a blind spot, a false positive for a
+            # clean session.
+            result.detected += bool(report.anomalies)
             result.extra_anomalies += len(report.anomalies)
             for a in report.anomalies:
                 result.severities[a.severity] = result.severities.get(a.severity, 0) + 1
@@ -230,7 +277,8 @@ class BenchmarkRunner:
 
 def _result_for(injection: Injection) -> TypeResult:
     return TypeResult(kind=injection.kind, expected_category=injection.expected_category,
-                      min_severity=injection.min_severity, note=injection.note)
+                      min_severity=injection.min_severity, note=injection.note,
+                      false_positive=injection.false_positive)
 
 
 def learn_holdout(sessions: list[AgentGraph], stride: int = 2) -> tuple[list[AgentGraph], list[AgentGraph], Baseline]:

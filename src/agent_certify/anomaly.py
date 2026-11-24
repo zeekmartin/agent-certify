@@ -8,8 +8,10 @@ Each check compares one aspect of a session with the :class:`Baseline`:
 ==============  =========================================  ======================
 check           flags                                      severity
 ==============  =========================================  ======================
-new_tool        a tool never seen in the baseline, or one   critical
-                the operator rejected
+new_tool        a tool never seen in the baseline, or one   critical; warning for
+                the operator rejected                      an unknown tool on a
+                                                           baseline of under
+                                                           MIN_BASELINE_SESSIONS
 new_link        an invocation path never seen (by role)    warning
 fi_deviation    FI more than 2 sigma from the mean         warning; critical past
                                                            3 sigma when FI *rose*
@@ -79,6 +81,12 @@ is now counted on the call and on the graph and reported as
 destination, since then something left the machine and the picture of where is
 known to be incomplete.
 
+**A thin baseline** is reported as such rather than trusted. Under
+:data:`MIN_BASELINE_SESSIONS` sessions, an unknown tool is a warning and the
+message says how many sessions the baseline rests on: with two, a tool as
+ordinary as ``Read`` is "never seen", and a check that calls that critical is
+one an operator learns to skip. A rejected tool is critical regardless.
+
 Three baseline overrides change what ``new_tool`` and ``new_link`` consider
 normal, and they are decisions rather than statistics, so they win over what was
 learned: ``accepted_tools`` silences a tool, ``rejected_tools`` makes one fire
@@ -137,6 +145,17 @@ VOLUME_RATIO_WARNING = 2.0
 #: the floor off**, leaving the relative thresholds alone.
 CALL_MIN_DELTA_CALLS = 10
 EGRESS_MIN_DELTA_BYTES = 10 * 1024
+
+#: **How many sessions a baseline needs before "never seen" means much.** Below
+#: this, an unknown tool is reported at *warning* rather than critical: two
+#: sessions that happened not to use ``Read`` make ``Read`` a critical finding,
+#: which is noise, and on real logs it was six of six ``new_tool`` alerts. The
+#: tool is still reported — a thin baseline is a reason to look twice, not to
+#: stay silent — and the message says how thin it was, so the reader can weigh
+#: it. A **rejected** tool is critical whatever the baseline: that is an
+#: operator's decision, not a statistic. Overridable per detector and from the
+#: command line (``--min-baseline-sessions``).
+MIN_BASELINE_SESSIONS = 5
 
 
 @dataclass
@@ -216,16 +235,25 @@ class AnomalyDetector:
 
     def __init__(self, baseline: Baseline, source: str = "",
                  min_call_delta: int = CALL_MIN_DELTA_CALLS,
-                 min_egress_delta: int = EGRESS_MIN_DELTA_BYTES):
+                 min_egress_delta: int = EGRESS_MIN_DELTA_BYTES,
+                 min_baseline_sessions: int = MIN_BASELINE_SESSIONS):
         """``min_call_delta`` and ``min_egress_delta`` are the absolute floors
         the two volume checks apply on top of their sigma thresholds; see
         :data:`CALL_MIN_DELTA_CALLS` and :data:`EGRESS_MIN_DELTA_BYTES`. Zero
-        turns a floor off.
+        turns a floor off. ``min_baseline_sessions`` is how many sessions a
+        baseline needs before an unknown tool is reported as critical rather
+        than a warning; see :data:`MIN_BASELINE_SESSIONS`.
         """
         self.baseline = baseline
         self.source = source
         self.min_call_delta = max(0, int(min_call_delta))
         self.min_egress_delta = max(0, int(min_egress_delta))
+        self.min_baseline_sessions = max(0, int(min_baseline_sessions))
+
+    @property
+    def thin_baseline(self) -> bool:
+        """True when the baseline rests on too few sessions for "never seen" to mean much."""
+        return self.baseline.learned_from < self.min_baseline_sessions
 
     def detect(self, graph: AgentGraph, scan_result: ScanResult) -> AnomalyReport:
         """Run all anomaly checks."""
@@ -269,8 +297,16 @@ class AnomalyDetector:
         return (present - b.known_tools - b.accepted_tools) | (present & b.rejected_tools)
 
     def _check_new_tools(self, graph: AgentGraph) -> list[Anomaly]:
-        """Flag any tool the baseline does not vouch for. Severity: critical."""
+        """Flag any tool the baseline does not vouch for.
+
+        Critical, with one exception: on a baseline of fewer than
+        :data:`MIN_BASELINE_SESSIONS` sessions an *unknown* tool is a warning,
+        because "never seen" says as much about the baseline as about the
+        session. A **rejected** tool stays critical however thin the baseline
+        is — it is a decision, and no number of sessions revises it.
+        """
         out = []
+        sessions = self.baseline.learned_from
         for name in sorted(self._new_tool_names(graph)):
             nid = next(i for i, n in graph.nodes.items() if n.kind == "tool" and n.name == name)
             rejected = name in self.baseline.rejected_tools
@@ -279,16 +315,23 @@ class AnomalyDetector:
                 continue        # every caller is covered by an accepted link
             callers = sorted({e.source for e in graph.edges if e.target == nid})
             detail = f"{graph.nodes[nid].call_count} call(s) by {', '.join(callers) or '-'}"
+            severity = CRITICAL
             if rejected:
                 message = f"Rejected tool used: {name}"
                 reference = "explicitly rejected by the operator"
                 detail += " — rejected, so it stays an anomaly across re-learns"
             else:
                 message = f"New tool never seen: {name}"
-                reference = f"not in {len(self.baseline.known_tools)} known tools"
+                reference = (f"not in {len(self.baseline.known_tools)} known tools, "
+                             f"learned from {sessions} session(s)")
+                if self.thin_baseline:
+                    severity = WARNING
+                    detail += (f" — warning rather than critical: a baseline of {sessions} "
+                               f"session(s) is under the {self.min_baseline_sessions} this needs "
+                               "to call an unknown tool critical")
                 if self.baseline.accepted_links:
                     detail += f" — not covered by an accepted link: {', '.join(uncovered)}"
-            out.append(Anomaly(CRITICAL, "new_tool", message, name, reference, None, detail))
+            out.append(Anomaly(severity, "new_tool", message, name, reference, None, detail))
         return out
 
     def _check_new_links(self, graph: AgentGraph) -> list[Anomaly]:

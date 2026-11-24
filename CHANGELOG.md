@@ -6,7 +6,74 @@ project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **A URL's host has to look like a host.** The shape test (one dot and a
+  letters-only suffix, or an address literal, or `localhost`) applied to bare
+  values only, so anything after `scheme://` became a destination:
+  `https://a`, `http://api/x`, `http://r`, `https://h%d.example.net/` and a URL
+  at the end of a markdown span were reported as the hosts `a`, `api`, `r`,
+  `h%d.example.net` and `` x.example.com` ``. Trailing prose and markdown
+  punctuation is stripped first, bracketed IPv6 literals are now matched by the
+  URL pattern at all (`http://[::1]/`), and `localhost` counts
+- **Writing a URL is not calling it.** Nothing is read from the value of a
+  field that carries file or document content — `content`, `new_string`,
+  `old_string`, `file_text`, `new_source`, `text`, `body`, `edits`, `patch`,
+  `diff`, `replacement` (`CONTENT_KEYS` in `agent_certify/domains.py`) — under
+  any tool. A `Write` whose contents mention `curl evil.example.net` reaches
+  nobody; the `Bash` call that runs the file afterwards is read as before,
+  since `command` is not a content key. `NETWORK_KEYS` and `SHELL_KEYS` keep
+  their behaviour exactly
+- **A separator inside quotes is not a command.** A command line is split on
+  `|`, `||`, `&&`, `;` and `&` only *outside* single and double quotes, `\"`
+  honoured inside double ones, so `git commit -m "fix; curl api.example.net"`,
+  `echo "a; wget b.example.net"` and
+  `python -c "import os; print('curl x.example.net')"` reach nobody. They were
+  read as two commands, the second of which looked like a `curl` invocation —
+  a *mention* of a command taken for one, and 27 of the 43 hosts this release
+  stopped reading were that or a filename. A wrapper's quoted command keeps its
+  meaning through the depth-1 recursion (`bash -c "cd /tmp; curl x.example.net"`
+  still reaches `x.example.net`). **A line break always separates** and quoting
+  is judged one line at a time, so a stray quote cannot move the segment
+  boundaries of the lines around it — doing it globally found *more* spurious
+  hosts than the plain split, measured — and **a line whose quoting does not
+  balance falls back to the old split**, verbatim, because a malformed command
+  line is the shape an exfiltration attempt would take. A no-separator fast
+  path keeps the common case below the cost of the plain split
+- **A thin baseline is reported as thin.** On a baseline of fewer than
+  `MIN_BASELINE_SESSIONS` (5, overridable per detector and with
+  `--min-baseline-sessions`), an *unknown* tool is a warning rather than a
+  critical, and the message says what it rests on — `not in 6 known tools,
+  learned from 2 sessions`. Two sessions that happened not to use `Read` do not
+  make `Read` a critical finding. A **rejected** tool stays critical whatever
+  the baseline: that is a decision, not a statistic
+- Measured over eleven held-out real sessions (baselines of two to four
+  sessions, so a worst case), before and after back to back on the same files:
+  **109 anomalies before, 72 after; 94 critical before, 58 after** —
+  `new_domain` 83 → 53, `egress_volume_spike` 8 → 1, `new_tool` 6 critical → 6
+  warning. Of the 104 hosts read before, 43 stopped being read and **not one
+  had been contacted**: traced key by key, 16 were not shaped like a host, 19
+  appeared only in a file-writing argument, and 8 were a fragment of a quoted
+  argument. Every true alert survived, the outbound-volume spike included. Two
+  hosts are now read that were not before: a bracketed IPv6 literal, which the
+  URL pattern did not match at all, and one whose trailing punctuation is now
+  stripped
+
 ### Added
+- `agent-certify learn` warns when it learns from fewer than
+  `MIN_BASELINE_SESSIONS` sessions, and says what will be noisy: an unknown
+  tool, and the two volume checks comparing against a deviation that is near
+  zero or as wide as its own mean
+- `agent_certify.domains.host_shape()`, the one notion of "shaped like a host",
+  used by both the URL search and the bare-value rule
+- `AnomalyDetector.min_baseline_sessions` and `.thin_baseline`;
+  `SessionWatcher(min_baseline_sessions=...)`; `scan`/`watch
+  --min-baseline-sessions`
+- `AnomalyInjector.inject_written_url()` and the `written_url` benchmark row: a
+  **false-positive case** rather than a fault — a clean `Write` whose contents
+  name a host, measured to produce nothing. Blind spots and false-positive
+  cases both expect silence for opposite reasons, so the table and
+  `BenchmarkResult` score them apart (`FALSE_POSITIVE_CASES`,
+  `injected_false_positives`, `TypeResult.false_positive`)
 - **Outbound volume per destination** (`egress_volume_spike`): a baseline now
   learns how many *bytes* each destination receives — mean, deviation, maximum
   and the number of sessions behind them (`domain_egress_volume`) — and a
