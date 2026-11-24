@@ -13,8 +13,22 @@ a fix timeline within 7 days.
 ## Threat model
 
 agent-certify reads local log files, writes reports and certificates, and
-optionally runs as an MCP server. It makes no network connections. The
-surfaces that matter:
+optionally runs as an MCP server.
+
+**It makes no network connections, with one exception an operator has to ask
+for by name.** `agent-certify scan`, `learn` and `watch` accept
+`--resolve-dns`, which resolves destination *names* to addresses so their
+country can be looked up in a local database. It is off by default, it requires
+`--geoip-db`, it prints what it is about to do and which resolver it will use
+before the first lookup, each name is resolved at most once with a bounded
+timeout, and the total number of lookups is capped. Nothing else in the tool
+opens a socket: not `certify`, not `verify`, not the MCP server, not any part
+of destination or region analysis without that flag. **The MCP server has no
+such option at all** — it reads local files and answers region questions from
+host names alone (§1, §6). The flag is on the command line, where a person
+types it and sees the warning, and nowhere an agent can reach.
+
+The surfaces that matter:
 
 ### 1. The MCP server (`agent-certify mcp`)
 
@@ -37,6 +51,13 @@ roots: tool names (including MCP server and tool names), sub-agent types and
 descriptions, call and error counts, project folder names, session ids,
 **network destinations** — the host names a session's tool calls pointed at —
 and the **sizes** of what those calls sent, per destination (see §6).
+
+The server never resolves a name and never opens a socket. A
+`forbidden_region` policy rule is answered from the host's country-code domain
+alone — no address database, no DNS — and a destination whose country cannot be
+told that way is reported as unknown or ignored, as the rule says. The
+`--resolve-dns` option of the command line does not exist here and cannot be
+reached through a tool argument.
 
 Prompt text is never extracted. Tool inputs and tool outputs are **read but
 not returned**: they are walked for host names only — including, for a shell
@@ -63,6 +84,31 @@ nothing else.
   a secrets manager; whoever holds the key can issue certificates that verify.
 - There is no revocation list yet: to retire a key, stop trusting its public
   key and re-issue certificates with a new one.
+- **Certificates record egress** (`cert_format` 3, since v0.8.1). A signed
+  `egress` section holds the destination patterns the operator had accepted and
+  rejected, the forbidden regions in force, and **the destinations the
+  certified session actually reached**. `verify` uses it to report a
+  destination the certificate does not cover and one in a forbidden region.
+  Two consequences:
+  - a certificate now contains host names from a real session, so it is no
+    longer only structural metadata. Review it before publishing it (§6), the
+    same way you would a baseline. **A certificate shared with a third party —
+    a customer, an auditor, a supplier — discloses those host names, and
+    internal ones can describe infrastructure that the topology never
+    revealed.** `certify --omit-observed-destinations` keeps the accepted and
+    rejected patterns and the forbidden regions and leaves the observed list
+    out entirely; the omission is part of the signed bytes, so it cannot be
+    added back or removed afterwards. `verify` then checks the rejected
+    patterns and the forbidden regions only, and says in its report that it
+    could do no more.
+  - formats 1 and 2 keep their original signed bytes — the section is left out
+    of the payload for them — so every certificate issued before this still
+    verifies, and `verify` says which format it read and that its destinations
+    were not checked. `graph_hash` is unchanged: a certificate's identity is
+    still its topology.
+- Regions in `verify` are decided offline: a country-code domain, or an address
+  literal looked up in a local database given with `--geoip-db`. `verify` never
+  resolves a name.
 
 ### 3. Baselines and policies
 
@@ -201,13 +247,34 @@ point — a size is not a sample. The hosts and their numbers live on the graph
 (`seen_domains`, `egress_bytes`, `egress_calls`) and on the calling node, so a
 report can say which tool reached which host and with how much.
 
+**Where a destination is** (since v0.8.1). A destination's country is decided
+from its country-code top-level domain (`api.example.cn` is `CN`, `bbc.co.uk`
+is `GB`), or — for an address literal — from a local CSV database the operator
+supplies with `--geoip-db`. No database ships with the package and none is
+downloaded. Both paths are offline. A `.com` hosted in Shanghai is **unknown**
+unless `--resolve-dns` is given, and the answer always says which of the three
+it came from, because they are not equally strong: a ccTLD is a registration
+rather than a location, and an address database says where a block is
+registered, which for a CDN is a cache and not the origin. A region is
+evidence, not a finding about data residency, and `forbidden_region` is a
+tripwire rather than a proof. No country is forbidden by default: the list is
+the organisation's, `suggest-policy` never drafts the rule, and the codes in
+this document and the README are examples.
+
 **What is stored on disk.** `agent-certify learn` writes every host it saw into
 `known_domains` in `.agent-certify/baseline.json`, alongside the `*.cn`-style
 patterns an operator accepted or rejected, and — since v0.8.0 — the mean,
 deviation, maximum and session count of the **bytes** each of those hosts
 received (`domain_egress_volume`). That file is a list of host names the
 sessions contacted and four numbers for each; treat it like the rest of §5 and
-review it before publishing it. Certificates do **not** carry destinations: `graph_hash()` covers
+review it before publishing it. **Certificates carry destinations too** since
+`cert_format` 3 (§2): the `egress` section records the host names the certified
+session reached, so a certificate is something to review before publishing, not
+only to sign. For one that will be shared outside the organisation, issue it
+with `certify --omit-observed-destinations`: the rules are signed, the host
+names are not written at all, and `verify` reports the narrower check it then
+performs. The safest order is to decide who will hold the certificate *before*
+issuing it, since re-issuing means re-signing. Certificates do **not** carry destinations: `graph_hash()` covers
 node roles, kinds and links only, which is also why certificates issued before
 v0.7.0 still verify.
 
@@ -232,9 +299,18 @@ padding, hid the next one for free. Padding is no longer a bound at all — a
 string is read whole, to the 10 MB limit — and the hosts-per-call bound remains
 but is now published.
 
+**What region analysis adds, and what it costs.** Reading a ccTLD is string
+handling on data already extracted. A `--geoip-db` lookup reads a local file
+the operator chose. `--resolve-dns` is the only new *outbound* behaviour in the
+tool's history: it sends the host names a session reached to a DNS resolver,
+which means the resolver's operator learns them. That is the trade, it is
+printed before the first lookup, and it is why the option is explicit, absent
+from the MCP server, and off by default.
+
 **Review rule.** Any feature that reads a new category of input data — a new
 field, a new part of a record, anything beyond the structural metadata listed
-in §1 — requires a review and an update of this document in the same change.
+in §1 — **or that makes a network connection** — requires a review and an
+update of this document in the same change.
 Network destinations shipped in v0.7.0 without one, and this section is the
 correction. Two features have gone through it since, each documented in the
 change that added it: reading the command line of shell tool calls, and

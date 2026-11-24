@@ -169,6 +169,31 @@ def test_check_anomalies(server, session_dir):
     assert hit["severity"] == "warning" and "learned from 1 session(s)" in hit["baseline_value"]
 
 
+def test_check_policy_reports_regions_and_never_resolves(server, session_dir, monkeypatch):
+    """The server answers region rules from host names alone, and makes no network call."""
+    from agent_certify.policy import Policy, PolicyRule
+
+    def no_dns(*args, **kwargs):
+        raise AssertionError("the MCP server resolved a name")
+
+    monkeypatch.setattr("socket.getaddrinfo", no_dns)
+    other = session_dir / "regions.jsonl"
+    other.write_text(json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [
+        {"type": "tool_use", "id": "r1", "name": "WebFetch",
+         "input": {"url": "https://collector.example.ru/v1"}},
+        {"type": "tool_use", "id": "r2", "name": "WebFetch",
+         "input": {"url": "https://ok.example.com/v1"}}]}}) + "\n", encoding="utf-8")
+    Policy([PolicyRule("forbidden_region", "RU", "critical", "data stays in the EU")]).save()
+    data, err = call(server, "check_policy", session_path=str(other))
+    assert not err and data["violation_count"] == 1
+    hit = data["violations"][0]
+    assert hit["rule_kind"] == "forbidden_region" and hit["country"] == "RU"
+    assert "collector.example.ru" in hit["message"] and "ccTLD" in hit["message"]
+    assert {r["host"]: r["country"] for r in data["destination_regions"]} == {
+        "collector.example.ru": "RU"}
+    assert "never resolves a name" in data["region_source"]
+
+
 def test_check_policy(server, tmp_path):
     msg, err = call(server, "check_policy")
     assert err and "suggest-policy" in msg

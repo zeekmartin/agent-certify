@@ -68,7 +68,8 @@ def test_pre_v03_certificate_still_verifies_and_compares_by_id(tmp_path):
     # signed over exactly the fields it had.
     g = _session({"abc": "Explore"})
     data = AgentCertificate.create(g).to_dict()
-    for newer in ("identity", "cert_format", "not_before", "not_after", "skipped_records"):   # not in v0.2 files
+    for newer in ("identity", "cert_format", "not_before", "not_after", "skipped_records",
+                  "egress"):                                                  # not in v0.2 files
         data.pop(newer)
     topo = _topology(g, "id")
     data.update(nodes=dict(topo["nodes"]), edges=[list(e) for e in topo["edges"]],

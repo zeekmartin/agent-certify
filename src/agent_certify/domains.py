@@ -60,7 +60,8 @@ about.
 Limits
 ------
 
-Logs are untrusted input, so a walk is bounded: :data:`MAX_SCAN_DEPTH` levels,
+Logs are untrusted input, so a walk is bounded: :data:`MAX_SHELL_SEGMENTS`
+commands per command line, :data:`MAX_SCAN_DEPTH` levels,
 :data:`MAX_SCAN_STRINGS` strings (a command line's arguments count against the
 same budget, one each), :data:`MAX_STRING_CHARS` characters of any one string
 and :data:`MAX_DOMAINS` hosts per call. A deeply nested or enormous argument
@@ -110,6 +111,7 @@ MAX_STRING_CHARS = 10 * 1024 * 1024  # characters examined of any one string (th
 MAX_DOMAINS = 200                    # hosts kept per call
 MAX_HOST_CHARS = 512                 # characters of a bare-host value: a hostname is at most 253
 MAX_SHLEX_CHARS = 64 * 1024          # characters of a command line parsed with full shell quoting
+MAX_SHELL_SEGMENTS = 10_000          # commands read out of one command line
 
 #: Why a scan stopped short of the whole argument object. Each one is counted
 #: on the call and on the graph, and reported as a ``destination_scan_truncated``
@@ -119,7 +121,9 @@ TRUNCATED_DOMAINS = "domains"        # MAX_DOMAINS hosts already found
 TRUNCATED_STRINGS = "strings"        # MAX_SCAN_STRINGS strings already examined
 TRUNCATED_STRING = "string"          # one string longer than MAX_STRING_CHARS
 TRUNCATED_DEPTH = "depth"            # nested deeper than MAX_SCAN_DEPTH
-TRUNCATION_REASONS = (TRUNCATED_DOMAINS, TRUNCATED_STRINGS, TRUNCATED_STRING, TRUNCATED_DEPTH)
+TRUNCATED_SEGMENTS = "segments"      # more commands on one line than MAX_SHELL_SEGMENTS
+TRUNCATION_REASONS = (TRUNCATED_DOMAINS, TRUNCATED_STRINGS, TRUNCATED_STRING, TRUNCATED_DEPTH,
+                      TRUNCATED_SEGMENTS)
 
 #: A scheme, then either a bracketed IPv6 literal or a run of characters that a
 #: hostname may hold. The backtick is excluded with the quotes: a host never
@@ -724,20 +728,33 @@ def _split_segments(command: str) -> list[str]:
     shape an exfiltration attempt would take, so the conservative reading (more
     segments, more destinations) is the one to keep. An apostrophe in prose
     lands here too, and that is the right side to err on.
+
+    **Bounded.** At most :data:`MAX_SHELL_SEGMENTS` commands come back, plus the
+    unread remainder as a last element — the shape :meth:`re.Pattern.split`
+    gives for ``maxsplit``, and what tells the caller to report a truncated
+    scan. The bound is on the *split*, not on the list afterwards: ``a;``
+    repeated to 10 MB with one unbalanced quote used to cost nine seconds, most
+    of it spent building five million segments to then throw away.
     """
     if not _HAS_SEPARATOR.search(command):
         return [command]                         # one command, whatever its quoting
     out: list[str] = []
-    for line in _LINES.split(command):
-        out += _split_line(line)
+    for line in _LINES.split(command, maxsplit=MAX_SHELL_SEGMENTS):
+        out += _split_line(line, MAX_SHELL_SEGMENTS + 1 - len(out))
+        if len(out) > MAX_SHELL_SEGMENTS:
+            break
     return out
 
 
-def _split_line(line: str) -> list[str]:
-    """One line cut on its separators, ignoring those inside quotes."""
+def _split_line(line: str, limit: int) -> list[str]:
+    """One line cut on its separators, ignoring those inside quotes.
+
+    At most ``limit`` pieces, the last of which is whatever was not read.
+    """
+    limit = max(1, limit)
     quotes = line.count("'") + line.count('"')
     if not quotes:
-        return _SEGMENTS.split(line)             # nothing to protect: the plain split
+        return _SEGMENTS.split(line, maxsplit=limit - 1)   # nothing to protect: the plain split
     segments, start, inside = [], 0, 0
     for m in _QUOTED_OR_SEPARATOR.finditer(line):
         text = m.group()
@@ -745,13 +762,15 @@ def _split_line(line: str) -> list[str]:
             # A quoted span, consumed whole: the separators in it are not ones.
             inside += text.count("'") + text.count('"')
             continue
+        if len(segments) >= limit - 1:
+            break                                # the rest is appended unread, as maxsplit does
         segments.append(line[start:m.start()])
         start = m.end()
     if inside != quotes:
         # A quote character the span pattern could not pair: the quoting of this
         # line does not balance, so its structure cannot be trusted. Counting is
         # how that is detected without slicing once per match.
-        return _SEGMENTS.split(line)
+        return _SEGMENTS.split(line, maxsplit=limit - 1)
     segments.append(line[start:])
     return segments
 
@@ -769,7 +788,15 @@ def _scan_command(command: str, scan: _Scan, depth: int) -> None:
     :func:`_destinations_in_arg` strips them); it only mis-splits an argument
     that contains a space, which is not a host.
     """
-    for segment in _split_segments(command):
+    segments = _split_segments(command)
+    if len(segments) > MAX_SHELL_SEGMENTS:
+        # A command line of a million commands is not a command line. The
+        # string budget does not bound this on its own: a segment with no
+        # arguments costs nothing against it, so `a;` repeated to 10 MB used to
+        # cost nine seconds of lexing — past the thirty an MCP call is allowed.
+        scan.note(TRUNCATED_SEGMENTS)
+        segments = segments[:MAX_SHELL_SEGMENTS]
+    for segment in segments:
         if scan.spent:
             scan.note(TRUNCATED_DOMAINS if len(scan.found) >= MAX_DOMAINS else TRUNCATED_STRINGS)
             return
