@@ -6,6 +6,75 @@ project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-24
+
+### Highlights
+
+- **Destinations are read from shell command lines** — `curl`, `wget`, `scp`,
+  `ssh`, `nc`, 23 clients in all, including object storage (`aws s3 cp`), DNS
+  queries (`dig`), numeric address spellings (`http://2130706433/`) and
+  internationalised names (`collector.xn--p1ai`).
+- **Outbound volume per destination**, learned in the baseline and compared
+  (`egress_volume_spike`), with an absolute floor under both volume checks.
+- **No scan limit drops a host in silence**: reaching one is reported
+  (`destination_scan_truncated`), critical when that call did name a
+  destination.
+- **Region policy, decided offline** (`forbidden_region`): country-code
+  domains, internationalised ccTLDs included, or an address literal in a local
+  DB-IP-format database. No name is resolved unless `--resolve-dns` says so,
+  and never from the MCP server.
+- **Certificates carry a signed `egress` section** (`cert_format` 3) — the
+  patterns accepted and rejected, the forbidden regions, the destinations
+  observed. Formats 1 and 2 keep their signed bytes and still verify.
+- **An independent audit of this release is closed**, every finding listed by
+  identifier below, including five classes of egress false negative that
+  produced no destination, no truncation and no warning.
+- **Benchmark**: detection 100.0% (108/108) among covered types; 85.7%
+  (108/126) of all injected faults, blind spots included; 0 false positives
+  (0/6 clean sessions).
+
+### Upgrading from 0.7
+
+Behaviour that changed by default. Everything here is a decision a script or a
+CI gate can see.
+
+- **`verify` exits 3, not 0, when egress coverage cannot be verified.** This
+  includes **every certificate issued before 0.8** checked against a session
+  that reached a destination: such a certificate has no `egress` section, so
+  whether those destinations were certified is unanswerable. Re-issue the
+  certificate with 0.8, or pass `--accept-unverified-egress` to accept the
+  narrower check as valid (exit 0, warning on stderr). Exits 0, 1 and 2 keep
+  their meaning.
+- **A certificate with no validity window fails** (`cert_format` 1, issued
+  before v0.5), unless `--allow-no-expiry`, which warns.
+- **`certify` refuses to sign a system that already breaks its own egress
+  rules** — a destination matching a rejected pattern, or one in a forbidden
+  region — and exits 1 writing nothing. `--allow-egress-violations` signs
+  anyway, records the violations in the signed section, and such a certificate
+  then fails verification.
+- **`certify` writes `cert_format` 3**, which a 0.7.x `verify` rejects. 0.8
+  reads all three formats; an older verifier does not read this one. Upgrade
+  the verifying side first.
+- **`new_tool` is a warning, not critical, on a baseline of fewer than 5
+  sessions** (`--min-baseline-sessions`, `0` restores the old behaviour). A
+  *rejected* tool stays critical whatever the baseline.
+- **Shell command lines are now read, so new destinations appear**: a host
+  behind `curl` reaches the baseline and fires `new_domain` (critical) where
+  0.7 saw nothing. Two anomaly categories are new and can reach `--fail-on`:
+  `egress_volume_spike` and `destination_scan_truncated`.
+- **The two volume checks are quieter**: a rise is reported only when it passes
+  the baseline's maximum by at least `--min-call-delta` (10 calls) or
+  `--min-egress-delta` (10 KiB); `0` turns a floor off. Reading a bare string
+  as a destination is stricter too (host shape, and nothing from a value a
+  `Write` call puts in a file). On eleven held-out real sessions the two
+  together moved 109 anomalies to 72, and 94 criticals to 58, with every true
+  alert surviving.
+- **`watch` honours `--geoip-db` and `--resolve-dns`**, which it previously
+  accepted and ignored.
+- **Dependency floors**: `numpy>=1.26.4` (was 1.24.0) and
+  `cryptography>=46.0.0` (was 41.0.0), both installed exactly and tested by the
+  `lowest` CI job under Python 3.10. `requires-python` is unchanged at `>=3.10`.
+
 ### Audit 2026-11-24
 
 A static audit of v0.8.0-to-be, read against this file, `README.md` and
@@ -28,7 +97,7 @@ and an undeclared gap is worse than a declared one.
 
 | id | finding |
 |---|---|
-| INT-001 | `__version__` said 0.7.0 while the tree wrote `cert_format` 3, which no 0.7.0 can read. Now `0.8.0.dev0`, with `MIN_VERSION_FOR_FORMAT` tying each format to the oldest version allowed to write it, and a test that fails if a format is added without its version |
+| INT-001 | `__version__` said 0.7.0 while the tree wrote `cert_format` 3, which no 0.7.0 can read. Now `0.8.0` (`0.8.0.dev0` until this release commit), with `MIN_VERSION_FOR_FORMAT` tying each format to the oldest version allowed to write it, and a test that fails if a format is added without its version |
 | CRY-001 | `verify` exited 0 for a certificate that could not be checked against the session's destinations. It now exits **3** — "signature and topology valid, egress coverage not verifiable" — and `--accept-unverified-egress` returns that case to 0 explicitly |
 | CRY-003 | a certificate with no validity window (format 1) verified as valid. With no expiry and no revocation, that is a credential nothing can retire: it now fails unless `--allow-no-expiry` is given |
 | CRY-002 | the absence of revocation was a half-sentence. `SECURITY.md` §2 now states it as a property of the trust model, with the procedure that exists today (destroy the key, re-issue, shorten `--validity-days` for a certificate that leaves the organisation). The revocation file goes to v0.9 |
@@ -124,8 +193,11 @@ each release, since they are set low on purpose and go stale by design.
 - **A certificate with no validity window fails** (`cert_format` 1, issued
   before v0.5): no expiry plus no revocation is a credential nothing can
   retire. `--allow-no-expiry` accepts one with a warning
-- **`__version__` is `0.8.0.dev0`**, and `MIN_VERSION_FOR_FORMAT` ties each
-  certificate format to the oldest version allowed to write it
+- **`__version__` is `0.8.0`**, and `MIN_VERSION_FOR_FORMAT` ties each
+  certificate format to the oldest version allowed to write it (`cert_format`
+  3 requires 0.8.0). It was `0.8.0.dev0` from the audit fix until this release
+  commit, because a tree that writes a format no release reads must not claim
+  a released version
 - **The dependency floors are tested, and deliberately low**:
   `numpy>=1.26.4` (the oldest release the suite passes on under Python 3.10)
   and `cryptography>=46.0.0` (the oldest series with the Ed25519 API and wheels
@@ -797,7 +869,11 @@ Fixes for the security audit of 2026-10-27 (45 findings). Items marked
 - HTML visualization with interactive graph
 - CLI: scan, blast, keygen, certify, verify
 
-[Unreleased]: https://github.com/zeekmartin/agent-certify/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/zeekmartin/agent-certify/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/zeekmartin/agent-certify/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/zeekmartin/agent-certify/compare/v0.6.1...v0.7.0
+[0.6.1]: https://github.com/zeekmartin/agent-certify/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/zeekmartin/agent-certify/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/zeekmartin/agent-certify/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/zeekmartin/agent-certify/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/zeekmartin/agent-certify/compare/v0.3.0...v0.4.0

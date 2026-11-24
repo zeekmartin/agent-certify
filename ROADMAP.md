@@ -126,42 +126,51 @@ Fixes the actionable findings of the 2026-10-27 security audit (45 findings: 3 h
   one blind spot still measured (`shell_domain`: a host named inside a shell command argument)
 - Fixes the 2026-11-03 audit (33 findings: 3 high, 7 medium, the rest low or info)
 
-## Planned
-
-### v0.8.0 — Egress
+### v0.8.0 — Egress (Nov 2026)
 
 Where an agent's data goes, and how much of it. agent-certify itself still makes no network
-connection: everything below is read from the logs and decided offline.
+connection: everything here is read from the logs and decided offline.
 
-- **Done** (unreleased): the `shell_domain` blind spot is closed — hosts named inside shell
-  commands (`curl`, `wget`, `scp`, `ssh`, `nc` …) are destinations, including inside the command a
-  shell wrapper or an `ssh` runs (INV-001). Two blind spots take its place in the benchmark, both
-  measured: `shell_var_domain` (a host built in a shell variable) and `ssh_tunnel_domain` (a host
-  at the far end of an `ssh -L` forwarding) — reading either would mean evaluating the shell
-  rather than parsing it
-- **Done** (unreleased): exfiltration — outbound volume per destination, learned in the baseline
-  and compared like call volume (`egress_volume_spike`), with the scan limits no longer dropping a
-  destination in silence (`destination_scan_truncated`). A fourth blind spot is measured in their
-  place: `file_upload_exfil`, a file whose size the log does not contain
-- **Done** (unreleased): region policy — `forbidden_region`, decided offline from the host name or
-  an optional local IP-geolocation database; no DNS lookup unless `--resolve-dns` says so, and
-  never from the MCP server. Certificates carry a signed `egress` section, and `certify` refuses to
-  sign a system that already breaks its own egress rules
-- **Done** (unreleased): five classes of egress false negative the 2026-11-24 audit found, each of
-  which produced no destination, no truncation and no warning at all — internationalised names
-  (EGR-001), schemes and clients beyond the web, including object storage, resolvers and database
-  clients (EGR-002), numeric address spellings (EGR-003), and commands substituted into an
-  assignment (EGR-005). The filename-label list is pinned to the day it was last checked against
-  the DNS root (EGR-004), and the benchmark reports the covered-only detection rate and the rate
-  over everything injected together, never one alone (INT-002)
-- Benchmark: new fault types for forbidden regions (shell egress, exfiltration and the five egress
-  false negatives: done)
+- Shell command egress: hosts named inside a shell command (`curl`, `wget`, `scp`, `ssh`, `nc` …)
+  are destinations, including inside the command a shell wrapper or an `ssh` runs (INV-001) — the
+  `shell_domain` blind spot v0.7.0 shipped and measured. Two blind spots take its place, both
+  measured: `shell_var_domain` and `ssh_tunnel_domain`; reading either would mean evaluating the
+  shell rather than parsing it
+- Exfiltration: outbound volume per destination, learned in the baseline and compared like call
+  volume (`egress_volume_spike`), with an absolute floor under both volume checks, and no scan
+  limit dropping a destination in silence (`destination_scan_truncated`). A fourth blind spot is
+  measured in its place: `file_upload_exfil`, a file whose size the log does not contain
+- Region policy: `forbidden_region`, decided offline from the host name — the 249 assigned ccTLDs,
+  7 exceptions and 61 internationalised ccTLDs — or from an optional local IP-geolocation
+  database; no DNS lookup unless `--resolve-dns` says so, and never from the MCP server
+- Certificates carry a signed `egress` section (`cert_format` 3), and `certify` refuses to sign a
+  system that already breaks its own egress rules. Formats 1 and 2 keep their signed bytes
+- Five classes of egress false negative the 2026-11-24 audit found, each of which produced no
+  destination, no truncation and no warning at all: internationalised names (EGR-001), schemes and
+  clients beyond the web, object storage, resolvers and database clients included (EGR-002),
+  numeric address spellings (EGR-003) and commands substituted into an assignment (EGR-005). The
+  filename-label list is pinned to the day it was last checked against the DNS root (EGR-004)
+- The rest of the 2026-11-24 audit: a version that matches the format it writes (INT-001), a third
+  `verify` exit code for egress coverage nobody can check (CRY-001), a certificate with no
+  validity window refused (CRY-003), revocation named as a property of the trust model (CRY-002),
+  an in-flight cap on the MCP server (MCP-001), `--hash-project` and the data a report carries
+  named in the documents (PRV-001), a CI matrix of 3.10 – 3.14 with classifiers to match
+  (CFG-001/002), tested dependency floors with a `lowest` CI job (SCA-002), Beta status (DOC-001)
+  and GeoIP attribution (LIC-001)
+- Benchmark at 22 fault types: detection 100.0% (108/108) among covered types; 85.7% (108/126) of
+  all injected faults, the three blind spots in the denominator; 0 false positives. Both rates are
+  reported together, never one alone (INT-002)
 - `SECURITY.md` updated in the same change for every new category of input read
+
+## Planned
 
 ### v0.9.0 — Provenance
 
 - Benchmark against published traces of multi-step tool attacks, run before provenance ships so the
   number has a "before"
+- **AgentDojo parser and benchmark**: AgentDojo's published attack traces as an input, and its
+  suites run against the detectors, so the detection rate rests on traces this project did not
+  write as well as on its own injections
 - Provenance: link untrusted content (a fetched page, an e-mail, a document) to the actions it
   triggers — the prompt injection path
 - **Revocation (CRY-002)**: a signed list of certificate ids an issuer no longer stands behind,
@@ -178,6 +187,23 @@ connection: everything below is read from the logs and decided offline.
   `numpy` and `cryptography` in `pyproject.toml` together with the `lowest` job that pins them.
   The floors are deliberately low enough to install on a frozen corporate image, which means they
   go stale by design unless someone moves them on purpose
+- **Region determination, the deferred half of the region findings (REG-001, REG-002)**: a ccTLD
+  is a registration and not a location, so a `.com` served from anywhere is `unknown` unless an
+  address database places it, and the strength of a determination (`cctld`, `cctld_idn`, `geoip`,
+  `dns+geoip`) is reported but never scored; and the region tables are dated snapshots
+  (`NOT_HOSTS_CHECKED`, `IDN_CCTLD_CHECKED`, both 2026-11-24) that go stale unless something
+  re-checks them against the IANA root zone. Both are declared limits today rather than fixed ones
+- **Destination fingerprints in the certificate**: a certificate that has to leave the
+  organisation can carry a salted hash of each observed destination instead of the host name, so
+  `verify` keeps checking coverage — today the choice is the names or nothing
+  (`--omit-observed-destinations`, which is what makes `verify` exit 3)
+- **Cooperative cancellation in the MCP server**: the long analyses check a cancellation flag at
+  their natural boundaries, so a timed-out or `notifications/cancelled` request stops instead of
+  being abandoned to run to the end. v0.8.0 caps the damage (`MAX_INFLIGHT`) rather than fixing it:
+  Python cannot kill a thread
+- **Call volume normalised by session length**: 40 `Read` calls in a ten-minute session and in a
+  six-hour one are not the same observation, and the baseline currently compares the raw count,
+  which makes a long session look anomalous and a short one look quiet
 
 ### v0.10.0 — Standard telemetry input
 
