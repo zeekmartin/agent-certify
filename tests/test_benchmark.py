@@ -167,7 +167,7 @@ def test_injections_cover_every_anomaly_type(injector, session, split):
     injections = injector.injections(session, baseline)
     kinds = [i.kind for i in injections]
     assert sorted(kinds) == sorted(ANOMALY_TYPES)
-    assert len(ANOMALY_TYPES) == 15
+    assert len(ANOMALY_TYPES) == 16
     blind = sorted(i.kind for i in injections if i.is_blind_spot)
     assert blind == sorted(BLIND_SPOTS) == ["file_upload_exfil", "shell_var_domain", "ssh_tunnel_domain"]
     assert [i.expected_category for i in injections if i.is_blind_spot] == [None, None, None]
@@ -379,6 +379,76 @@ def test_a_reported_false_positive_case_is_named_as_one(split, injector):
     data = result.to_dict()
     assert data["false_positive_cases"] == ["written_url"] and data["injected_false_positives"] == 0
     assert next(t for t in data["per_type"] if t["kind"] == "written_url")["false_positive_case"]
+
+
+def test_the_region_injection_is_scored_against_the_policy(injector, session, split):
+    """The one fault the policy owns rather than the baseline.
+
+    A destination in a forbidden country is not unusual, it is not allowed; no
+    amount of history makes it normal, and nothing in a baseline would ever
+    report it. The runner has to check policies for the suite to measure that.
+    """
+    _, _, baseline = split
+    g = injector.inject_forbidden_region(session)
+    assert injector.region_domain in g.seen_domains
+    assert sorted(g.nodes) == sorted(session.nodes)              # nothing structural
+    injection = next(i for i in injector.injections(session, baseline) if i.kind == "forbidden_region")
+    assert injection.expected_rule == "forbidden_region" and injection.min_severity == CRITICAL
+    assert injection.expected_category is None and not injection.is_blind_spot
+    assert injection.policy is not None and injection.policy.rules[0].regions == ["RU"]
+
+    violations = BenchmarkRunner([session], baseline).check_policy(g, injection.policy)
+    assert [v.rule.kind for v in violations] == ["forbidden_region"]
+    assert "RU" in violations[0].message and injector.region_domain in violations[0].message
+    assert "ccTLD" in violations[0].message                      # how it was decided
+
+    # And the clean session it was injected into violates nothing.
+    assert BenchmarkRunner([session], baseline).check_policy(session, injection.policy) == []
+
+
+def test_the_runner_scores_a_policy_fault_like_any_other(split, injector):
+    _, test, baseline = split
+    result = BenchmarkRunner(test, baseline).run()
+    row = next(t for t in result.per_type if t.kind == "forbidden_region")
+    assert row.expected_rule == "forbidden_region" and row.expected == "policy forbidden_region/crit"
+    assert row.detected == row.trials == len(test) and row.missed == []
+    assert row.severities == {CRITICAL: len(test)}
+    assert row in result.covered and not row.is_blind_spot and not row.false_positive
+    assert [t.kind for t in result.policy_cases] == ["forbidden_region"]
+    assert result.to_dict()["policy_cases"] == ["forbidden_region"]
+    assert next(t for t in result.to_dict()["per_type"]
+                if t["kind"] == "forbidden_region")["expected_rule"] == "forbidden_region"
+    assert "policy forbidden_region/crit" in result.table()
+
+
+def test_a_policy_fault_counts_as_missed_when_the_rule_is_not_there(split, injector, session):
+    """The row must be able to fail: with no region rule, nothing is violated."""
+    from agent_certify.benchmark.runner import TypeResult
+    from agent_certify.policy import Policy
+
+    _, test, baseline = split
+    runner = BenchmarkRunner(test, baseline)
+    injection = next(i for i in injector.injections(session, baseline) if i.kind == "forbidden_region")
+    toothless = Policy(rules=[])
+    assert runner.check_policy(injection.graph, toothless) == []
+    assert runner.check_policy(injection.graph, None) == []
+    row = TypeResult(kind="forbidden_region", expected_category=None, min_severity=CRITICAL,
+                     expected_rule="forbidden_region")
+    runner._score(row, replace_policy(injection, toothless))
+    assert row.detected == 0 and row.missed == [injection.graph.session_id]
+
+
+def replace_policy(injection, policy):
+    import dataclasses
+
+    return dataclasses.replace(injection, policy=policy)
+
+
+def test_forbid_region_builds_the_rule_the_benchmark_needs(injector):
+    policy = injector.forbid_region("RU,CN")
+    assert [r.kind for r in policy.rules] == ["forbidden_region"]
+    assert policy.rules[0].regions == ["CN", "RU"] and policy.rules[0].severity == CRITICAL
+    assert injector.forbid_region("RU", severity=WARNING).rules[0].severity == WARNING
 
 
 def test_accept_domain_leaves_the_original_baseline_alone(injector, split):

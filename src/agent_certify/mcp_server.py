@@ -66,6 +66,7 @@ from agent_certify.parser.auto import AutoParser
 from agent_certify.parser.mcp_logs import project_key
 from agent_certify.paths import PathNotAllowed, confine
 from agent_certify.policy import DEFAULT_POLICY_PATH, Policy
+from agent_certify.regions import OFFLINE
 from agent_certify.scanner import HIGH, AgentFIScanner, Perspective, ScanResult
 from agent_certify.watcher import latest_session
 
@@ -115,7 +116,9 @@ TOOLS = [
     },
     {
         "name": "check_policy",
-        "description": "Check the current session against the policy rules. Returns any violations.",
+        "description": "Check the current session against the policy rules. Returns any violations, "
+                       "including destinations in a forbidden region (decided from the host name's "
+                       "country-code domain only: the server never resolves a name).",
         "inputSchema": {"type": "object", "properties": {
             "session_path": _SESSION,
             "policy_path": {"type": "string",
@@ -129,6 +132,18 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {"session_path": _SESSION}, "additionalProperties": False},
     },
 ]
+
+
+def _country_of(violation) -> str:
+    """The country code a ``forbidden_region`` violation named, or ``""``.
+
+    Read back from the message the policy wrote, so the server adds a field
+    without reaching for a resolver of its own.
+    """
+    for code in violation.rule.regions:
+        if f"region {code}:" in violation.message:
+            return code
+    return ""
 
 
 class ToolError(Exception):
@@ -571,16 +586,33 @@ class AgentCertifyMCPServer:
         }
 
     def _check_policy(self, session_path: str | None = None, policy_path: str | None = None) -> dict:
+        """Policy violations of one session, region rules included.
+
+        The resolver is :data:`~agent_certify.regions.OFFLINE` and nothing else:
+        a ``forbidden_region`` rule is answered from ccTLDs alone here, with no
+        address database and **no name resolution**. The server has no option to
+        change that — ``--resolve-dns`` exists on the command line, where a
+        person types it and sees the warning, and the server's whole contract is
+        that it reads local files and makes no network connection
+        (``SECURITY.md`` §1). A destination whose country cannot be told from
+        its name is reported as unknown, or ignored, exactly as the rule says.
+        """
         policy, source = self._policy(policy_path, required=True)
         graph, label, _ = self._load(session_path)
-        violations = policy.check(graph)
+        violations = policy.check(graph, OFFLINE)
+        regions = [{"host": host, "country": region.country, "source": region.source}
+                   for host, region in OFFLINE.regions(graph.seen_domains).items() if region.known]
         return {
             "session": label,
             "policy": source,
             "rule_count": len(policy.rules),
             "violation_count": len(violations),
             "violations": [{"rule_kind": v.rule.kind, "target": v.rule.target, "severity": v.severity,
-                            "message": v.message, "observed": v.observed} for v in violations],
+                            "message": v.message, "observed": v.observed,
+                            **({"country": _country_of(v)} if v.rule.kind == "forbidden_region" else {})}
+                           for v in violations],
+            "destination_regions": regions,
+            "region_source": "ccTLD only; the MCP server never resolves a name",
             "summary": ("No policy violations." if not violations else
                         f"{len(violations)} violation(s) of {len(policy.rules)} rule(s): "
                         + "; ".join(v.message for v in violations[:3])),

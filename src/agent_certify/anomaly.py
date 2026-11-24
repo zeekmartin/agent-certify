@@ -120,6 +120,7 @@ _TRUNCATION_TEXT = {
     "strings": "a call held more strings than are examined per call",
     "string": "a string was longer than the limit on one string",
     "depth": "an argument object nested deeper than the walk goes",
+    "segments": "a command line held more commands than are read from one",
 }
 _EPS = 1e-9
 

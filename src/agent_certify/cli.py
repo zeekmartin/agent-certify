@@ -67,6 +67,7 @@ from agent_certify.certificate import (
     AgentCertificate,
     _private_key_hex,
     _public_key_hex,
+    egress_violations,
     generate_keypair,
 )
 from agent_certify.domains import domain_matches, normalise_pattern
@@ -77,11 +78,15 @@ from agent_certify.parser import AutoParser, MCPLogsParser
 from agent_certify.parser.auto import is_trace_dir
 from agent_certify.paths import expand_cli
 from agent_certify.policy import DEFAULT_POLICY_PATH, Policy, PolicyGenerator, PolicyViolation
+from agent_certify.regions import OFFLINE, RegionResolver, load_geoip
 from agent_certify.scanner import AgentFIScanner, Perspective, ScanResult
 from agent_certify.watcher import SessionWatcher, latest_session
 
 DEFAULT_PATH = "~/.claude/projects"
 FAIL_EXIT = 2
+#: `certify` refusing to sign is a failed command, not a finding in a report:
+#: exit 1, the way `verify` reports drift.
+CERTIFY_REFUSED = 1
 
 
 def _path(p: str) -> Path:
@@ -405,6 +410,34 @@ def cmd_scan(args) -> int:
     return 0
 
 
+def _regions(args) -> RegionResolver:
+    """The region resolver a command builds from its arguments.
+
+    Offline by default, and offline still with ``--geoip-db`` alone: that reads
+    a local file to put a country on an address literal. Only ``--resolve-dns``
+    makes a network call, it requires the database (an address with nothing to
+    look it up in says nothing), and it announces itself on stderr before the
+    first lookup.
+    """
+    db_path = getattr(args, "geoip_db", None)
+    resolve = bool(getattr(args, "resolve_dns", False))
+    if not db_path and not resolve:
+        return OFFLINE
+    if resolve and not db_path:
+        raise SystemExit("agent-certify: --resolve-dns needs --geoip-db PATH: a resolved address names "
+                         "no country without a local database (DB-IP 'IP to Country Lite' CSV, CC BY 4.0)")
+    try:
+        database = load_geoip(db_path) if db_path else None
+    except ValueError as exc:
+        raise SystemExit(f"agent-certify: {exc}") from None
+    if database is not None and database.skipped:
+        _warn(f"{database.skipped} unusable row(s) in {Path(db_path).as_posix()} were skipped "
+              f"({database.ranges} address range(s) loaded)")
+    resolver = RegionResolver(geoip=database, resolve_dns=resolve)
+    resolver.warn_once()
+    return resolver
+
+
 def _detector(baseline: Baseline | None, source: str, args) -> AnomalyDetector | None:
     """The detector a command builds from its arguments, floors included."""
     if not baseline:
@@ -422,12 +455,15 @@ def _scan_report(args) -> list[dict]:
     baseline, source = _find_baseline(args)
     policy, policy_source = _find_policy(args)
     detector = _detector(baseline, source, args)
+    # One resolver, one cache, one warning — and built whether or not a policy
+    # uses it, so a wrong --geoip-db is an error the operator hears about.
+    regions = _regions(args)
     sessions = []
     for g in graphs:
         r = AgentFIScanner(g, perspective=args.perspective).scan()
         sessions.append({"graph": g, "result": r,
                          "anomalies": detector.detect(g, r) if detector else None,
-                         "violations": policy.check(g) if policy else None})
+                         "violations": policy.check(g, regions) if policy else None})
     single = len(graphs) == 1
     result = sessions[0]["result"] if single else AgentFIScanner(merged, perspective=args.perspective).scan()
     anomalies = sessions[0]["anomalies"] if single else None
@@ -513,7 +549,7 @@ def cmd_watch(args) -> int:
                 print(line, file=sys.stderr)
     SessionWatcher(str(session), baseline=baseline, policy=policy, interval=args.interval,
                    min_call_delta=args.min_call_delta, min_egress_delta=args.min_egress_delta,
-                   min_baseline_sessions=args.min_baseline_sessions,
+                   min_baseline_sessions=args.min_baseline_sessions, regions=_regions(args),
                    perspective=args.perspective, max_scans=args.scans, max_seconds=args.duration,
                    out=out, on_scan=on_scan).watch()
     return 0
@@ -802,18 +838,52 @@ def _read_private_key(path: str) -> str:
 
 def cmd_certify(args) -> int:
     _, g = load(args.path)
+    baseline, _ = _find_baseline(args)
+    policy, _ = _find_policy(args)
+    regions = _regions(args)
+    # A certificate says a system is in a known good state. Signing one for a
+    # session that was already breaking its own egress rules would say the
+    # opposite of the evidence, so it takes an explicit option.
+    violations = egress_violations(g, baseline, policy, regions)
+    if violations and not args.allow_egress_violations:
+        print(f"agent-certify: refusing to certify: {len(violations)} destination(s) of this "
+              "session break its own egress rules:", file=sys.stderr)
+        for line in violations:
+            print(f"  - {line}", file=sys.stderr)
+        print("Fix the system, or revise the decision that forbids them "
+              "(`baseline accept --domain`, or the policy rule). To sign anyway and record these "
+              "violations in the certificate, pass --allow-egress-violations.", file=sys.stderr)
+        return CERTIFY_REFUSED
     key = _read_private_key(args.key) if args.key else None
     if key is None:
         _warn("issuing an UNSIGNED certificate (no --key): it can only be checked with --allow-unsigned")
     if g.skipped_records:
         _warn(f"{g.skipped_records} record(s) could not be read; the certificate covers a possibly "
               "incomplete graph (recorded in the certificate as skipped_records)")
-    cert = AgentCertificate.create(g, system_id=args.system_id, signing_key=key, validity_days=args.validity_days)
+    if violations:
+        _warn(f"--allow-egress-violations: signing although {len(violations)} destination(s) of "
+              "this session break its own egress rules (" + "; ".join(violations[:3])
+              + "). They are recorded in the certificate, and `verify` will report them")
+    cert = AgentCertificate.create(g, system_id=args.system_id, signing_key=key,
+                                   validity_days=args.validity_days, baseline=baseline, policy=policy,
+                                   omit_observed_destinations=args.omit_observed_destinations,
+                                   regions=regions)
     out = args.output or f"{_safe(cert.system_id)}.cert.json"
     cert.save(out)
     print(f"certificate {cert.certificate_id} -> {out}")
     print(f"  FI {cert.fi_score:.4f} | {cert.node_count} nodes, {cert.edge_count} links, "
           f"{cert.bridge_count} bridges | signed: {cert.is_signed} | valid until {cert.not_after}")
+    egress = cert.egress
+    observed = (f"{len(egress['destinations'])} destination(s)" if "destinations" in egress
+                else "destinations not recorded (--omit-observed-destinations)")
+    print(f"  egress: {observed}, "
+          f"{len(egress.get('accepted_domains', []))} accepted and "
+          f"{len(egress.get('rejected_domains', []))} rejected pattern(s), "
+          f"{len(egress.get('forbidden_regions', []))} forbidden region(s)")
+    if egress.get("destinations"):
+        _warn("the certificate records the host names this session reached; review it before "
+              "publishing, and use --omit-observed-destinations for a certificate that leaves "
+              "the organisation (SECURITY.md §2, §6)")
     return 0
 
 
@@ -857,7 +927,8 @@ def cmd_verify(args) -> int:
             raise SystemExit(f"agent-certify: {args.public_key} does not hold an Ed25519 public key (64 hex chars)")
     _, g = load(args.path)
     report = cert.verify(g, fi_tolerance=args.fi_tolerance, public_key=pub, allow_unsigned=args.allow_unsigned,
-                         ignore_expiry=args.ignore_expiry, expected_system_id=args.expect_system_id)
+                         ignore_expiry=args.ignore_expiry, expected_system_id=args.expect_system_id,
+                         regions=_regions(args))
     _emit(json.dumps(report.to_dict(), indent=2) if args.format == "json" else str(report), None)
     return 0 if report.is_valid else 1
 
@@ -890,6 +961,19 @@ def _otel_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--otel-file", help=f"span file (default: {DEFAULT_TRACES_PATH.as_posix()})")
 
 
+def _region_args(p: argparse.ArgumentParser, dns: bool = False) -> None:
+    """``--geoip-db`` (offline) and, where it is allowed, ``--resolve-dns`` (not)."""
+    p.add_argument("--geoip-db", metavar="PATH",
+                   help="local CSV of 'ip_start,ip_end,country' rows (DB-IP 'IP to Country Lite', "
+                        "CC BY 4.0) used to put a country on an address literal. Read from disk; "
+                        "no database ships with agent-certify and none is downloaded")
+    if dns:
+        p.add_argument("--resolve-dns", action="store_true",
+                       help="resolve destination names over the network to find their region "
+                            "(needs --geoip-db). THE ONE OPTION THAT MAKES A NETWORK CONNECTION: off "
+                            "by default, announced on stderr, and never available from the MCP server")
+
+
 def _policy_args(p: argparse.ArgumentParser) -> None:
     g = p.add_mutually_exclusive_group()
     g.add_argument("--policy", help=f"policy to enforce (default: {DEFAULT_POLICY_PATH} if present)")
@@ -910,6 +994,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="labels for node roles (default: engineering)")
     _baseline_args(s)
     _policy_args(s)
+    _region_args(s, dns=True)
     s.add_argument("--include-mcp", action="store_true",
                    help="add the session's calls from MCP server logs (claude-cli-nodejs cache)")
     s.add_argument("--fail-on", choices=["critical", "warning", "never"], default="critical",
@@ -925,6 +1010,7 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--duration", type=float, help="stop after this many seconds (default: until Ctrl+C)")
     _baseline_args(w)
     _policy_args(w)
+    _region_args(w, dns=True)
     _otel_args(w)
     w.set_defaults(func=cmd_watch)
 
@@ -942,6 +1028,7 @@ def build_parser() -> argparse.ArgumentParser:
     learn.add_argument("-o", "--output", help=f"where to save it (default: {DEFAULT_BASELINE_PATH})")
     learn.add_argument("--include-mcp", action="store_true",
                        help="include MCP server log calls (use with `scan --include-mcp`)")
+    _region_args(learn, dns=True)
     learn.add_argument("--forget-overrides", action="store_true",
                        help="discard accept/reject decisions instead of carrying them forward")
     learn.set_defaults(func=cmd_learn)
@@ -999,6 +1086,24 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--validity-days", type=int, default=DEFAULT_VALIDITY_DAYS,
                    help=f"how long the certificate is valid (default: {DEFAULT_VALIDITY_DAYS})")
     c.add_argument("-o", "--output")
+    c.add_argument("--allow-egress-violations", action="store_true",
+                   help="issue the certificate even though the session already reaches a destination "
+                        "its own rules forbid (a rejected pattern, or a forbidden region). Off by "
+                        "default: certify exits 1 and names them. The violations are recorded in the "
+                        "signed certificate and reported by verify")
+    c.add_argument("--omit-observed-destinations", action="store_true",
+                   help="keep the accepted and rejected patterns and the forbidden regions in the "
+                        "certificate, but not the list of destinations this session reached. For a "
+                        "certificate shared outside the organisation: observed host names can "
+                        "disclose internal infrastructure. verify then checks the rejected patterns "
+                        "and the forbidden regions only, and says so")
+    # The certificate records the egress rules in force when it is issued, so
+    # certify reads the same baseline and policy a scan would — and the same
+    # local address database, to decide a region offline. No --resolve-dns:
+    # issuing a certificate does not open a socket.
+    _baseline_args(c)
+    _policy_args(c)
+    _region_args(c)
     c.set_defaults(func=cmd_certify)
 
     v = sub.add_parser("verify", help="check a graph against a certificate (exit 1 on drift)")
@@ -1011,6 +1116,7 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("--expect-system-id", help="fail unless the certificate was issued for this system id")
     v.add_argument("--fi-tolerance", type=float, default=0.001)
     v.add_argument("--format", choices=["text", "json"], default="text")
+    _region_args(v)            # --geoip-db only: verify never resolves a name
     v.set_defaults(func=cmd_verify)
     return ap
 

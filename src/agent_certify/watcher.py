@@ -45,6 +45,7 @@ from agent_certify.baseline import Baseline
 from agent_certify.graph import AgentGraph
 from agent_certify.parser.auto import AutoParser
 from agent_certify.policy import Policy, PolicyViolation
+from agent_certify.regions import OFFLINE, RegionResolver
 from agent_certify.scanner import HIGH, AgentFIScanner, Perspective
 
 
@@ -68,6 +69,12 @@ class SessionWatcher:
     called after every scan with all of that scan's anomalies (an
     :class:`AnomalyReport`, or None without a baseline) and policy violations
     (a list, or None without a policy), not only the newly reported ones.
+
+    ``regions`` resolves destinations for ``forbidden_region`` policy rules and
+    is kept **for the whole watch**: one cache, one lookup budget. A long watch
+    therefore resolves each name at most once, however many cycles it runs, and
+    a name whose lookup timed out stays unknown rather than being retried every
+    thirty seconds. Offline by default (see :mod:`agent_certify.regions`).
     """
 
     def __init__(
@@ -86,6 +93,7 @@ class SessionWatcher:
         min_call_delta: int = CALL_MIN_DELTA_CALLS,
         min_egress_delta: int = EGRESS_MIN_DELTA_BYTES,
         min_baseline_sessions: int = MIN_BASELINE_SESSIONS,
+        regions: RegionResolver | None = None,
     ):
         if interval <= 0:
             raise ValueError("interval must be positive")
@@ -104,6 +112,13 @@ class SessionWatcher:
         self.min_call_delta = min_call_delta           # the volume floors; see AnomalyDetector
         self.min_egress_delta = min_egress_delta
         self.min_baseline_sessions = min_baseline_sessions
+        #: One resolver for the whole watch, not one per cycle. That is what
+        #: makes its cache and its lookup cap mean something over hours: a name
+        #: is resolved once, a name whose lookup timed out stays *unknown* for
+        #: the life of the process and is never tried again, and the cap on
+        #: resolutions is a cap on the run rather than on each cycle. Default:
+        #: offline, like everything else.
+        self.regions = regions or OFFLINE
         self.history: list[dict] = []
         self._stop = threading.Event()
         self._last_size: int | None = None
@@ -215,7 +230,7 @@ class SessionWatcher:
                     self.on_anomaly(a)
         violations = []
         if self.policy:
-            all_violations = self.policy.check(graph)
+            all_violations = self.policy.check(graph, self.regions)
             for v in all_violations:
                 if self._is_new(("policy", v.rule.kind, v.rule.target, v.message), v.severity):
                     violations.append(v)

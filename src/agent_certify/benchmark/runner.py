@@ -7,8 +7,11 @@
 :class:`~agent_certify.benchmark.injector.AnomalyInjector` for every fault that
 applies to each session, runs the anomaly checks over the result and counts:
 
-* **detection rate** — injected faults reported with the expected anomaly
-  category, at the expected severity or worse;
+* **detection rate** — injected faults reported as expected: with the expected
+  anomaly category, or — for a fault the operator's policy owns rather than the
+  baseline — as a violation of the expected rule, at the expected severity or
+  worse. Both count the same way, because a product that reports "not allowed"
+  as well as "unusual" has to measure both;
 * **false negative rate** — the rest of them (1 − detection rate);
 * **false positive rate** — clean sessions, with nothing injected, that the
   checks flag anyway;
@@ -44,6 +47,7 @@ from agent_certify.benchmark.injector import (
     Injection,
 )
 from agent_certify.graph import AgentGraph
+from agent_certify.regions import OFFLINE
 from agent_certify.scanner import AgentFIScanner
 
 #: Severities from most to least serious; a fault expected at one is detected at any above it.
@@ -64,6 +68,8 @@ class TypeResult:
     kind: str
     expected_category: str | None
     min_severity: str | None
+    #: Set for a fault the policy catches: the rule kind that must be violated.
+    expected_rule: str | None = None
     trials: int = 0
     detected: int = 0
     severities: dict[str, int] = field(default_factory=dict)   # severity -> times the expected anomaly came back
@@ -74,7 +80,8 @@ class TypeResult:
 
     @property
     def is_blind_spot(self) -> bool:
-        return self.expected_category is None and not self.false_positive
+        return (self.expected_category is None and not self.false_positive
+                and not self.expected_rule)
 
     @property
     def quiet(self) -> int:
@@ -91,13 +98,14 @@ class TypeResult:
             return "(must stay silent)"
         if self.is_blind_spot:
             return "(blind spot)"
-        return f"{self.expected_category}/{(self.min_severity or '')[:4]}"
+        subject = self.expected_category or f"policy {self.expected_rule}"
+        return f"{subject}/{(self.min_severity or '')[:4]}"
 
     def to_dict(self) -> dict:
         return {"kind": self.kind, "expected_category": self.expected_category,
                 "min_severity": self.min_severity, "trials": self.trials, "detected": self.detected,
                 "detection_rate": self.detection_rate, "blind_spot": self.is_blind_spot,
-                "false_positive_case": self.false_positive,
+                "false_positive_case": self.false_positive, "expected_rule": self.expected_rule,
                 "severities": dict(sorted(self.severities.items())), "missed": self.missed,
                 "extra_anomalies": self.extra_anomalies, "note": self.note}
 
@@ -113,8 +121,13 @@ class BenchmarkResult:
 
     @property
     def covered(self) -> list[TypeResult]:
-        """Types a check is supposed to catch (blind spots and clean sessions excluded)."""
+        """Types a check or a policy rule is supposed to catch (blind spots and clean sessions excluded)."""
         return [t for t in self.per_type if not t.is_blind_spot and not t.false_positive]
+
+    @property
+    def policy_cases(self) -> list[TypeResult]:
+        """Faults scored against the policy engine rather than the baseline."""
+        return [t for t in self.per_type if t.expected_rule]
 
     @property
     def blind_spots(self) -> list[str]:
@@ -158,6 +171,7 @@ class BenchmarkResult:
                 "detection_rate": self.detection_rate, "false_negative_rate": self.false_negative_rate,
                 "false_positive_rate": self.false_positive_rate, "blind_spots": self.blind_spots,
                 "false_positive_cases": [t.kind for t in self.false_positive_cases],
+                "policy_cases": [t.kind for t in self.policy_cases],
                 "injected_false_positives": self.injected_false_positives,
                 "per_type": [t.to_dict() for t in self.per_type]}
 
@@ -251,10 +265,35 @@ class BenchmarkRunner:
         """Run every anomaly check on one graph."""
         return AnomalyDetector(baseline, self.source).detect(graph, AgentFIScanner(graph).scan())
 
+    @staticmethod
+    def check_policy(graph: AgentGraph, policy) -> list:
+        """Run one policy against one graph, offline.
+
+        Regions are read from ccTLDs: the benchmark must measure what every
+        caller gets without a database and without resolving a name, which is
+        also all the MCP server can do.
+        """
+        return policy.check(graph, OFFLINE) if policy is not None else []
+
     # ------------------------------------------------------------ internals
     def _score(self, result: TypeResult, injection: Injection) -> None:
         report = self.detect(injection.graph, injection.baseline or self.baseline)
         result.trials += 1
+        if injection.expected_rule:
+            # A fault the policy owns: the violation is the detection, and any
+            # anomaly reported alongside is counted as extra, like anywhere else.
+            violations = self.check_policy(injection.graph, injection.policy)
+            found = next((v for v in violations
+                          if v.rule.kind == injection.expected_rule
+                          and SEVERITY_ORDER[v.severity]
+                          <= SEVERITY_ORDER[injection.min_severity or v.severity]), None)
+            if found is None:
+                result.missed.append(injection.graph.session_id or "")
+            else:
+                result.detected += 1
+                result.severities[found.severity] = result.severities.get(found.severity, 0) + 1
+            result.extra_anomalies += len(report.anomalies) + len(violations) - (1 if found else 0)
+            return
         hit = next((a for a in report.anomalies
                     if a.category == injection.expected_category
                     and SEVERITY_ORDER[a.severity] <= SEVERITY_ORDER[injection.min_severity or a.severity]), None)
@@ -278,7 +317,7 @@ class BenchmarkRunner:
 def _result_for(injection: Injection) -> TypeResult:
     return TypeResult(kind=injection.kind, expected_category=injection.expected_category,
                       min_severity=injection.min_severity, note=injection.note,
-                      false_positive=injection.false_positive)
+                      false_positive=injection.false_positive, expected_rule=injection.expected_rule)
 
 
 def learn_holdout(sessions: list[AgentGraph], stride: int = 2) -> tuple[list[AgentGraph], list[AgentGraph], Baseline]:

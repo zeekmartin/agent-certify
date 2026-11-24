@@ -6,7 +6,89 @@ project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Where a destination is** (`agent_certify.regions`): a destination gets an
+  ISO 3166-1 alpha-2 country code, decided **offline**, and the answer says how
+  it was reached — `cctld` (a country-code domain: `api.example.cn` → `CN`,
+  `bbc.co.uk` → `GB`; the table is the 249 assigned codes plus the seven
+  exceptions), `geoip` (an address literal looked up in a local CSV of
+  `ip_start,ip_end,country` rows — DB-IP's *IP to Country Lite* format, CC BY
+  4.0 — read with a binary search and no dependency), or `unknown`. **No
+  database ships with the package and none is downloaded.** A `.com` hosted
+  elsewhere is `unknown`, which is the honest limit and is documented as one: a
+  ccTLD is a registration rather than a location
+- **`--resolve-dns`** on `scan`, `learn` and `watch`: resolves destination
+  names to addresses so the database can place them. **The one option in
+  agent-certify that makes a network connection** — off by default, requires
+  `--geoip-db`, prints what it will do and which resolver it will use before
+  the first lookup, resolves each name at most once per run with a bounded wait
+  and a cap on the number of lookups. **Never available from the MCP server**,
+  which answers region questions from host names alone and opens no socket
+- **`--geoip-db`** on `scan`, `learn`, `watch` and `verify`: a local address
+  database. Offline, so `verify` can use it without becoming a network tool
+- **Policy rule `forbidden_region`** (target: `"CN,RU,BY,IR"` — an *example*;
+  no country is forbidden by default and no sanctions list ships here). The
+  violation names the destination, the country and **how the country was
+  determined**, since a ccTLD, an address database and a DNS lookup are not
+  equally strong. `"unknown_region": "warning"` reports destinations whose
+  country cannot be determined; the default ignores them. `suggest-policy`
+  never drafts the rule: which countries an organisation will not send data to
+  is a decision with legal weight that no baseline implies
+- **A signed `egress` section in certificates** (`cert_format` 3): the
+  destination patterns accepted and rejected, the forbidden regions in force,
+  and the destinations observed, all signed. `certify` reads the baseline and
+  policy to fill it; `verify` reports a destination the certificate does not
+  cover and one in a forbidden region, resolving regions offline.
+  **Formats 1 and 2 keep their original signed bytes**, so every certificate
+  issued before this still verifies — tested for each format, and checked
+  end to end against a certificate issued by the real v0.7.0 code.
+  `graph_hash` is unchanged: a certificate's identity is still its topology
+- **`certify` refuses to sign a system that already breaks its own egress
+  rules**: a destination matching a rejected pattern in the baseline, or one in
+  a forbidden region of the policy. It exits 1, names each destination and the
+  rule it broke, and writes nothing — a certificate says a system was in a
+  known good state, and signing over a live violation would say the opposite of
+  the evidence. `--allow-egress-violations` signs anyway, warns on stderr, and
+  records the violations in the signed `egress` section
+  (`violations_at_issue`), so the evidence travels with the signature; `verify`
+  reports them, and such a certificate still fails verification. Both rules are
+  checked offline, `--geoip-db` included (`certify` never resolves a name),
+  through the new `certificate.egress_violations()`
+- **`certify --omit-observed-destinations`**: keeps the accepted and rejected
+  patterns and the forbidden regions in the certificate and leaves out the list
+  of destinations the session reached, for a certificate that will be shared
+  outside the organisation — observed host names can describe internal
+  infrastructure that the topology never revealed. The key is absent rather
+  than empty (an empty list would claim the session reached nothing), the
+  omission is inside the signed bytes, and `verify` then checks the rejected
+  patterns and the forbidden regions only and says so in its report
+- **One region resolver for a whole `watch`**: the resolver is held for the
+  process, so its cache covers the failures too. A name whose lookup ran past
+  the deadline stays `unknown` and is never retried on a later cycle, which
+  leaves one abandoned thread rather than one per cycle, and the cap on
+  resolutions is a budget for the run rather than for each cycle. `watch` also
+  honours `--geoip-db` and `--resolve-dns`, which it previously ignored
+- `AnomalyInjector.inject_forbidden_region()` and `.forbid_region()`, and the
+  `forbidden_region` benchmark row: the first fault scored against the **policy
+  engine** rather than a baseline. The runner now checks policies as well as
+  anomalies (`BenchmarkRunner.check_policy`, `Injection.policy` /
+  `.expected_rule`, `TypeResult.expected_rule`,
+  `BenchmarkResult.policy_cases`) — **16 fault types, 72/72 detected**, with
+  three measured blind spots and one false-positive case
+- `tests/test_regions.py`, `tests/test_cert_egress.py`,
+  `tests/test_cli_regions.py`: the ccTLD table, the database loader and its
+  malformed rows, the resolver's cache, timeout and lookup cap, the policy
+  rule, the certificate section and both legacy formats, every CLI path, and —
+  in every test that involves DNS — a fake `socket.getaddrinfo`, with guards
+  that **fail the test if anything resolves a name** when it should not
+
 ### Fixed
+- **A command line of a million commands is bounded** (`MAX_SHELL_SEGMENTS`,
+  10 000). 10 MB of `a;` with an unbalanced quote took about nine seconds to
+  analyse, against the thirty an MCP call is allowed in total; it now takes
+  0.1 s. The bound is on the *split* rather than on the list afterwards, and
+  reaching it is published as `destination_scan_truncated` with the reason
+  `segments`, like every other bound
 - **A URL's host has to look like a host.** The shape test (one dot and a
   letters-only suffix, or an address literal, or `localhost`) applied to bare
   values only, so anything after `scheme://` became a destination:
@@ -58,7 +140,6 @@ project uses [Semantic Versioning](https://semver.org/).
   URL pattern did not match at all, and one whose trailing punctuation is now
   stripped
 
-### Added
 - `agent-certify learn` warns when it learns from fewer than
   `MIN_BASELINE_SESSIONS` sessions, and says what will be noisy: an unknown
   tool, and the two volume checks comparing against a deviation that is near

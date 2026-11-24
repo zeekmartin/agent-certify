@@ -474,12 +474,13 @@ wrapped_shell_domain  new_domain/crit                       6         6   100.0%
 exfiltration          egress_volume_spike/warn              6         6   100.0%  6 critical
 decoy_flood           destination_scan_truncated/crit       6         6   100.0%  6 critical
 padding_evasion       new_domain/crit                       6         6   100.0%  6 critical
+forbidden_region      policy forbidden_region/crit          6         6   100.0%  6 critical
 shell_var_domain      (blind spot)                          6         0     0.0%  not covered by any check
 ssh_tunnel_domain     (blind spot)                          6         0     0.0%  not covered by any check
 file_upload_exfil     (blind spot)                          6         0     0.0%  not covered by any check
 written_url           (must stay silent)                    6         0     0.0%  silent, as it must be (6/6)
 ----------------------------------------------------------------------------------------------------------
-detection rate 100.0% (66/66)   false negatives 0.0%   false positives 0.0% (0/6 clean, 0 anomalies)
+detection rate 100.0% (72/72)   false negatives 0.0%   false positives 0.0% (0/6 clean, 0 anomalies)
 false-positive cases: written_url — 6/6 stayed silent, as a clean session must
 blind spots: shell_var_domain, ssh_tunnel_domain, file_upload_exfil — injected and expected to go unreported, no check covers the fault
 ```
@@ -501,8 +502,9 @@ blind spots: shell_var_domain, ssh_tunnel_domain, file_upload_exfil — injected
 | `inject_padding_evasion` | a destination behind 70 000 characters of padding | `new_domain`, critical |
 | `inject_file_upload_exfil` | a file uploaded to a known host, whose size the log does not hold | **nothing** — a measured blind spot |
 | `inject_written_url` | a URL written into a file's contents, never called | **nothing** — a measured false-positive case |
+| `inject_forbidden_region` | a destination in a country the operator's policy forbids | `forbidden_region` **policy violation**, critical |
 
-Six things in that table are worth more than the 100%:
+Seven things in that table are worth more than the 100%:
 
 - **The volume spike was a measured miss for a release.** v0.6.1 reported it as
   a blind spot — no check read call volume — and v0.7.0's `call_volume_spike`
@@ -554,6 +556,13 @@ Six things in that table are worth more than the 100%:
   All three are counted apart from the detection rate, and the day anything
   does read one, its row reports by itself. "No blind spots left" is a sentence
   this project will not print unless the measurement says it.
+- **One row is a policy violation, not an anomaly.** A destination in a
+  forbidden country is not unusual, it is *not allowed*: no amount of history
+  makes it normal, and no baseline would ever report it.
+  `inject_forbidden_region` is scored against the policy engine — which is why
+  the runner checks policies as well as anomalies, and why the row reads
+  `policy forbidden_region/crit`. The country is read from the host's ccTLD, so
+  the measurement needs no database and no name resolution.
 - **One row is a clean session, not a fault.** `inject_written_url` writes a
   URL into a file's contents and measures that **nothing** is reported about
   it. A blind spot and a false-positive case both expect silence, for opposite
@@ -697,9 +706,57 @@ The first two are the injection benchmark's measured blind spots
 documented here and nowhere measured, because "obfuscated" has no edge to
 measure against.
 
-**Patterns, not addresses.** Nothing is resolved, in either direction. A
-pattern is matched against the name the agent used, which is the thing you made
-a decision about:
+### Where a destination is
+
+A host name says where data went. Who it went to, in the sense a regulator
+means, is a *country* — so a destination can be given one, offline, and the
+answer always says how it was reached:
+
+| source | from | needs |
+|---|---|---|
+| `cctld` | the host's country-code domain (`api.example.cn` → `CN`, `bbc.co.uk` → `GB`) | nothing |
+| `geoip` | an address literal, in a local database (`77.88.8.8` → `RU`) | `--geoip-db` |
+| `dns+geoip` | a name resolved to an address, then looked up | `--resolve-dns` **and** `--geoip-db` |
+| `unknown` | nothing above applied | — |
+
+```
+[CRITICAL] FORBIDDEN region RU: collector.example.ru (RU (ccTLD))
+           collector.example.ru is in RU (ccTLD), reached by tool:WebFetch
+```
+
+**A `.com` hosted in Shanghai is `unknown`.** There is nothing in the name to
+read, and nothing is resolved unless you ask. That is the honest limit of this
+feature, and the reason the source is always printed: a ccTLD is a
+*registration*, not a location — `.io` domains sit in Virginia, a `.de` site
+can be served from Oregon — and an address database says where a block is
+*registered*, which for a CDN is the nearest cache rather than the origin. A
+region is evidence about a destination, not a finding about data residency.
+
+**No database ships with agent-certify and none is downloaded.** `--geoip-db`
+reads a CSV of `ip_start,ip_end,country` rows — the format of DB-IP's *IP to
+Country Lite* export, published under CC BY 4.0 — from a path you give. Ranges
+are looked up with a binary search, so a three-million-row file costs
+microseconds and no dependency.
+
+**`--resolve-dns` is the one thing in this tool that makes a network
+connection.** It is off by default, available on `scan`, `learn` and `watch`
+only, requires `--geoip-db`, and announces itself before the first lookup:
+
+```
+agent-certify: --resolve-dns: resolving destination names over the network via
+the resolver(s) in /etc/resolv.conf: 10.0.0.1. Each unknown host is looked up
+once, with a 2s timeout, up to 500 names.
+```
+
+Each name is resolved at most once per run, the wait is bounded, and the number
+of lookups is capped. The resolver's operator learns the host names your
+sessions reached — that is the trade, and it is why the option is explicit. The
+**MCP server has no such option**: it answers region questions from host names
+alone, and never opens a socket (`SECURITY.md` §1).
+
+**Patterns, not addresses.** Nothing is resolved, in either direction, unless
+`--resolve-dns` says so. A pattern is matched against the name the agent used,
+which is the thing you made a decision about:
 
 | Pattern | Matches | Does not match |
 |---|---|---|
@@ -784,6 +841,103 @@ Missing agent type: agent:Explore (was in certified baseline)
 Certificates issued before v0.3 have no `identity` field; they keep comparing
 agents by id, and their signatures remain valid.
 
+### What a certificate says about egress
+
+Since v0.8.0 (`cert_format` 3) a certificate also records **where the system
+was allowed to send data** when it was issued, in a signed `egress` section:
+
+```json
+"egress": {
+  "accepted_domains": ["*.openai.com"],
+  "rejected_domains": ["*.cn"],
+  "forbidden_regions": ["CN", "RU"],
+  "destinations": ["api.openai.com", "eu.openai.com"]
+}
+```
+
+`certify` reads the baseline and policy in force to fill it, and `verify`
+compares the live session against it:
+
+```
+Verification: FAIL
+  Destinations: 1 not covered, 1 in a forbidden region
+  - 1 destination(s) not covered by the certificate: collector.example.net
+  - Destination mirror.example.ru is in forbidden region RU (cctld)
+```
+
+A destination is covered when the certificate observed it, or when one of its
+accepted patterns matches it and no rejected pattern does. Regions are resolved
+offline — a ccTLD, or an address literal with `--geoip-db`; `verify` never
+resolves a name.
+
+Three things do not change. `graph_hash` still covers the topology alone, so a
+new destination is not a new shape. Formats 1 and 2 keep their original signed
+bytes (the section is left out of the payload for them), so **every certificate
+issued before this still verifies** — `verify` says which format it read and
+that its destinations were not checked. And the section is signed, so an
+operator cannot quietly widen what a certificate allowed.
+
+### certify refuses to sign a system that already breaks its rules
+
+A certificate says a system was in a known good state. Signing one for a
+session that was *already* reaching a destination its own rules forbid would
+say the opposite of the evidence, so `certify` stops:
+
+```
+$ agent-certify certify session.jsonl --key issuer.key
+agent-certify: refusing to certify: 2 destination(s) of this session break its own egress rules:
+  - api.unknown.cn: matches rejected pattern *.cn
+  - collector.example.ru: in forbidden region RU (ccTLD)
+Fix the system, or revise the decision that forbids them (`baseline accept
+--domain`, or the policy rule). To sign anyway and record these violations in
+the certificate, pass --allow-egress-violations.
+```
+
+Exit code 1, and no file is written. Two rules are checked, both offline: a
+destination matching a **rejected pattern** in the baseline, and one in a
+**forbidden region** of the policy (`--geoip-db` extends that to address
+literals; `certify` never resolves a name).
+
+`--allow-egress-violations` signs anyway — there are reasons to want a
+certificate of a system you know is wrong, starting with having a signed record
+of it — prints a warning, and **records the violations in the signed `egress`
+section** as `violations_at_issue`. The evidence then travels with the
+signature, `verify` reports it, and the certificate still fails verification:
+signing a violation does not make it go away.
+
+### A certificate you can share
+
+A certificate now contains host names from a real session — which is the point
+when you verify your own system against it, and a disclosure when you hand it
+to someone else. `internal-billing.corp.example` in a signed file tells a third
+party something about your infrastructure that your topology never did.
+
+```bash
+agent-certify certify session.jsonl --key issuer.key --omit-observed-destinations
+```
+
+`--omit-observed-destinations` keeps the accepted and rejected patterns and the
+forbidden regions, and leaves the observed list out of the section altogether
+(the key is absent, which is not an empty list: that would claim the session
+reached nothing). The omission is inside the signed bytes, so nobody can add
+the list back or take it away afterwards.
+
+`verify` then does what it still can — the rejected patterns and the forbidden
+regions — and says so rather than passing silently:
+
+```
+Verification: FAIL
+  - Destination mirror.example.ru is in forbidden region RU (cctld)
+  ! Certificate records no observed destinations (issued with
+    --omit-observed-destinations): only its rejected patterns and forbidden
+    regions were checked against the 3 destination(s) of this session, not
+    whether each one was certified
+```
+
+So the choice is explicit: a certificate for internal drift detection records
+what was reached, and one that leaves the organisation records only the rules.
+Either way, review it before publishing (`SECURITY.md` §2, §6).
+
 ### Trust model
 
 A signature proves something only when it is checked against a key you
@@ -795,6 +949,10 @@ verification when it is unsigned, signed by another key, edited after
 signing, outside its validity window, or issued for another system
 (`--expect-system-id`). `--allow-unsigned` skips the signature check
 explicitly and prints a warning; use it only for local experiments.
+
+`certify` and `verify` make no network connection, and neither resolves a
+name: the one option that does is `--resolve-dns` on `scan`, `learn` and
+`watch` (see [Where a destination is](#where-a-destination-is)).
 
 Since v0.5 every certificate carries `not_before` / `not_after` (90 days by
 default, `--validity-days`), so an older, more permissive certificate cannot be
@@ -825,7 +983,8 @@ reports them separately.
     {"kind": "forbidden_tool", "target": "deploy_production", "severity": "critical", "message": "No agent may deploy to production"},
     {"kind": "forbidden_link", "target": "agent:* → *database*", "severity": "critical", "message": "Sub-agents may not reach the database"},
     {"kind": "max_sub_agents", "target": "5", "severity": "warning", "message": "More than 5 sub-agents is unusual"},
-    {"kind": "required_tool", "target": "Bash", "severity": "warning", "message": "Bash is expected in every session"}
+    {"kind": "required_tool", "target": "Bash", "severity": "warning", "message": "Bash is expected in every session"},
+    {"kind": "forbidden_region", "target": "CN,RU,BY,IR", "severity": "critical", "message": "Customer data must not leave the EU", "unknown_region": "warning"}
   ],
   "generated_from": "baseline (25 sessions)",
   "created_at": "2026-10-27T20:00:00Z"
@@ -838,11 +997,28 @@ reports them separately.
 | `forbidden_link` | `"source → target"` (or `->`) | a matching invocation link exists |
 | `max_sub_agents` | integer | more sub-agents than that |
 | `required_tool` | tool pattern | no matching tool is used |
+| `forbidden_region` | country codes, comma-separated (`"CN,RU"`) | a destination is in one of those countries |
 
 Patterns are shell-style globs (`*`, `?`), case-insensitive, matched against a
 node's id (`tool:Bash`), type (`agent:Explore`) and name (`Bash`). `agent:*`
 matches every sub-agent; a bare name matches exactly (`deploy` does not match
 `deploy_production`; `deploy*` does).
+
+**`forbidden_region`** reads the countries of the session's destinations (see
+[Where a destination is](#where-a-destination-is)) and fires on the ones you
+list, as ISO 3166-1 alpha-2 codes. The violation names the destination, the
+country **and how it was determined**, because a ccTLD, a local address
+database and a DNS lookup are not equally strong evidence.
+
+A destination whose country cannot be determined is **ignored** by default — a
+`.com` is nothing but a name unless something resolves it, and failing every
+session with an unresolvable host would make the rule unusable. Set
+`"unknown_region": "warning"` on the rule to hear about them instead.
+
+The codes above are an **example**. No country is forbidden by default, nothing
+in agent-certify ships a sanctions list, and `suggest-policy` never drafts this
+rule: which countries an organisation will not send data to is a decision with
+legal weight that no baseline implies.
 
 `agent-certify suggest-policy` drafts a conservative policy from the baseline:
 tools seen in every session become REQUIRED (warning), and the sub-agent count

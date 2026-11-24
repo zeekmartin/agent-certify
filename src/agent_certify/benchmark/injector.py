@@ -42,6 +42,9 @@ evasion``              padding in one string              critical
 upload_exfil``         whose size the log does not hold   measured blind spot
 ``inject_written_      a URL *written into a file*, not   **nothing** — a
 url``                  called                             false-positive case
+``inject_forbidden_    a destination in a country the     ``forbidden_region``
+region``               operator's policy forbids          policy violation,
+                                                          critical
 =====================  =================================  =====================
 
 The volume spike was a measured blind spot until v0.7.0: no check read how
@@ -78,6 +81,12 @@ call and read 64 KB of any one string, and a host past either bound vanished
 with no trace at all. Padding is no longer a bound (a string is read whole, to
 the 10 MB a record already allows), and the hosts-per-call bound remains but is
 now counted and reported, so a flood of decoys no longer buys silence.
+
+``inject_forbidden_region`` is the one fault the **policy** catches rather than
+a baseline: a destination in a forbidden country is not unusual, it is not
+allowed, and no amount of history makes it normal. It is scored like any other
+fault, which is why the runner checks policies as well as anomalies — a suite
+that only measured anomalies would have left half the product unmeasured.
 
 ``inject_written_url`` is not a fault at all: it is a **false-positive case**,
 the one shape the suite asserts must stay silent for a good reason rather than
@@ -128,6 +137,8 @@ from agent_certify.anomaly import CRITICAL, MIN_BASELINE_SESSIONS, WARNING
 from agent_certify.baseline import Baseline
 from agent_certify.domains import MAX_DOMAINS, extract_call_domains, measure_call, normalise_pattern
 from agent_certify.graph import AgentGraph
+from agent_certify.policy import Policy, PolicyRule
+from agent_certify.regions import cctld_country as _country_of
 
 #: Default names for the things injections add. They name the benchmark on
 #: purpose: if one shows up in a report of real traffic, it came from here.
@@ -142,6 +153,11 @@ HIDDEN_DOMAIN = "hidden.unknown.cn"          # buried behind a flood of decoys
 PADDED_DOMAIN = "padded.unknown.cn"          # buried behind a block of padding
 DECOY_DOMAIN = "decoy.example.net"           # the decoys themselves, accepted by the operator
 WRITTEN_DOMAIN = "written.unknown.cn"        # named in a file's contents, never called
+#: A destination whose ccTLD puts it in a country a policy can forbid. ``.ru``
+#: is used because it reads as a region offline, with no database and no
+#: resolution; the country is the *benchmark's* example and nothing in
+#: agent-certify forbids any country by default.
+REGION_DOMAIN = "collector.benchmark.ru"
 
 #: Every anomaly type the benchmark injects, in report order. The last one is a
 #: blind spot: it is injected and expected to go unreported (see the module
@@ -149,6 +165,7 @@ WRITTEN_DOMAIN = "written.unknown.cn"        # named in a file's contents, never
 ANOMALY_TYPES = ("new_tool", "error_spike", "new_agent", "volume_spike", "forbidden_tool",
                  "foreign_domain", "shell_domain", "wrapped_shell_domain", "exfiltration",
                  "decoy_flood", "padding_evasion",
+                 "forbidden_region",
                  "shell_var_domain", "ssh_tunnel_domain", "file_upload_exfil", "written_url")
 
 #: Blind spots among :data:`ANOMALY_TYPES`: faults no check covers yet, whose
@@ -187,11 +204,15 @@ class Injection:
     #: because the rule is right, the other because a check is missing — so
     #: they are scored apart.
     false_positive: bool = False
+    #: A fault the **policy** catches rather than the baseline: the policy to
+    #: check the injected session against, and the rule kind that must fire.
+    policy: Policy | None = None
+    expected_rule: str | None = None
 
     @property
     def is_blind_spot(self) -> bool:
         """True when no check covers this fault, so the expected outcome is silence."""
-        return self.expected_category is None and not self.false_positive
+        return self.expected_category is None and not self.false_positive and not self.expected_rule
 
 
 class AnomalyInjector:
@@ -216,7 +237,8 @@ class AnomalyInjector:
                  wrapped_shell_domain: str = WRAPPED_SHELL_DOMAIN,
                  ssh_tunnel_domain: str = SSH_TUNNEL_DOMAIN,
                  hidden_domain: str = HIDDEN_DOMAIN, padded_domain: str = PADDED_DOMAIN,
-                 decoy_domain: str = DECOY_DOMAIN, written_domain: str = WRITTEN_DOMAIN):
+                 decoy_domain: str = DECOY_DOMAIN, written_domain: str = WRITTEN_DOMAIN,
+                 region_domain: str = REGION_DOMAIN):
         self.new_tool = new_tool
         self.new_agent = new_agent
         self.foreign_domain = foreign_domain
@@ -228,6 +250,7 @@ class AnomalyInjector:
         self.padded_domain = padded_domain
         self.decoy_domain = decoy_domain
         self.written_domain = written_domain
+        self.region_domain = region_domain
 
     # ------------------------------------------------------------ injectors
     def inject_new_tool(self, session: AgentGraph, tool_name: str | None = None) -> AgentGraph:
@@ -562,6 +585,32 @@ class AnomalyInjector:
         g.nodes[target].metadata["upload_destination"] = name
         return g
 
+    def inject_forbidden_region(self, session: AgentGraph, domain: str | None = None) -> AgentGraph:
+        """Reach a destination in a country the operator's policy forbids.
+
+        Pair it with :meth:`forbid_region`, as the registry does: the fault is
+        the *decision*, so the rule has to exist for there to be anything to
+        measure. The host's region is read from its ccTLD, which needs no
+        database and no name resolution — the same way the MCP server reads it.
+
+        Nothing structural changes, and the destination is as new as any other,
+        so ``new_domain`` fires too; what this measures is that
+        ``forbidden_region`` fires *as a policy violation*, which no baseline
+        would ever produce.
+        """
+        name = (domain or self.region_domain).strip().lower()
+        if not name:
+            raise ValueError("domain is required: a forbidden region has to be reached somewhere")
+        g = self._copy(session, "forbidden_region")
+        if name in g.seen_domains:
+            raise ValueError(f"{name!r} is already a destination in this session; pick one it does not use")
+        target = self._busiest_tool(g) or self._caller(g)
+        arguments = {"url": f"https://{name}/v1/collect", "method": "POST"}
+        egress = measure_call(arguments)
+        g.record_egress(target, egress.domains, egress.outbound_bytes)
+        g.nodes[target].metadata["injected"] = "forbidden_region"
+        return g
+
     # ------------------------------------------------- evading the scan limits
     def inject_decoy_flood(self, session: AgentGraph, hidden: str | None = None,
                            decoys: int = MAX_DOMAINS + 20) -> AgentGraph:
@@ -676,6 +725,18 @@ class AnomalyInjector:
         return b
 
     @staticmethod
+    def forbid_region(countries: str, severity: str = CRITICAL) -> Policy:
+        """A policy with one ``forbidden_region`` rule, for the region injection.
+
+        The benchmark has to supply it: no country is forbidden by default, and
+        a suite that assumed one would be measuring a policy agent-certify does
+        not have.
+        """
+        return Policy(rules=[PolicyRule(kind="forbidden_region", target=countries, severity=severity,
+                                        message="benchmark: data must not leave for these countries")],
+                      generated_from="benchmark")
+
+    @staticmethod
     def accept_domain(baseline: Baseline, pattern: str) -> Baseline:
         """A copy of ``baseline`` in which ``pattern`` is an accepted destination.
 
@@ -751,6 +812,10 @@ class AnomalyInjector:
                   f"{self.hidden_domain} buried behind {MAX_DOMAINS + 20} approved decoy hosts "
                   "in one command",
                   baseline=self.accept_domain(baseline, f"*.{self.decoy_domain}"))
+        self._add(out, "forbidden_region", lambda: self.inject_forbidden_region(session),
+                  None, None, f"{self.region_domain} reached, in a country the policy forbids",
+                  policy=self.forbid_region(_country_of(self.region_domain) or "RU"),
+                  expected_rule="forbidden_region", min_severity=CRITICAL)
         self._add(out, "padding_evasion", lambda: self.inject_padding_evasion(session),
                   "new_domain", CRITICAL,
                   f"{self.padded_domain} behind 70 000 characters of padding in one argument")
@@ -774,13 +839,15 @@ class AnomalyInjector:
 
     @staticmethod
     def _add(out: list, kind: str, build, category, severity, note, baseline: Baseline | None = None,
-             false_positive: bool = False) -> None:
+             false_positive: bool = False, policy: Policy | None = None,
+             expected_rule: str | None = None, min_severity: str | None = None) -> None:
         try:
             graph = build()
         except (ValueError, KeyError):
             return                      # this fault does not apply to this session
-        out.append(Injection(kind=kind, graph=graph, expected_category=category, min_severity=severity,
-                             baseline=baseline, note=note, false_positive=false_positive))
+        out.append(Injection(kind=kind, graph=graph, expected_category=category,
+                             min_severity=min_severity or severity, baseline=baseline, note=note,
+                             false_positive=false_positive, policy=policy, expected_rule=expected_rule))
 
     # ------------------------------------------------------------ internals
     @staticmethod
