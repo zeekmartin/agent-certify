@@ -2,7 +2,14 @@
 # Copyright 2026 Cognitive Engineering (Switzerland)
 # SPDX-License-Identifier: Apache-2.0
 """agent-certify: structural verification of multiagent systems."""
-__version__ = "0.7.0"
+#: The version this tree builds. A development version until the release
+#: commit: everything on this branch writes ``cert_format`` 3, which no
+#: released version reads, so a build from here must not claim to be 0.7.0 —
+#: and must not claim to be 0.8.0 either, which is a released artefact that
+#: does not exist yet. See MIN_VERSION_FOR_FORMAT in certificate.py: the table
+#: ties a certificate format to the oldest version allowed to write it, and a
+#: test ties this string to that table.
+__version__ = "0.8.0.dev0"
 
 from agent_certify.anomaly import Anomaly, AnomalyDetector, AnomalyReport
 from agent_certify.baseline import Baseline, BaselineLearner, load_baseline

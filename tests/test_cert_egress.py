@@ -242,12 +242,27 @@ def test_a_format_1_certificate_still_verifies():
                                    "skipped_records", "egress"), fi_fixed=False, domain=False)
     assert cert.cert_format == 1 and cert.egress == {} and cert.identity == "id"
     assert cert.signature_valid(issuer)
-    report = cert.verify(graph, public_key=issuer)
+    # Its signature still checks out, and it still verifies — but a certificate
+    # with no end date is now a decision rather than a default (CRY-003), so
+    # the waiver has to be explicit.
+    refused = cert.verify(graph, public_key=issuer)
+    assert not refused.is_valid
+    assert any("no validity period" in r for r in refused.reasons)
+    assert any("--allow-no-expiry" in r for r in refused.reasons)
+
+    report = cert.verify(graph, public_key=issuer, allow_no_expiry=True)
     assert report.is_valid, report.reasons
     assert any("no validity period" in w for w in report.warnings)
     assert any("Certificate format 1, current is 3" in w for w in report.warnings)
     assert any("not checked" in w for w in report.warnings)       # its destinations
     assert report.added_destinations == [] and report.forbidden_destinations == []
+    # The session did reach somewhere and this certificate carries no egress
+    # rules, so coverage cannot be decided: the signature and the topology are
+    # good, and whether those destinations were the certified ones is unknown.
+    # `verify` exits 3 for this, not 0 (CRY-001).
+    assert graph.seen_domains == {"api.openai.com"}
+    assert report.egress_coverage == "no_section" and not report.egress_verifiable
+    assert "NOT VERIFIABLE" in str(report)
 
 
 def test_a_format_2_certificate_still_verifies():

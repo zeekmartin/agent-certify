@@ -87,10 +87,13 @@ def test_pre_v03_certificate_still_verifies_and_compares_by_id(tmp_path):
     assert cert.identity == "id"
     issuer = data["signer_public_key"]                         # the issuer's key, known out of band
     assert cert.signature_valid(issuer)                        # old signature still checks out
-    legacy = cert.verify(g, public_key=issuer)
+    # No validity window: accepted only with the explicit waiver (CRY-003).
+    assert not cert.verify(g, public_key=issuer).is_valid
+    legacy = cert.verify(g, public_key=issuer, allow_no_expiry=True)
     assert legacy.is_valid
     assert any("before v0.5" in w for w in legacy.warnings)    # no validity period, legacy format
-    report = cert.verify(_session({"xyz": "Explore"}), public_key=issuer)   # legacy semantics: ids differ
+    report = cert.verify(_session({"xyz": "Explore"}), public_key=issuer,   # legacy semantics: ids differ
+                         allow_no_expiry=True)
     assert not report.is_valid and report.added_nodes == ["agent:xyz"]
 
 

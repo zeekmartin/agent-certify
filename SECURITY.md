@@ -73,8 +73,12 @@ nothing else.
   embedded in a certificate is informational only and never trusted.
   `--allow-unsigned` bypasses the signature check explicitly, with a warning.
 - Certificates expire (90 days by default) and can be bound to a system id
-  (`--expect-system-id`); certificates issued before v0.5 have no expiry and
-  are reported as legacy.
+  (`--expect-system-id`). A certificate with **no validity window at all**
+  (`cert_format` 1, issued before v0.5) **fails** verification since v0.8.0:
+  with no expiry and no revocation list (below), such a certificate is a
+  credential that nothing can retire. `--allow-no-expiry` accepts one anyway,
+  with a warning — the point is that accepting it is a decision someone makes
+  rather than a default inherited from an old release.
 - Certificates are loaded with strict type and range validation; NaN and
   Infinity are rejected.
 - The private key is a raw Ed25519 seed in hex, **not encrypted**. `keygen`
@@ -82,8 +86,28 @@ nothing else.
   warns when it is readable by other users. On Windows the file inherits the
   folder's ACL. Keep keys outside repositories and shared folders, ideally in
   a secrets manager; whoever holds the key can issue certificates that verify.
-- There is no revocation list yet: to retire a key, stop trusting its public
-  key and re-issue certificates with a new one.
+- **There is no revocation.** This is a property of the trust model, not a
+  missing feature flag, and it is worth stating plainly: a certificate that has
+  been signed is valid until it expires, and nothing the issuer does afterwards
+  can shorten that. There is no list to publish, no endpoint to check, and
+  `verify` makes no network call — so a certificate that should not have been
+  issued, or whose key has leaked, cannot be called back. What follows from
+  that:
+  - **To retire a key**: stop distributing its public key, destroy the private
+    key, and re-issue with a new one. Every certificate that key signed keeps
+    verifying for anyone who still holds the old public key — key rotation
+    protects future certificates, not past ones. Distribute public keys the
+    same way you would any other trust anchor, so that withdrawing one is a
+    change you can actually make.
+  - **For a certificate that leaves your organisation**, shorten the window:
+    `certify --validity-days 7` (or fewer). The expiry is the only expiry
+    mechanism there is, so its length is the whole of your ability to
+    de-authorise that file. A 90-day certificate handed to a third party is a
+    90-day credential you cannot take back.
+  - A revocation file — a signed list of certificate ids an issuer refuses to
+    stand behind, read from disk like every other input — is planned for v0.9
+    (see `ROADMAP.md`). Until it exists, the two points above are the whole
+    procedure.
 - **Certificates record egress** (`cert_format` 3, since v0.8.0). A signed
   `egress` section holds the destination patterns the operator had accepted and
   rejected, the forbidden regions in force, and **the destinations the
@@ -106,9 +130,33 @@ nothing else.
     verifies, and `verify` says which format it read and that its destinations
     were not checked. `graph_hash` is unchanged: a certificate's identity is
     still its topology.
+- **`verify` will not report a pass it cannot stand behind.** When a
+  certificate carries no list of observed destinations and the session reached
+  some, coverage is not a question anyone can answer: the signature is good,
+  the topology matches, and whether those destinations were the certified ones
+  is unknown. `verify` exits **3** for that case — distinct from 0 (valid) and
+  1 (invalid) — and says so in words. `--accept-unverified-egress` makes it 0,
+  explicitly, for an operator who has decided the narrower check is enough.
+  The same applies to a certificate with no `egress` section at all
+  (`cert_format` 1 or 2).
 - Regions in `verify` are decided offline: a country-code domain, or an address
   literal looked up in a local database given with `--geoip-db`. `verify` never
   resolves a name.
+- **The dependency floors are the oldest versions CI tests** — `numpy>=1.26.4`
+  and `cryptography>=46.0.0` — not a statement about what is safe. The `lowest`
+  job installs exactly those two versions under Python 3.10 and runs the whole
+  suite against them, so the number in `pyproject.toml` is a tested floor
+  rather than a guess. An installation with no constraint on these packages
+  takes the most recent release instead, which is what `pip` does by default.
+  A deployment that **freezes** a version takes on tracking `cryptography`'s
+  security advisories itself: their policy covers "the main branch as well as
+  the most recent release"
+  ([source](https://cryptography.io/en/latest/security/)), so any frozen older
+  series is unpatched by definition, and this package's signatures are only
+  worth the library underneath them. The `pip-audit` step in the same `lowest`
+  job reports what the floor exposes today; it is informational and does not
+  fail the build, so the exposure is visible without the floor becoming a
+  moving wall in front of an install.
 
 ### 3. Baselines and policies
 
@@ -126,8 +174,29 @@ reports, OTel spans and certificates.
 
 ### 5. Files written
 
-Reports, baselines, policies, OTel traces and certificates contain session
-ids, project folder names (which encode local paths) and agent descriptions.
+Reports, baselines, policies, OTel traces and certificates carry identifiers
+that came from the machine they were produced on. Named explicitly, because
+each one travels further than people expect:
+
+- **the project name.** Derived from the session folder, which is derived from
+  a filesystem path: `H--acme-client-audit` or `C--Users-jdoe-work-bigbank` is
+  a *path*, so it can carry a user name, a customer name or an unannounced
+  project. It appears in the text report, in `scan --format json`, in the OTel
+  span attribute `agent_certify.project`, and in the header of an HTML report.
+- **the session id**, which identifies one session of one agent on one machine
+  and appears in the same four places, plus every certificate.
+- **tool and agent names and descriptions**, which can name internal systems.
+- **network destinations** (§6), in reports, baselines and certificates.
+
+`scan --hash-project` and `watch --hash-project` replace the project name with
+`sha256:<first 12 hex characters>` in **every** output — report, JSON, OTel
+span, HTML. The digest is stable, so sessions of one project still group
+together across reports. It is **pseudonymisation, not anonymisation**: anyone
+holding a list of candidate project names can confirm one by hashing it. It
+keeps a name out of a file that gets passed around; it is not a defence against
+someone who already knows what to guess. The session id is not hashed — it is
+what makes a report traceable to the session it describes.
+
 The `.agent-certify/` folder is created with a `.gitignore` that excludes its
 contents; HTML reports are ignored by this repository's `.gitignore`. Do not
 publish these files without reviewing them.
@@ -323,6 +392,16 @@ sizes *written in a log*, not bytes observed on a network:
 - **a body built at run time is not sized**: `curl -d "$(cat secrets)"` or a
   variable expansion carries no literal value. The command is parsed, never
   evaluated (above), so there is nothing to measure.
+
+**What a report carries alongside the destinations.** A destination is
+reported next to the identifiers of §5 — the project name and the session id —
+so a report that names where a system went also names *which* system, and
+whose. `--hash-project` replaces the project name in every output; the session
+id stays. **When `--geoip-db` was used**, `scan`, `watch` and `verify` print
+`IP geolocation by DB-IP.com, CC BY 4.0` on stderr: the database is published
+under CC BY 4.0, which asks for attribution wherever its data is used, and a
+report that places a destination in a country is such a use. Carry that line
+with the report if you pass it on.
 
 **What is kept.** Only host names and **numbers**. Host names lowercased, with
 URL credentials, port, path and query discarded, and nothing resolved: a name

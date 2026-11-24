@@ -44,6 +44,7 @@ from agent_certify.anomaly import (
 from agent_certify.baseline import Baseline
 from agent_certify.graph import AgentGraph
 from agent_certify.parser.auto import AutoParser
+from agent_certify.paths import hash_project
 from agent_certify.policy import Policy, PolicyViolation
 from agent_certify.regions import OFFLINE, RegionResolver
 from agent_certify.scanner import HIGH, AgentFIScanner, Perspective
@@ -94,6 +95,7 @@ class SessionWatcher:
         min_egress_delta: int = EGRESS_MIN_DELTA_BYTES,
         min_baseline_sessions: int = MIN_BASELINE_SESSIONS,
         regions: RegionResolver | None = None,
+        hash_project: bool = False,
     ):
         if interval <= 0:
             raise ValueError("interval must be positive")
@@ -119,6 +121,11 @@ class SessionWatcher:
         #: resolutions is a cap on the run rather than on each cycle. Default:
         #: offline, like everything else.
         self.regions = regions or OFFLINE
+        #: Replace the project name with a digest on every scan of this watch
+        #: (``--hash-project``). Applied where the graph is parsed, so the
+        #: report, the OTel span and anything else built from it carry the
+        #: label and never the name. See :func:`agent_certify.paths.hash_project`.
+        self.hash_project = bool(hash_project)
         self.history: list[dict] = []
         self._stop = threading.Event()
         self._last_size: int | None = None
@@ -201,6 +208,8 @@ class SessionWatcher:
         started = datetime.now(timezone.utc)
         try:
             graph = AutoParser().parse(str(self.session_path))
+            if self.hash_project:
+                graph.project = hash_project(graph.project)
         finally:
             parsers.setLevel(level)
         result = AgentFIScanner(graph, perspective=self.perspective).scan()

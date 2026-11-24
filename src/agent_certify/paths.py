@@ -13,15 +13,44 @@ Two kinds of input reach agent-certify:
   to the caller), resolves symlinks and ``..``, and accepts the result only if it
   lies inside one of the allowed roots. Its errors never contain the path.
 
-This module also holds the resource limits shared by the parsers, and creates
-the ``.agent-certify/`` state directory with a ``.gitignore`` so that its
-contents (session ids, project names) are not committed by accident.
+This module also holds the resource limits shared by the parsers, the
+pseudonymisation of a project name (:func:`hash_project`, behind
+``--hash-project``), and creates the ``.agent-certify/`` state directory with a
+``.gitignore`` so that its contents (session ids, project names) are not
+committed by accident.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 from collections.abc import Iterable, Iterator
 from pathlib import Path
+
+#: How many hex characters of the digest a hashed project name keeps. Twelve is
+#: enough that two projects on one machine will not collide, and short enough to
+#: read in a report; it is a label, not a secret.
+PROJECT_HASH_CHARS = 12
+
+
+def hash_project(name: str | None) -> str | None:
+    """``"H--acme-client-audit"`` as ``"sha256:3f2a1c0d9e8b"``; None stays None.
+
+    A project name is derived from a filesystem path, so it can carry a user
+    name, a client name or an internal code name — and it travels into every
+    report, span and HTML file this tool writes. ``--hash-project`` replaces it
+    with a digest so that a report can be shared while sessions of the same
+    project still group together: the same name always gives the same label.
+
+    This is **pseudonymisation, not anonymisation**: anyone who can guess a
+    project name can confirm it by hashing it. It keeps a name out of a report
+    that is passed around; it does not protect one from someone who already has
+    a list of candidates. The docs say so in those words.
+    """
+    if not name:
+        return name
+    digest = hashlib.sha256(name.encode("utf-8", "surrogatepass")).hexdigest()
+    return f"sha256:{digest[:PROJECT_HASH_CHARS]}"
+
 
 # ------------------------------------------------------------------ limits
 MAX_DEPTH = 5                       # directory levels walked below a scanned directory
