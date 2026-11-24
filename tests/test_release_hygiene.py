@@ -33,7 +33,6 @@ from agent_certify.paths import PROJECT_HASH_CHARS, hash_project
 from agent_certify.scanner import AgentFIScanner
 from agent_certify.viz import render_html
 
-
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
@@ -395,6 +394,22 @@ def test_the_floor_is_justified_where_an_auditor_will_look():
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert "cryptography.io/en/latest/security/" in pyproject
     assert "lowest" in pyproject                         # the job that proves the number
+
+
+
+def test_the_dev_extra_pins_the_ruff_the_lint_job_uses():
+    """A lint that passes locally and fails in CI is a lint nobody can trust.
+
+    Two ruff versions sort imports differently, so the development install has
+    to carry the same pin as the `lint` job.
+    """
+    pyproject = read_pyproject()
+    dev = pyproject["project"]["optional-dependencies"]["dev"]
+    pinned = [spec for spec in dev if spec.startswith("ruff")]
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    version = re.search(r'pip install "ruff==([0-9.]+)"', ci).group(1)
+    assert pinned == [f"ruff=={version}"], (
+        f"the lint job installs ruff {version} and the dev extra asks for {pinned}")
 
 
 def test_the_lowest_job_installs_exactly_the_declared_floors():

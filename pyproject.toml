@@ -64,7 +64,10 @@ mcp = []           # stdio MCP server, no `mcp` package
 otel = []          # OTLP/JSON spans, no OpenTelemetry SDK
 cursor = []        # Cursor Agent Trace parser
 all = []
-dev = ["pytest>=7.0", "pytest-cov", "ruff", "tomli; python_version < '3.11'"]
+# `ruff` is pinned to the version the CI lint job installs: a different
+# version sorts imports differently, so "clean locally" has to mean the
+# same thing as "clean in CI".
+dev = ["pytest>=7.0", "pytest-cov", "ruff==0.17.3", "tomli; python_version < '3.11'"]
 
 [project.scripts]
 agent-certify = "agent_certify.cli:main"
