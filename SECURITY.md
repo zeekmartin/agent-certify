@@ -84,7 +84,7 @@ nothing else.
   a secrets manager; whoever holds the key can issue certificates that verify.
 - There is no revocation list yet: to retire a key, stop trusting its public
   key and re-issue certificates with a new one.
-- **Certificates record egress** (`cert_format` 3, since v0.8.1). A signed
+- **Certificates record egress** (`cert_format` 3, since v0.8.0). A signed
   `egress` section holds the destination patterns the operator had accepted and
   rejected, the forbidden regions in force, and **the destinations the
   certified session actually reached**. `verify` uses it to report a
@@ -146,7 +146,7 @@ but only when that call's own arguments already carried a destination — so a
 file read or a search result full of URLs is not treated as egress. The walk is
 bounded (8 levels deep, 2,000 strings, 64 KB per string, 200 hosts per call).
 
-**What is not read at all** (since v0.8.1). Two categories of value are
+**What is not read at all** (since v0.8.0). Two categories of value are
 skipped before anything else happens, because reading them produced findings
 about traffic that never existed:
 
@@ -247,7 +247,7 @@ point — a size is not a sample. The hosts and their numbers live on the graph
 (`seen_domains`, `egress_bytes`, `egress_calls`) and on the calling node, so a
 report can say which tool reached which host and with how much.
 
-**Where a destination is** (since v0.8.1). A destination's country is decided
+**Where a destination is** (since v0.8.0). A destination's country is decided
 from its country-code top-level domain (`api.example.cn` is `CN`, `bbc.co.uk`
 is `GB`), or — for an address literal — from a local CSV database the operator
 supplies with `--geoip-db`. No database ships with the package and none is

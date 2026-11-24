@@ -294,6 +294,96 @@ def test_without_an_observed_list_verify_still_enforces_rejections_and_regions(t
     assert not report["is_valid"]
 
 
+def test_certify_refuses_a_system_that_already_breaks_its_egress_rules(tmp_path, capsys, no_dns):
+    """A certificate says "known good state". Signing over a live violation would say the opposite."""
+    session = write_session(tmp_path, "s.jsonl", ["api.openai.com", "collector.example.ru"])
+    policy = tmp_path / "policy.json"
+    Policy([PolicyRule("forbidden_region", "RU", "critical", "data stays in the EU")]).save(policy)
+    out_path = tmp_path / "c.cert.json"
+    assert main(["certify", session, "--policy", str(policy), "--no-baseline",
+                 "-o", str(out_path)]) == 1
+    err = capsys.readouterr().err
+    assert "refusing to certify: 1 destination(s)" in err
+    assert "collector.example.ru: in forbidden region RU (ccTLD)" in err
+    assert "--allow-egress-violations" in err
+    assert not out_path.exists()                               # nothing was written
+
+
+def test_certify_refuses_a_destination_that_matches_a_rejected_pattern(tmp_path, capsys, no_dns):
+    from agent_certify.baseline import BaselineLearner, load_baseline
+
+    session = write_session(tmp_path, "s.jsonl", ["api.openai.com", "api.unknown.cn"])
+    baseline_path = tmp_path / "baseline.json"
+    BaselineLearner().save(BaselineLearner().learn([session]), baseline_path)
+    capsys.readouterr()
+    assert main(["baseline", "reject", "--domain", "*.cn", "--baseline", str(baseline_path)]) == 0
+    assert load_baseline(baseline_path).rejected_domains == {"*.cn"}
+    capsys.readouterr()
+    out_path = tmp_path / "c.cert.json"
+    assert main(["certify", session, "--baseline", str(baseline_path), "--no-policy",
+                 "-o", str(out_path)]) == 1
+    err = capsys.readouterr().err
+    assert "api.unknown.cn: matches rejected pattern *.cn" in err
+    assert not out_path.exists()
+
+
+def test_allow_egress_violations_signs_and_records_them(tmp_path, capsys, no_dns):
+    session = write_session(tmp_path, "s.jsonl", ["api.openai.com", "collector.example.ru"])
+    policy = tmp_path / "policy.json"
+    Policy([PolicyRule("forbidden_region", "RU", "critical", "x")]).save(policy)
+    key = tmp_path / "issuer.key"
+    assert main(["keygen", str(key)]) == 0
+    capsys.readouterr()
+    out_path = tmp_path / "forced.cert.json"
+    assert main(["certify", session, "--policy", str(policy), "--no-baseline", "--key", str(key),
+                 "--allow-egress-violations", "-o", str(out_path)]) == 0
+    printed = capsys.readouterr()
+    assert "--allow-egress-violations: signing although 1 destination(s)" in printed.err
+    assert "collector.example.ru: in forbidden region RU" in printed.err
+    cert = json.loads(out_path.read_text(encoding="utf-8"))
+    assert cert["egress"]["violations_at_issue"] == [
+        "collector.example.ru: in forbidden region RU (ccTLD)"]
+    assert cert["signature"]
+
+    # And the forced certificate still fails verification: the signature does
+    # not make the violation go away.
+    public = (tmp_path / "issuer.key.pub").read_text(encoding="utf-8").strip()
+    pub_file = tmp_path / "issuer.pub"
+    pub_file.write_text(public, encoding="utf-8")
+    assert main(["verify", str(out_path), session, "--public-key", str(pub_file),
+                 "--format", "json"]) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["is_valid"] is False and report["signature_valid"] is True
+    assert [hit["host"] for hit in report["forbidden_destinations"]] == ["collector.example.ru"]
+    assert any("issued over 1 egress violation(s)" in w for w in report["warnings"])
+
+
+def test_certify_is_unaffected_when_nothing_is_wrong(tmp_path, capsys, no_dns):
+    session = write_session(tmp_path, "s.jsonl", ["api.openai.com"])
+    policy = tmp_path / "policy.json"
+    Policy([PolicyRule("forbidden_region", "RU", "critical", "x")]).save(policy)
+    out_path = tmp_path / "c.cert.json"
+    assert main(["certify", session, "--policy", str(policy), "--no-baseline",
+                 "-o", str(out_path)]) == 0
+    assert "refusing" not in capsys.readouterr().err
+    assert "violations_at_issue" not in out_path.read_text(encoding="utf-8")
+
+
+def test_certify_reads_a_local_database_for_the_refusal(tmp_path, capsys, geoip_csv, no_dns):
+    """An address literal in a forbidden region blocks certification too, offline."""
+    session = write_session(tmp_path, "s.jsonl", [RU_ADDRESS])
+    policy = tmp_path / "policy.json"
+    Policy([PolicyRule("forbidden_region", "RU", "critical", "x")]).save(policy)
+    out_path = tmp_path / "c.cert.json"
+    assert main(["certify", session, "--policy", str(policy), "--no-baseline",
+                 "-o", str(out_path)]) == 0                    # no database: nothing to see
+    capsys.readouterr()
+    other = tmp_path / "d.cert.json"
+    assert main(["certify", session, "--policy", str(policy), "--no-baseline",
+                 "--geoip-db", geoip_csv, "-o", str(other)]) == 1
+    assert f"{RU_ADDRESS}: in forbidden region RU" in capsys.readouterr().err
+
+
 def test_verify_reports_egress_drift_and_regions(tmp_path, capsys, no_dns):
     certified = write_session(tmp_path, "certified.jsonl", ["api.openai.com"])
     policy = tmp_path / "policy.json"

@@ -843,7 +843,7 @@ agents by id, and their signatures remain valid.
 
 ### What a certificate says about egress
 
-Since v0.8.1 (`cert_format` 3) a certificate also records **where the system
+Since v0.8.0 (`cert_format` 3) a certificate also records **where the system
 was allowed to send data** when it was issued, in a signed `egress` section:
 
 ```json
@@ -876,6 +876,34 @@ bytes (the section is left out of the payload for them), so **every certificate
 issued before this still verifies** — `verify` says which format it read and
 that its destinations were not checked. And the section is signed, so an
 operator cannot quietly widen what a certificate allowed.
+
+### certify refuses to sign a system that already breaks its rules
+
+A certificate says a system was in a known good state. Signing one for a
+session that was *already* reaching a destination its own rules forbid would
+say the opposite of the evidence, so `certify` stops:
+
+```
+$ agent-certify certify session.jsonl --key issuer.key
+agent-certify: refusing to certify: 2 destination(s) of this session break its own egress rules:
+  - api.unknown.cn: matches rejected pattern *.cn
+  - collector.example.ru: in forbidden region RU (ccTLD)
+Fix the system, or revise the decision that forbids them (`baseline accept
+--domain`, or the policy rule). To sign anyway and record these violations in
+the certificate, pass --allow-egress-violations.
+```
+
+Exit code 1, and no file is written. Two rules are checked, both offline: a
+destination matching a **rejected pattern** in the baseline, and one in a
+**forbidden region** of the policy (`--geoip-db` extends that to address
+literals; `certify` never resolves a name).
+
+`--allow-egress-violations` signs anyway — there are reasons to want a
+certificate of a system you know is wrong, starting with having a signed record
+of it — prints a warning, and **records the violations in the signed `egress`
+section** as `violations_at_issue`. The evidence then travels with the
+signature, `verify` reports it, and the certificate still fails verification:
+signing a violation does not make it go away.
 
 ### A certificate you can share
 

@@ -43,6 +43,17 @@ project uses [Semantic Versioning](https://semver.org/).
   issued before this still verifies — tested for each format, and checked
   end to end against a certificate issued by the real v0.7.0 code.
   `graph_hash` is unchanged: a certificate's identity is still its topology
+- **`certify` refuses to sign a system that already breaks its own egress
+  rules**: a destination matching a rejected pattern in the baseline, or one in
+  a forbidden region of the policy. It exits 1, names each destination and the
+  rule it broke, and writes nothing — a certificate says a system was in a
+  known good state, and signing over a live violation would say the opposite of
+  the evidence. `--allow-egress-violations` signs anyway, warns on stderr, and
+  records the violations in the signed `egress` section
+  (`violations_at_issue`), so the evidence travels with the signature; `verify`
+  reports them, and such a certificate still fails verification. Both rules are
+  checked offline, `--geoip-db` included (`certify` never resolves a name),
+  through the new `certificate.egress_violations()`
 - **`certify --omit-observed-destinations`**: keeps the accepted and rejected
   patterns and the forbidden regions in the certificate and leaves out the list
   of destinations the session reached, for a certificate that will be shared

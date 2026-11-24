@@ -67,6 +67,7 @@ from agent_certify.certificate import (
     AgentCertificate,
     _private_key_hex,
     _public_key_hex,
+    egress_violations,
     generate_keypair,
 )
 from agent_certify.domains import domain_matches, normalise_pattern
@@ -83,6 +84,9 @@ from agent_certify.watcher import SessionWatcher, latest_session
 
 DEFAULT_PATH = "~/.claude/projects"
 FAIL_EXIT = 2
+#: `certify` refusing to sign is a failed command, not a finding in a report:
+#: exit 1, the way `verify` reports drift.
+CERTIFY_REFUSED = 1
 
 
 def _path(p: str) -> Path:
@@ -836,15 +840,34 @@ def cmd_certify(args) -> int:
     _, g = load(args.path)
     baseline, _ = _find_baseline(args)
     policy, _ = _find_policy(args)
+    regions = _regions(args)
+    # A certificate says a system is in a known good state. Signing one for a
+    # session that was already breaking its own egress rules would say the
+    # opposite of the evidence, so it takes an explicit option.
+    violations = egress_violations(g, baseline, policy, regions)
+    if violations and not args.allow_egress_violations:
+        print(f"agent-certify: refusing to certify: {len(violations)} destination(s) of this "
+              "session break its own egress rules:", file=sys.stderr)
+        for line in violations:
+            print(f"  - {line}", file=sys.stderr)
+        print("Fix the system, or revise the decision that forbids them "
+              "(`baseline accept --domain`, or the policy rule). To sign anyway and record these "
+              "violations in the certificate, pass --allow-egress-violations.", file=sys.stderr)
+        return CERTIFY_REFUSED
     key = _read_private_key(args.key) if args.key else None
     if key is None:
         _warn("issuing an UNSIGNED certificate (no --key): it can only be checked with --allow-unsigned")
     if g.skipped_records:
         _warn(f"{g.skipped_records} record(s) could not be read; the certificate covers a possibly "
               "incomplete graph (recorded in the certificate as skipped_records)")
+    if violations:
+        _warn(f"--allow-egress-violations: signing although {len(violations)} destination(s) of "
+              "this session break its own egress rules (" + "; ".join(violations[:3])
+              + "). They are recorded in the certificate, and `verify` will report them")
     cert = AgentCertificate.create(g, system_id=args.system_id, signing_key=key,
                                    validity_days=args.validity_days, baseline=baseline, policy=policy,
-                                   omit_observed_destinations=args.omit_observed_destinations)
+                                   omit_observed_destinations=args.omit_observed_destinations,
+                                   regions=regions)
     out = args.output or f"{_safe(cert.system_id)}.cert.json"
     cert.save(out)
     print(f"certificate {cert.certificate_id} -> {out}")
@@ -1063,6 +1086,11 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--validity-days", type=int, default=DEFAULT_VALIDITY_DAYS,
                    help=f"how long the certificate is valid (default: {DEFAULT_VALIDITY_DAYS})")
     c.add_argument("-o", "--output")
+    c.add_argument("--allow-egress-violations", action="store_true",
+                   help="issue the certificate even though the session already reaches a destination "
+                        "its own rules forbid (a rejected pattern, or a forbidden region). Off by "
+                        "default: certify exits 1 and names them. The violations are recorded in the "
+                        "signed certificate and reported by verify")
     c.add_argument("--omit-observed-destinations", action="store_true",
                    help="keep the accepted and rejected patterns and the forbidden regions in the "
                         "certificate, but not the list of destinations this session reached. For a "
@@ -1070,9 +1098,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "disclose internal infrastructure. verify then checks the rejected patterns "
                         "and the forbidden regions only, and says so")
     # The certificate records the egress rules in force when it is issued, so
-    # certify reads the same baseline and policy a scan would.
+    # certify reads the same baseline and policy a scan would — and the same
+    # local address database, to decide a region offline. No --resolve-dns:
+    # issuing a certificate does not open a socket.
     _baseline_args(c)
     _policy_args(c)
+    _region_args(c)
     c.set_defaults(func=cmd_certify)
 
     v = sub.add_parser("verify", help="check a graph against a certificate (exit 1 on drift)")
