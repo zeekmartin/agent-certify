@@ -93,30 +93,60 @@ def test_a_destination_in_a_command_is_found(command, expected):
 
 
 #: One invocation per program on NETWORK_COMMANDS, in the shape that program
-#: actually takes a destination in. A program on the list with no case here is
-#: a claim rather than a feature, so the table has to cover the list exactly.
+#: actually takes a destination in, with what it must produce. A program on the
+#: list with no case here is a claim rather than a feature, so the table has to
+#: cover the list exactly — and the expected value is written out, because for
+#: a bucket or a configured remote the destination is not a host name.
+PROBE = "probe.example.net"
 INVOCATIONS = {
-    "curl": "curl -sS probe.example.net/x",
-    "wget": "wget -q probe.example.net/x",
-    "http": "http GET probe.example.net/x",
-    "https": "https GET probe.example.net/x",
-    "httpie": "httpie probe.example.net/x",
-    "nc": "nc probe.example.net 9000",
-    "ncat": "ncat probe.example.net 9000",
-    "netcat": "netcat probe.example.net 9000",
-    "socat": "socat TCP4:probe.example.net:9000 -",
-    "telnet": "telnet probe.example.net 25",
-    "ssh": "ssh user@probe.example.net",
-    "scp": "scp f.bin user@probe.example.net:/x",
-    "sftp": "sftp user@probe.example.net",
-    "rsync": "rsync -az ./d user@probe.example.net:/x",
-    "ftp": "ftp probe.example.net",
-    "git": "git clone git@probe.example.net:x/y.git",
-    "invoke-webrequest": "Invoke-WebRequest -Uri probe.example.net/x",
-    "invoke-restmethod": "Invoke-RestMethod -Uri probe.example.net/x",
-    "iwr": "iwr probe.example.net/x",
-    "irm": "irm probe.example.net/x",
-    "test-netconnection": "Test-NetConnection -ComputerName probe.example.net",
+    "curl": ("curl -sS probe.example.net/x", {PROBE}),
+    "wget": ("wget -q probe.example.net/x", {PROBE}),
+    "http": ("http GET probe.example.net/x", {PROBE}),
+    "https": ("https GET probe.example.net/x", {PROBE}),
+    "httpie": ("httpie probe.example.net/x", {PROBE}),
+    "nc": ("nc probe.example.net 9000", {PROBE}),
+    "ncat": ("ncat probe.example.net 9000", {PROBE}),
+    "netcat": ("netcat probe.example.net 9000", {PROBE}),
+    "socat": ("socat TCP4:probe.example.net:9000 -", {PROBE}),
+    "telnet": ("telnet probe.example.net 25", {PROBE}),
+    "ssh": ("ssh user@probe.example.net", {PROBE}),
+    "scp": ("scp f.bin user@probe.example.net:/x", {PROBE}),
+    "sftp": ("sftp user@probe.example.net", {PROBE}),
+    "rsync": ("rsync -az ./d user@probe.example.net:/x", {PROBE}),
+    "ftp": ("ftp probe.example.net", {PROBE}),
+    "tftp": ("tftp probe.example.net", {PROBE}),
+    "smbclient": ("smbclient //probe.example.net/share", {PROBE}),
+    "git": ("git clone git@probe.example.net:x/y.git", {PROBE}),
+    "invoke-webrequest": ("Invoke-WebRequest -Uri probe.example.net/x", {PROBE}),
+    "invoke-restmethod": ("Invoke-RestMethod -Uri probe.example.net/x", {PROBE}),
+    "iwr": ("iwr probe.example.net/x", {PROBE}),
+    "irm": ("irm probe.example.net/x", {PROBE}),
+    "test-netconnection": ("Test-NetConnection -ComputerName probe.example.net", {PROBE}),
+    # Object storage and cloud CLIs: an endpoint option, or a bucket URL whose
+    # destination is the bucket (see BUCKET_SCHEMES).
+    "aws": ("aws s3 cp f.bin s3://probe-bucket/k", {"s3:probe-bucket"}),
+    "s3cmd": ("s3cmd put f.bin s3://probe-bucket/k", {"s3:probe-bucket"}),
+    "gsutil": ("gsutil cp f.bin gs://probe-bucket/k", {"gs:probe-bucket"}),
+    "gcloud": ("gcloud storage cp f.bin gs://probe-bucket/k", {"gs:probe-bucket"}),
+    "az": ("az storage blob upload --endpoint https://probe.example.net -f f.bin", {PROBE}),
+    "azcopy": ("azcopy copy f.bin https://probe.example.net/c/b", {PROBE}),
+    "mc": ("mc cp f.bin --endpoint https://probe.example.net/bucket", {PROBE}),
+    "kubectl": ("kubectl --server https://probe.example.net get pods", {PROBE}),
+    "rclone": ("rclone copy f.bin probe-remote:bucket/x", {"rclone:probe-remote"}),
+    # Resolvers: the queried name is the destination.
+    "dig": ("dig probe.example.net +short", {PROBE}),
+    "nslookup": ("nslookup probe.example.net", {PROBE}),
+    "host": ("host probe.example.net", {PROBE}),
+    "drill": ("drill probe.example.net", {PROBE}),
+    # Databases, caches, raw TLS.
+    "psql": ("psql -h probe.example.net -U u -d db", {PROBE}),
+    "mysql": ("mysql -h probe.example.net -u root", {PROBE}),
+    "mysqldump": ("mysqldump -h probe.example.net db", {PROBE}),
+    "redis-cli": ("redis-cli -h probe.example.net ping", {PROBE}),
+    "mongosh": ("mongosh mongodb://probe.example.net/db", {PROBE}),
+    "mongo": ("mongo mongodb://probe.example.net/db", {PROBE}),
+    "mongodump": ("mongodump --host probe.example.net", {PROBE}),
+    "openssl": ("openssl s_client -connect probe.example.net:443", {PROBE}),
 }
 
 
@@ -126,9 +156,11 @@ def test_the_invocation_table_covers_every_declared_network_command():
 
 @pytest.mark.parametrize("program", sorted(INVOCATIONS))
 def test_every_declared_network_command_is_exercised(program):
-    assert shell(INVOCATIONS[program]) == {"probe.example.net"}
+    command, expected = INVOCATIONS[program]
+    assert shell(command) == expected
     # The same program with no destination in its arguments reaches nobody.
     assert shell(f"{program} --help") == set()
+    assert shell(f"{program} --version") == set()
 
 
 # ------------------------------------------------------- how the line is read

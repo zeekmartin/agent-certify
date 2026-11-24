@@ -11,10 +11,15 @@ one is never reached otherwise.
 import pytest
 from conftest import session_graph
 
+from agent_certify.graph import AgentGraph
 from agent_certify.policy import Policy, PolicyRule, split_regions
 from agent_certify.regions import (
+    CCTLD,
     CCTLD_COUNTRY,
     CCTLD_EXCEPTIONS,
+    CCTLD_IDN,
+    IDN_CCTLD_CHECKED,
+    IDN_CCTLD_COUNTRY,
     ISO_3166_1_ALPHA_2,
     OFFLINE,
     GeoIPDatabase,
@@ -76,11 +81,20 @@ def test_the_table_is_the_iso_list_plus_the_exceptions():
     assert all(len(code) == 2 and code.isupper() and code.isalpha() for code in ISO_3166_1_ALPHA_2)
     for code in ("CN", "RU", "BY", "IR", "GB", "US", "CH", "DE", "KP", "SY", "CU", "VE"):
         assert code in ISO_3166_1_ALPHA_2
-    # Every ccTLD maps to a code, and only the exceptions differ from their label.
+    # Every two-letter ccTLD maps to a code, and only the exceptions differ
+    # from their label. The internationalised labels are a third rule, pinned
+    # to IANA by their own test below.
     for label, country in CCTLD_COUNTRY.items():
+        if label.startswith("xn--"):
+            assert IDN_CCTLD_COUNTRY[label] == country
+            continue
         assert len(label) == 2 and label.islower()
         assert country == CCTLD_EXCEPTIONS.get(label, label.upper())
     assert CCTLD_COUNTRY["uk"] == "GB" and CCTLD_COUNTRY["de"] == "DE"
+    assert CCTLD_COUNTRY["xn--p1ai"] == "RU"
+    # The three rules together, with nothing lost to a collision.
+    assert len(CCTLD_COUNTRY) == (len(ISO_3166_1_ALPHA_2) + len(CCTLD_EXCEPTIONS)
+                                  + len(IDN_CCTLD_COUNTRY))
 
 
 # ------------------------------------------------------------------- GeoIP
@@ -424,3 +438,128 @@ def test_a_database_object_can_be_built_directly(tmp_path):
     path.write_text("1.0.0.0,1.0.0.255,au\n", encoding="utf-8")
     db = GeoIPDatabase(path)
     assert db.country("1.0.0.7") == "AU"                    # upper-cased on load
+
+
+# --------------------------------------------------------------- IDN ccTLDs
+# An internationalised ccTLD is a country-code domain, and a forbidden_region
+# rule has to reach it. These tests carry their own copy of the table and the
+# day it was checked, so the table cannot drift from its source in silence.
+
+#: Transcribed from the IANA Root Zone Database's machine-readable form,
+#: https://data.iana.org/TLD/v1/tlds.json — every entry of ``country-code``
+#: type whose label starts with ``xn--``, with that file's own
+#: ``iso3166_code``. Checked on the date below; the file read was generated
+#: 2026-11-23 and every entry was ``active``.
+IDN_CCTLD_AT = {
+    "xn--2scrj9c": "IN", "xn--3e0b707e": "KR", "xn--3hcrj9c": "IN", "xn--45br5cyl": "IN",
+    "xn--45brj9c": "IN", "xn--4dbrk0ce": "IL", "xn--54b7fta0cc": "BD", "xn--80ao21a": "KZ",
+    "xn--90a3ac": "RS", "xn--90ae": "BG", "xn--90ais": "BY",
+    "xn--clchc0ea0b2g2a9gcd": "SG", "xn--d1alf": "MK", "xn--e1a4c": "EU",
+    "xn--fiqs8s": "CN", "xn--fiqz9s": "CN", "xn--fpcrj9c3d": "IN", "xn--fzc2c9e2c": "LK",
+    "xn--gecrj9c": "IN", "xn--h2breg3eve": "IN", "xn--h2brj9c": "IN",
+    "xn--h2brj9c8c": "IN", "xn--j1amh": "UA", "xn--j6w193g": "HK", "xn--kprw13d": "TW",
+    "xn--kpry57d": "TW", "xn--l1acc": "MN", "xn--lgbbat1ad8j": "DZ", "xn--mgb9awbf": "OM",
+    "xn--mgba3a4f16a": "IR", "xn--mgbaam7a8h": "AE", "xn--mgbah1a3hjkrd": "MR",
+    "xn--mgbai9azgqp6j": "PK", "xn--mgbayh7gpa": "JO", "xn--mgbbh1a": "IN",
+    "xn--mgbbh1a71e": "IN", "xn--mgbc0a9azcg": "MA", "xn--mgbcpq6gpa1a": "BH",
+    "xn--mgberp4a5d4ar": "SA", "xn--mgbgu82a": "IN", "xn--mgbpl2fh": "SD",
+    "xn--mgbtx2b": "IQ", "xn--mgbx4cd0ab": "MY", "xn--mix891f": "MO", "xn--node": "GE",
+    "xn--o3cw4h": "TH", "xn--ogbpf8fl": "SY", "xn--p1ai": "RU", "xn--pgbs0dh": "TN",
+    "xn--q7ce6a": "LA", "xn--qxa6a": "EU", "xn--qxam": "GR", "xn--rvc1e0am3e": "IN",
+    "xn--s9brj9c": "IN", "xn--wgbh1c": "EG", "xn--wgbl6a": "QA", "xn--xkc2al3hye2a": "LK",
+    "xn--xkc2dl3a5ee0h": "IN", "xn--y9a3aq": "AM", "xn--yfro4i67o": "SG",
+    "xn--ygbi2ammx": "PS"
+}
+
+
+def test_the_idn_cctld_table_is_pinned_to_the_day_it_was_checked():
+    """Change the table, re-check IANA, change the date — all three together.
+
+    A missing entry is not a wrong answer here, it is **no** answer: the
+    destination comes back ``unknown`` and a ``forbidden_region`` rule naming
+    that country passes it through. That is how ``collector.xn--p1ai`` — a
+    Russian ccTLD any browser reaches — got past a rule naming ``RU``, so the
+    list is pinned the way :data:`agent_certify.domains.NOT_HOSTS` is.
+
+    Re-check at every new delegation (a new script for a country that has one,
+    or a country's first) against the Root Zone Database, type
+    ``country-code``, column *IDN ccTLD*:
+    https://www.iana.org/domains/root/db — machine-readable at
+    https://data.iana.org/TLD/v1/tlds.json
+    """
+    assert IDN_CCTLD_CHECKED == "2026-11-24", (
+        "IDN_CCTLD_COUNTRY was edited, or the check is due: verify every entry against the "
+        "IANA Root Zone Database, then update IDN_CCTLD_CHECKED and the copy in this test.")
+    assert IDN_CCTLD_COUNTRY == IDN_CCTLD_AT, (
+        "IDN_CCTLD_COUNTRY changed. Verify the whole table against "
+        "https://data.iana.org/TLD/v1/tlds.json (type country-code, labels starting xn--, "
+        "field iso3166_code), then update IDN_CCTLD_CHECKED and IDN_CCTLD_AT together.")
+
+
+def test_every_entry_is_a_punycode_label_and_a_known_country():
+    for label, country in IDN_CCTLD_COUNTRY.items():
+        assert label.startswith("xn--") and label.islower()
+        assert len(country) == 2 and country.isupper()
+        # Either an assigned ISO code, or one of the exceptions already named
+        # here — xn--e1a4c and xn--qxa6a are the European Union's, like .eu.
+        assert country in ISO_3166_1_ALPHA_2 or country in CCTLD_EXCEPTIONS.values()
+
+
+@pytest.mark.parametrize("host, country", [
+    ("collector.xn--p1ai", "RU"),            # рф
+    ("shop.xn--fiqs8s", "CN"),               # 中国, simplified
+    ("shop.xn--fiqz9s", "CN"),               # 中國, traditional
+    ("x.xn--90ais", "BY"),                   # бел
+    ("api.xn--mgba3a4f16a", "IR"),           # ایران
+    ("a.b.xn--p1ai", "RU"),                  # a subdomain is still under the ccTLD
+    ("XN--P1AI", "RU"),                      # the label alone, any case
+    ("x.xn--3e0b707e", "KR"),
+    ("x.xn--j1amh", "UA"),
+    ("x.xn--node", "GE"),                    # a label that reads like a word
+    ("x.xn--notreal", ""),                   # not delegated: no answer invented
+    ("x.example.com", ""),
+])
+def test_an_internationalised_cctld_names_its_country(host, country):
+    assert cctld_country(host) == country
+
+
+def test_the_source_is_named_apart_from_the_latin_table():
+    # "ccTLD (IDN)" says which of the two tables answered: one is derived from
+    # the ISO list, the other transcribed from IANA by hand.
+    idn = OFFLINE.region("collector.xn--p1ai")
+    assert (idn.country, idn.source) == ("RU", CCTLD_IDN)
+    assert idn.describe() == "RU (ccTLD (IDN))"
+    latin = OFFLINE.region("collector.example.ru")
+    assert (latin.country, latin.source) == ("RU", CCTLD)
+    assert latin.describe() == "RU (ccTLD)"
+
+
+def test_an_internationalised_cctld_needs_no_lookup(tmp_path):
+    def no_dns(host, *args, **kwargs):
+        raise AssertionError(f"resolved {host!r}: a ccTLD answers offline")
+
+    db = tmp_path / "ip2country.csv"
+    db.write_text('"1.0.0.0","1.255.255.255","AU"\n', encoding="utf-8")
+    resolver = RegionResolver(geoip=load_geoip(db), resolve_dns=True, getaddrinfo=no_dns)
+    assert resolver.region("collector.xn--p1ai").country == "RU"
+    assert resolver.lookups == 0
+
+
+def test_a_forbidden_region_rule_reaches_an_internationalised_domain():
+    """The point of the table: RU has to catch рф, and CN both Chinese forms."""
+    graph = AgentGraph()
+    graph.add_node("claude", kind="orchestrator")
+    graph.record_egress("claude", {"collector.xn--p1ai", "shop.xn--fiqs8s",
+                                   "shop.xn--fiqz9s", "ok.example.com"}, 2048)
+
+    def violations(target):
+        rule = PolicyRule(kind="forbidden_region", target=target, severity="critical",
+                          message=f"destinations in {target} are not allowed")
+        return {v.observed for v in Policy([rule]).check(graph)}
+
+    assert any("collector.xn--p1ai" in observed for observed in violations("RU"))
+    cn = violations("CN")
+    assert any("shop.xn--fiqs8s" in observed for observed in cn)
+    assert any("shop.xn--fiqz9s" in observed for observed in cn)
+    # And nothing is invented about a destination the table says nothing about.
+    assert not any("ok.example.com" in observed for observed in violations("RU") | cn)

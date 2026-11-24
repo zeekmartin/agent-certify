@@ -20,7 +20,17 @@ source         from                                       needs
 ``unknown``    nothing above applied                      —
 =============  =========================================  ======================
 
-**What this cannot tell you.** A ``.com`` hosted in Shanghai is ``unknown``
+An internationalised ccTLD is read like any other: ``collector.xn--p1ai`` is
+``RU`` and says ``ccTLD (IDN)``, from a table transcribed from the IANA Root
+Zone Database (:data:`IDN_CCTLD_COUNTRY`). A destination written
+``collector.рф`` arrives here already converted to punycode, which is why one
+table serves both spellings.
+
+**What this cannot tell you.** A destination that is not a DNS name —
+``s3:logs-eu``, ``rclone:backup`` — is always ``unknown``: a bucket name says
+nothing about where the bucket is, and the endpoint lives in a client's own
+configuration rather than in anything a session records. A ``.com`` hosted in
+Shanghai is ``unknown``
 without resolution: there is nothing in the name to read, and the tool does not
 resolve by default. A ccTLD is a *registration*, not a location — ``.io``
 domains sit in Virginia, a ``.de`` site can be served from Oregon — and an
@@ -85,11 +95,111 @@ ISO_3166_1_ALPHA_2 = (                                  # noqa: SIM905 — group
     "UA UG UM US UY UZ VA VC VE VG VI VN VU WF WS YE YT ZA ZM ZW"
 ).split()
 
-#: ccTLD label -> country code. Built from the two rules above, so there is one
-#: place to look and nothing to keep in step by hand.
-CCTLD_COUNTRY = {code.lower(): code for code in ISO_3166_1_ALPHA_2} | CCTLD_EXCEPTIONS
+#: Internationalised ccTLD (punycode label) -> ISO 3166-1 alpha-2 code.
+#:
+#: **Source**: the IANA Root Zone Database, type ``country-code``, taken from
+#: its machine-readable form <https://data.iana.org/TLD/v1/tlds.json> (the file
+#: the database itself publishes; ``meta.source`` names
+#: <https://www.iana.org/domains/root/db>). Every entry below is that file's
+#: own ``iso3166_code`` for that TLD, transcribed label by label — not a guess
+#: from the script or the language. Entries checked against it on
+#: :data:`IDN_CCTLD_CHECKED`; the file read was generated 2026-11-23, and all
+#: 61 entries were ``active``.
+#:
+#: Why this exists: an internationalised ccTLD is a country-code domain, so a
+#: ``forbidden_region`` rule has to reach it. Without the table
+#: ``collector.xn--p1ai`` — ``collector.рф``, Russia's ccTLD, reachable from
+#: any browser — came back ``unknown``, and a rule naming ``RU`` passed it
+#: through. The two-letter table could not help: ``xn--p1ai`` is not two
+#: letters, and that is the whole of the bug.
+#:
+#: Several countries have more than one: India has fourteen (one per script),
+#: China two (simplified and traditional), Taiwan two, Sri Lanka two, Greece
+#: and the European Union each one beside their Latin ccTLD. All of them are
+#: listed, because a rule that catches one spelling and not another is worse
+#: than no rule.
+#:
+#: **Re-check at every new delegation**, which for an IDN ccTLD means a new
+#: script for a country that already has one, or a country's first: see the
+#: test that carries the date.
+IDN_CCTLD_COUNTRY = {
+    "xn--mgbaam7a8h": "AE",
+    "xn--y9a3aq": "AM",
+    "xn--54b7fta0cc": "BD",
+    "xn--90ae": "BG",
+    "xn--mgbcpq6gpa1a": "BH",
+    "xn--90ais": "BY",
+    "xn--fiqs8s": "CN",
+    "xn--fiqz9s": "CN",
+    "xn--lgbbat1ad8j": "DZ",
+    "xn--wgbh1c": "EG",
+    "xn--e1a4c": "EU",
+    "xn--qxa6a": "EU",
+    "xn--node": "GE",
+    "xn--qxam": "GR",
+    "xn--j6w193g": "HK",
+    "xn--4dbrk0ce": "IL",
+    "xn--2scrj9c": "IN",
+    "xn--3hcrj9c": "IN",
+    "xn--45br5cyl": "IN",
+    "xn--45brj9c": "IN",
+    "xn--fpcrj9c3d": "IN",
+    "xn--gecrj9c": "IN",
+    "xn--h2breg3eve": "IN",
+    "xn--h2brj9c": "IN",
+    "xn--h2brj9c8c": "IN",
+    "xn--mgbbh1a": "IN",
+    "xn--mgbbh1a71e": "IN",
+    "xn--mgbgu82a": "IN",
+    "xn--rvc1e0am3e": "IN",
+    "xn--s9brj9c": "IN",
+    "xn--xkc2dl3a5ee0h": "IN",
+    "xn--mgbtx2b": "IQ",
+    "xn--mgba3a4f16a": "IR",
+    "xn--mgbayh7gpa": "JO",
+    "xn--3e0b707e": "KR",
+    "xn--80ao21a": "KZ",
+    "xn--q7ce6a": "LA",
+    "xn--fzc2c9e2c": "LK",
+    "xn--xkc2al3hye2a": "LK",
+    "xn--mgbc0a9azcg": "MA",
+    "xn--d1alf": "MK",
+    "xn--l1acc": "MN",
+    "xn--mix891f": "MO",
+    "xn--mgbah1a3hjkrd": "MR",
+    "xn--mgbx4cd0ab": "MY",
+    "xn--mgb9awbf": "OM",
+    "xn--mgbai9azgqp6j": "PK",
+    "xn--ygbi2ammx": "PS",
+    "xn--wgbl6a": "QA",
+    "xn--90a3ac": "RS",
+    "xn--p1ai": "RU",
+    "xn--mgberp4a5d4ar": "SA",
+    "xn--mgbpl2fh": "SD",
+    "xn--clchc0ea0b2g2a9gcd": "SG",
+    "xn--yfro4i67o": "SG",
+    "xn--ogbpf8fl": "SY",
+    "xn--o3cw4h": "TH",
+    "xn--pgbs0dh": "TN",
+    "xn--kprw13d": "TW",
+    "xn--kpry57d": "TW",
+    "xn--j1amh": "UA",
+}
 
-CCTLD, GEOIP, DNS_GEOIP, UNKNOWN = "cctld", "geoip", "dns+geoip", "unknown"
+#: The day every entry of :data:`IDN_CCTLD_COUNTRY` was last checked against
+#: the IANA Root Zone Database. A test pins the table to this date: change the
+#: table, re-check the source and change the date, together.
+IDN_CCTLD_CHECKED = "2026-11-24"
+
+#: ccTLD label -> country code. Built from the three rules above, so there is
+#: one place to look and nothing to keep in step by hand. An internationalised
+#: label lands here beside the Latin ones, which is what lets one lookup answer
+#: for both: the caller never has to know which kind it holds.
+CCTLD_COUNTRY = ({code.lower(): code for code in ISO_3166_1_ALPHA_2}
+                 | CCTLD_EXCEPTIONS | IDN_CCTLD_COUNTRY)
+
+CCTLD, CCTLD_IDN = "cctld", "cctld_idn"
+GEOIP, DNS_GEOIP, UNKNOWN = "geoip", "dns+geoip", "unknown"
 
 #: How long one name resolution may hold the caller up, and how many of them a
 #: single run may make. Both are there so that a session full of unknown hosts
@@ -104,7 +214,10 @@ class Region:
     """A destination's country, and how it was determined.
 
     ``country`` is an ISO 3166-1 alpha-2 code, or ``""`` when nothing applied;
-    ``source`` is one of ``cctld``, ``geoip``, ``dns+geoip``, ``unknown``.
+    ``source`` is one of ``cctld``, ``cctld_idn``, ``geoip``, ``dns+geoip``,
+    ``unknown``. ``cctld_idn`` is named apart from ``cctld`` because the table
+    behind it is transcribed from IANA by hand rather than derived from the ISO
+    list, so a report says which of the two answered.
     """
     country: str = ""
     source: str = UNKNOWN
@@ -117,7 +230,8 @@ class Region:
         """``"CN (ccTLD)"``, or ``"region unknown"``."""
         if not self.known:
             return "region unknown"
-        label = {CCTLD: "ccTLD", GEOIP: "GeoIP database on an address literal",
+        label = {CCTLD: "ccTLD", CCTLD_IDN: "ccTLD (IDN)",
+                 GEOIP: "GeoIP database on an address literal",
                  DNS_GEOIP: "DNS lookup then GeoIP database"}.get(self.source, self.source)
         return f"{self.country} ({label})"
 
@@ -128,13 +242,23 @@ UNKNOWN_REGION = Region()
 def cctld_country(host: str) -> str:
     """The country a host's ccTLD belongs to, or ``""``.
 
-    ``api.example.cn`` is ``CN``; ``bbc.co.uk`` is ``GB``; ``example.com`` is
-    ``""``, and so is an address literal, which has no top-level domain.
+    ``api.example.cn`` is ``CN``; ``bbc.co.uk`` is ``GB``;
+    ``collector.xn--p1ai`` is ``RU``; ``example.com`` is ``""``, and so is an
+    address literal, which has no top-level domain.
     """
+    return CCTLD_COUNTRY.get(cctld_label(host), "")
+
+
+def cctld_label(host: str) -> str:
+    """A host's last label, lowercased: the one thing both ccTLD tables key on."""
     if not isinstance(host, str):
         return ""
-    label = host.strip().rstrip(".").rsplit(".", 1)[-1].lower()
-    return CCTLD_COUNTRY.get(label, "")
+    return host.strip().rstrip(".").rsplit(".", 1)[-1].lower()
+
+
+def is_idn_cctld(host: str) -> bool:
+    """Is this host's ccTLD an internationalised one? Decides the source name."""
+    return cctld_label(host) in IDN_CCTLD_COUNTRY
 
 
 def _as_int(text: str) -> tuple[int, int] | None:
@@ -322,9 +446,16 @@ class RegionResolver:
 
     # ------------------------------------------------------------ internals
     def _resolve(self, host: str) -> Region:
+        if ":" in host and not host.startswith("["):
+            # A destination that is not a DNS name: a bucket, or a remote
+            # configured outside the log (``s3:logs-eu``, ``rclone:backup``).
+            # Its region is genuinely unknown — a bucket name says nothing
+            # about where the bucket is — and there is nothing to resolve, so
+            # it does not spend a lookup from the budget either.
+            return UNKNOWN_REGION
         country = cctld_country(host)
         if country:
-            return Region(country, CCTLD)
+            return Region(country, CCTLD_IDN if is_idn_cctld(host) else CCTLD)
         if ip_version(host):
             found = self.geoip.country(host) if self.geoip else ""
             return Region(found, GEOIP) if found else UNKNOWN_REGION

